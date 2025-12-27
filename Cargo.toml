@@ -6,4 +6,5 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.100"
 cranelift = { version = "0.127.0", features = ["module", "native", "object"] }
+lake-frontend = { git = "https://github.com/morphqdd/lake_frontend.git", branch = "dev" }
 
