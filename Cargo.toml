@@ -1,0 +1,9 @@
+[package]
+name = "lake-native-compiler"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+cranelift = { version = "0.127.0", features = ["module", "native", "object"] }
+
