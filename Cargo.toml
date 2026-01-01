@@ -5,6 +5,15 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
+blink = { git = "https://github.com/morphqdd/blink", version = "0.0.0" }
 cranelift = { version = "0.127.0", features = ["module", "native", "object"] }
+cranelift-wasm = "0.112.3"
 lake-frontend = { git = "https://github.com/morphqdd/lake_frontend.git", branch = "dev" }
+num_cpus = "1.17.0"
+
+[dev-dependencies]
+tempfile = "3.24.0"
+
+[build-dependencies]
+anyhow = "1.0.100"
 
