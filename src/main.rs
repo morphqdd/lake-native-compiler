@@ -1,4 +1,4 @@
-use std::{fs, path::Path, process::Command};
+use std::path::Path;
 
 use anyhow::Result;
 use lake_native_compiler::compiler::{compile, link};

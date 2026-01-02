@@ -1,7 +1,6 @@
 use std::{fs, path::Path, process::Command};
 
 use anyhow::{Result, bail};
-use blink::linker::Linker;
 use lake_frontend::{api::ast::Process, prelude::parse};
 
 use crate::compiler::{ctx::CompilerCtx, rt::Runtime};
@@ -68,7 +67,7 @@ pub fn compile<SP: AsRef<Path>>(source_path: SP) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn compile_machine(ctx: CompilerCtx, machine: &Process<'_>) -> Result<CompilerCtx> {
+fn compile_machine(ctx: CompilerCtx, _machine: &Process<'_>) -> Result<CompilerCtx> {
     Ok(ctx)
 }
 

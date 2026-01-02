@@ -1,9 +1,7 @@
 use std::collections::HashMap;
 
-use anyhow::Result;
-use cranelift::prelude::{FunctionBuilder, Type, Value, Variable};
+use cranelift::prelude::{FunctionBuilder, Type};
 
-use crate::compiler::ctx::CompilerCtx;
 
 pub struct ProcessMap {
     inner: HashMap<u32, bool>,
