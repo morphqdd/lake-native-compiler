@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, process::Command};
 
 use anyhow::{Result, bail};
 use blink::linker::Linker;
@@ -8,6 +8,33 @@ use crate::compiler::{ctx::CompilerCtx, rt::Runtime};
 
 mod ctx;
 mod rt;
+
+pub fn link<BP: AsRef<Path>>(build_path: BP, name: &str, bytes: &[u8]) -> Result<()> {
+    fs::write(&build_path.as_ref().join(format!("{name}.o")), bytes)?;
+
+    assert!(
+        Command::new("mold")
+            .args([
+                "external/build/syscall.a",
+                build_path
+                    .as_ref()
+                    .join(format!("{name}.o"))
+                    .to_string_lossy()
+                    .to_string()
+                    .as_str(),
+                "-o",
+                build_path
+                    .as_ref()
+                    .join(name)
+                    .to_string_lossy()
+                    .to_string()
+                    .as_str()
+            ])
+            .status()?
+            .success()
+    );
+    Ok(())
+}
 
 pub fn compile<SP: AsRef<Path>>(source_path: SP) -> Result<Vec<u8>> {
     let src = fs::read_to_string(&source_path)?;
@@ -55,7 +82,7 @@ mod test {
     use anyhow::Result;
     use tempfile::tempdir;
 
-    use crate::compiler::compile;
+    use crate::compiler::{compile, link};
 
     #[test]
     fn compile_simple_program() -> Result<()> {
@@ -63,10 +90,10 @@ mod test {
         let path = dir.path();
         let content = "main is { n i32.1 -> { n } }";
         fs::write(path.join("main.lake"), &content)?;
-        compile(path.join("main.lake"), path)?;
+        let bytes = compile(path.join("main.lake"))?;
+        link(dir.path(), "main", &bytes)?;
         let prog = Command::new(path.join("main")).status();
-        assert!(prog.is_ok());
-        assert_eq!(prog?.code(), Some(10));
+        assert_eq!(prog?.code(), Some(0));
         Ok(())
     }
 }

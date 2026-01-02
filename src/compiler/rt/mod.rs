@@ -54,7 +54,7 @@ impl Runtime {
             .module_mut()
             .declare_func_in_func(exit_id, &mut builder.func);
 
-        let zero = builder.ins().iconst(pointer_type, 10);
+        let zero = builder.ins().iconst(pointer_type, 0);
 
         builder.ins().call(exit_ref, &[zero]);
         builder.ins().trap(TrapCode::user(0xDE).unwrap());
