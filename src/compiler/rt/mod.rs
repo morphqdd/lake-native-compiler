@@ -10,9 +10,9 @@ use cranelift::{
 use crate::compiler::{
     ctx::CompilerCtx,
     rt::{
-        alloc::heap_memory_operations::init_heap_memory_funcs,
-        alloc::mmap::init_mmap_func,
+        alloc::{heap_memory_operations::init_heap_memory_funcs, mmap::init_mmap_func},
         rt_utils::{exit::init_exit_func, init_syscall_wrapper},
+        rw::init_rw,
     },
 };
 
@@ -33,7 +33,9 @@ impl Default for Runtime {
 
 impl Runtime {
     fn init(&self, ctx: CompilerCtx) -> Result<CompilerCtx> {
-        init_heap_memory_funcs(init_mmap_func(init_exit_func(init_syscall_wrapper(ctx)?)?)?)
+        init_rw(init_heap_memory_funcs(init_mmap_func(init_exit_func(
+            init_syscall_wrapper(ctx)?,
+        )?)?)?)
     }
     pub fn build(self, ctx: CompilerCtx) -> Result<CompilerCtx> {
         let mut ctx = self.init(ctx)?;
@@ -89,46 +91,6 @@ impl Runtime {
                 .store(MemFlags::new(), heap_end_addr, heap_end_ptr, 0);
         }
 
-        let Some(FuncOrDataId::Func(allocate_id)) = ctx.module().get_name("rt_allocate") else {
-            bail!("RT func 'allocate' is not define")
-        };
-
-        let allocate_ref = ctx
-            .module_mut()
-            .declare_func_in_func(allocate_id, &mut builder.func);
-
-        let buf_size = builder.ins().iconst(pointer_type, 32);
-        let allocate_call = builder.ins().call(allocate_ref, &[buf_size]);
-
-        let ptr = builder.inst_results(allocate_call)[0];
-
-        let Some(FuncOrDataId::Func(store_id)) = ctx.module().get_name("rt_store") else {
-            bail!("RT func 'store' is not define")
-        };
-
-        let store_ref = ctx
-            .module_mut()
-            .declare_func_in_func(store_id, &mut builder.func);
-
-        let u8_type = Type::int(8).unwrap();
-        let h = builder.ins().iconst(pointer_type, 'H' as u8 as i64);
-        let e = builder.ins().iconst(pointer_type, 'e' as u8 as i64);
-        let l = builder.ins().iconst(pointer_type, 'l' as u8 as i64);
-        let o = builder.ins().iconst(pointer_type, 'o' as u8 as i64);
-
-        let u8_type_size = builder.ins().iconst(pointer_type, 1);
-        let i0 = builder.ins().iconst(pointer_type, 0);
-        let i1 = builder.ins().iconst(pointer_type, 1);
-        let i2 = builder.ins().iconst(pointer_type, 2);
-        let i3 = builder.ins().iconst(pointer_type, 3);
-        let i4 = builder.ins().iconst(pointer_type, 4);
-
-        builder.ins().call(store_ref, &[ptr, h, u8_type_size, i0]);
-        builder.ins().call(store_ref, &[ptr, e, u8_type_size, i1]);
-        builder.ins().call(store_ref, &[ptr, l, u8_type_size, i2]);
-        builder.ins().call(store_ref, &[ptr, l, u8_type_size, i3]);
-        builder.ins().call(store_ref, &[ptr, o, u8_type_size, i4]);
-
         let Some(FuncOrDataId::Func(exit_id)) = ctx.module().get_name("rt_exit") else {
             bail!("RT func 'exit' is not define")
         };
@@ -137,7 +99,7 @@ impl Runtime {
             .module_mut()
             .declare_func_in_func(exit_id, &mut builder.func);
 
-        let zero = builder.inst_results(allocate_call)[0];
+        let zero = builder.ins().iconst(pointer_type, 0);
         builder.ins().call(exit_ref, &[zero]);
         builder.ins().trap(TrapCode::user(0xDE).unwrap());
 

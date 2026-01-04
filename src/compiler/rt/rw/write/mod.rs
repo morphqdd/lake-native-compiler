@@ -1,10 +1,14 @@
 use anyhow::{Result, bail};
 use cranelift::{
-    module::{FuncOrDataId, Module},
-    prelude::{AbiParam, FunctionBuilder, FunctionBuilderContext},
+    module::{FuncOrDataId, Linkage, Module},
+    prelude::{
+        AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder, IntCC, MemFlags, TrapCode,
+    },
 };
 
 use crate::compiler::ctx::CompilerCtx;
+
+const SYSCALL_WRITE: i64 = 1;
 
 pub fn init_write(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let ty = ctx.module().target_config().pointer_type();
@@ -31,9 +35,40 @@ pub fn init_write(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     builder.switch_to_block(entry);
     builder.seal_block(entry);
 
-    let [fd, ptr, size] = builder.block_params(entry)[0..3] else {
+    let [fd, fat_ptr, size] = builder.block_params(entry)[0..3] else {
         bail!("Need 3 params");
     };
+
+    let syscall_ty = builder.ins().iconst(ty, SYSCALL_WRITE);
+    let zero = builder.ins().iconst(ty, 0);
+    let user_data_base_ptr = builder.ins().load(ty, MemFlags::new(), fat_ptr, 0);
+    let ptr_to_end_of_val = builder.ins().iadd(user_data_base_ptr, size);
+    let user_data_end_ptr = builder.ins().load(ty, MemFlags::new(), fat_ptr, 8);
+
+    let cond = builder.ins().icmp(
+        IntCC::UnsignedLessThan,
+        ptr_to_end_of_val,
+        user_data_end_ptr,
+    );
+
+    builder.ins().trapz(cond, TrapCode::unwrap_user(32));
+
+    builder.ins().call(
+        syscall_ref,
+        &[syscall_ty, fd, user_data_base_ptr, size, zero, zero, zero],
+    );
+
+    builder.ins().return_(&[]);
+
+    let write_sig = builder.func.signature.clone();
+    let id = ctx
+        .module_mut()
+        .declare_function("rt_write", Linkage::Export, &write_sig)?;
+    ctx.module_mut().define_function(id, &mut module_ctx)?;
+
+    println!("rt_write_func: {}", module_ctx.func);
+
+    ctx.module_mut().clear_context(&mut module_ctx);
 
     Ok(ctx)
 }

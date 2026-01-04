@@ -3,13 +3,14 @@ use cranelift::{
     module::{FuncOrDataId, Linkage, Module},
     prelude::{
         AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder, IntCC, MemFlags, TrapCode,
+        Type,
     },
 };
 
 use crate::compiler::ctx::CompilerCtx;
 
 pub fn init_heap_memory_funcs(ctx: CompilerCtx) -> Result<CompilerCtx> {
-    init_store(init_allocate(ctx)?)
+    init_load(init_store(init_allocate(ctx)?)?)
 }
 
 fn init_allocate(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
@@ -112,7 +113,7 @@ fn init_store(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     builder.seal_block(entry);
 
     let [fat_ptr, val, size, offset] = builder.block_params(entry)[0..4] else {
-        bail!("Not 4 params")
+        bail!("Need 4 params")
     };
 
     let user_data_base_ptr = builder.ins().load(ty, MemFlags::new(), fat_ptr, 0);
@@ -143,6 +144,69 @@ fn init_store(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     println!("store_func: {}", module_ctx.func);
 
     ctx.module_mut().clear_context(&mut module_ctx);
+
+    Ok(ctx)
+}
+
+fn init_load(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
+    let ty = ctx.module().target_config().pointer_type();
+
+    for bit in [8, 16, 32, 64] {
+        let loaded_ty = Type::int(bit).unwrap();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        let mut module_ctx = ctx.module().make_context();
+        let mut builder = FunctionBuilder::new(&mut module_ctx.func, &mut builder_ctx);
+
+        builder.func.signature.params.push(AbiParam::new(ty));
+        builder.func.signature.params.push(AbiParam::new(ty));
+
+        builder
+            .func
+            .signature
+            .returns
+            .push(AbiParam::new(loaded_ty));
+
+        let entry = builder.create_block();
+        builder.append_block_param(entry, ty);
+        builder.append_block_param(entry, ty);
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+
+        let [fat_ptr, offset] = builder.block_params(entry)[0..2] else {
+            bail!("Need 2 params")
+        };
+
+        let size = builder.ins().iconst(ty, bit as i64);
+        let user_data_base_ptr = builder.ins().load(ty, MemFlags::new(), fat_ptr, 0);
+        let user_data_offeset_ptr = builder.ins().iadd(user_data_base_ptr, offset);
+        let ptr_to_end_of_val = builder.ins().iadd(user_data_offeset_ptr, size);
+        let user_data_end_ptr = builder.ins().load(ty, MemFlags::new(), fat_ptr, 8);
+
+        let cond = builder.ins().icmp(
+            IntCC::UnsignedLessThan,
+            ptr_to_end_of_val,
+            user_data_end_ptr,
+        );
+
+        builder.ins().trapz(cond, TrapCode::unwrap_user(32));
+
+        let val = builder
+            .ins()
+            .load(loaded_ty, MemFlags::new(), user_data_offeset_ptr, 0);
+        builder.ins().return_(&[val]);
+
+        let load_sig = builder.func.signature.clone();
+        let id = ctx.module_mut().declare_function(
+            &format!("rt_load_u{}", bit),
+            Linkage::Export,
+            &load_sig,
+        )?;
+        ctx.module_mut().define_function(id, &mut module_ctx)?;
+
+        println!("load_u{bit}_func: {}", module_ctx.func);
+
+        ctx.module_mut().clear_context(&mut module_ctx);
+    }
 
     Ok(ctx)
 }
