@@ -1,7 +1,21 @@
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    hash::{DefaultHasher, Hash, Hasher},
+    path::Path,
+    process::Command,
+};
 
 use anyhow::{Result, bail};
-use lake_frontend::{api::ast::Process, prelude::parse};
+use cranelift::{
+    codegen::ir::BlockArg,
+    frontend::Switch,
+    module::{Linkage, Module},
+    prelude::{AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder},
+};
+use lake_frontend::{
+    api::ast::{Machine, Pattern},
+    prelude::parse,
+};
 
 use crate::compiler::{ctx::CompilerCtx, rt::Runtime};
 
@@ -69,7 +83,66 @@ pub fn compile<SP: AsRef<Path>>(source_path: SP) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn compile_machine(ctx: CompilerCtx, _machine: &Process<'_>) -> Result<CompilerCtx> {
+fn hash(patterns: &[Pattern<'_>]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for pattern in patterns {
+        if !pattern.has_default() {
+            let ident = pattern.ident();
+            let ty = pattern.ty();
+            ident.hash(&mut hasher);
+            ty.to_string().hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+fn compile_machine(mut ctx: CompilerCtx, machine: &Machine<'_>) -> Result<CompilerCtx> {
+    let ptr_ty = ctx.module().target_config().pointer_type();
+    let mut module_ctx = ctx.module().make_context();
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut builder = FunctionBuilder::new(&mut module_ctx.func, &mut builder_ctx);
+
+    builder.func.signature.params.push(AbiParam::new(ptr_ty));
+
+    let entry = builder.create_block();
+    let default_block = builder.create_block();
+    let switch_block = builder.create_block();
+    builder.append_block_param(entry, ptr_ty);
+    builder.append_block_param(switch_block, ptr_ty);
+
+    builder.switch_to_block(entry);
+    let val = builder.block_params(entry)[0];
+    builder.ins().jump(switch_block, &[BlockArg::Value(val)]);
+
+    let mut switch = Switch::new();
+
+    for (i, branch) in machine.branches().iter().enumerate() {
+        let branch_block = builder.create_block();
+        builder.switch_to_block(branch_block);
+        switch.set_entry(i as u128, branch_block);
+        builder.ins().return_(&[]);
+    }
+
+    builder.switch_to_block(switch_block);
+    let val = builder.block_params(switch_block)[0];
+    switch.emit(&mut builder, val, default_block);
+
+    builder.switch_to_block(default_block);
+    builder.ins().return_(&[]);
+
+    builder.seal_all_blocks();
+
+    let machine_sig = builder.func.signature.clone();
+    let machine_ident = machine.ident().to_string();
+    let id = ctx
+        .module_mut()
+        .declare_function(&machine_ident, Linkage::Export, &machine_sig)?;
+    ctx.module_mut().define_function(id, &mut module_ctx)?;
+
+    println!("{machine_ident}: {}", module_ctx.func);
+
+    ctx.module_mut().clear_context(&mut module_ctx);
+
     Ok(ctx)
 }
 

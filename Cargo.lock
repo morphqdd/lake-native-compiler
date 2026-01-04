@@ -157,8 +157,8 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "chumsky"
-version = "0.12.0"
-source = "git+https://github.com/zesterer/chumsky.git#b297509591b3232c3e553d85fad922b8e5e21237"
+version = "0.13.0"
+source = "git+https://github.com/zesterer/chumsky.git#da922ff3bfcb26a70b8ca4e40ea0a6dbafb8324c"
 dependencies = [
  "hashbrown 0.15.5",
  "regex-automata",
@@ -645,7 +645,7 @@ dependencies = [
 [[package]]
 name = "lake-frontend"
 version = "0.1.0"
-source = "git+https://github.com/morphqdd/lake_frontend.git?branch=dev#f878903aab92b437e42b9f1996bcceae5b809a21"
+source = "git+https://github.com/morphqdd/lake_frontend.git?branch=dev#c7a35a563549e3c28ae6534e0368b550435ff779"
 dependencies = [
  "anyhow",
  "ariadne",
