@@ -9,11 +9,13 @@ mod ctx;
 mod rt;
 
 pub fn link<BP: AsRef<Path>>(build_path: BP, name: &str, bytes: &[u8]) -> Result<()> {
+    fs::create_dir_all(&build_path)?;
     fs::write(&build_path.as_ref().join(format!("{name}.o")), bytes)?;
 
     assert!(
         Command::new("mold")
             .args([
+                "-static",
                 "external/build/syscall.a",
                 build_path
                     .as_ref()

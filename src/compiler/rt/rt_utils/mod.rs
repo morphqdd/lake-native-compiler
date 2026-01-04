@@ -21,7 +21,7 @@ pub fn init_syscall_wrapper(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     syscall_sig.returns.push(AbiParam::new(target_pointer_ty));
 
     ctx.module_mut()
-        .declare_function("syscall", Linkage::Import, &syscall_sig)?;
+        .declare_function("rt_syscall", Linkage::Import, &syscall_sig)?;
 
     Ok(ctx)
 }

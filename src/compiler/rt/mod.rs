@@ -1,13 +1,17 @@
 use anyhow::{Result, bail};
 use cranelift::{
     module::{DataDescription, FuncOrDataId, Linkage, Module},
-    prelude::{AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder, MemFlags, TrapCode},
+    prelude::{
+        AbiParam, EntityRef, FunctionBuilder, FunctionBuilderContext, Imm64, InstBuilder, MemFlags,
+        TrapCode, Type, Value,
+    },
 };
 
 use crate::compiler::{
     ctx::CompilerCtx,
     rt::{
-        alloc::init_mmap_func,
+        alloc::heap_memory_operations::init_heap_memory_funcs,
+        alloc::mmap::init_mmap_func,
         rt_utils::{exit::init_exit_func, init_syscall_wrapper},
     },
 };
@@ -15,6 +19,7 @@ use crate::compiler::{
 mod alloc;
 mod process;
 mod rt_utils;
+mod rw;
 
 const HEAP_SIZE: i64 = 16 * 1024 * 1024;
 
@@ -28,7 +33,7 @@ impl Default for Runtime {
 
 impl Runtime {
     fn init(&self, ctx: CompilerCtx) -> Result<CompilerCtx> {
-        init_mmap_func(init_exit_func(init_syscall_wrapper(ctx)?)?)
+        init_heap_memory_funcs(init_mmap_func(init_exit_func(init_syscall_wrapper(ctx)?)?)?)
     }
     pub fn build(self, ctx: CompilerCtx) -> Result<CompilerCtx> {
         let mut ctx = self.init(ctx)?;
@@ -38,37 +43,15 @@ impl Runtime {
         let mut module_ctx = ctx.module().make_context();
         let mut builder = FunctionBuilder::new(&mut module_ctx.func, &mut builder_ctx);
 
-        builder
-            .func
-            .signature
-            .returns
-            .push(AbiParam::new(pointer_type));
-
         let entry_block = builder.create_block();
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
 
-        if let Some(mmap_id) = ctx.module().get_name("mmap")
-            && let FuncOrDataId::Func(mmap_id) = mmap_id
+        if let Some(FuncOrDataId::Func(mmap_id)) = ctx.module().get_name("rt_mmap")
+            && let Some(FuncOrDataId::Data(heap_base_id)) = ctx.module().get_name("heap_base")
+            && let Some(FuncOrDataId::Data(heap_curr_id)) = ctx.module().get_name("heap_curr")
+            && let Some(FuncOrDataId::Data(heap_end_id)) = ctx.module().get_name("heap_end")
         {
-            let mut data_description = DataDescription::new();
-            data_description.define_zeroinit(pointer_type.bytes() as usize);
-            let heap_base_id =
-                ctx.module_mut()
-                    .declare_data("heap_base", Linkage::Export, true, false)?;
-            ctx.module_mut()
-                .define_data(heap_base_id, &data_description)?;
-            let heap_curr_id =
-                ctx.module_mut()
-                    .declare_data("heap_curr", Linkage::Export, true, false)?;
-            ctx.module_mut()
-                .define_data(heap_curr_id, &data_description)?;
-            let heap_end_id =
-                ctx.module_mut()
-                    .declare_data("heap_end", Linkage::Export, true, false)?;
-            ctx.module_mut()
-                .define_data(heap_end_id, &data_description)?;
-
             let mmap_ref = ctx
                 .module_mut()
                 .declare_func_in_func(mmap_id, &mut builder.func);
@@ -101,13 +84,52 @@ impl Runtime {
             builder
                 .ins()
                 .store(MemFlags::new(), heap_base_addr, heap_curr_ptr, 0);
-
             builder
                 .ins()
                 .store(MemFlags::new(), heap_end_addr, heap_end_ptr, 0);
         }
 
-        let Some(FuncOrDataId::Func(exit_id)) = ctx.module().get_name("exit") else {
+        let Some(FuncOrDataId::Func(allocate_id)) = ctx.module().get_name("rt_allocate") else {
+            bail!("RT func 'allocate' is not define")
+        };
+
+        let allocate_ref = ctx
+            .module_mut()
+            .declare_func_in_func(allocate_id, &mut builder.func);
+
+        let buf_size = builder.ins().iconst(pointer_type, 32);
+        let allocate_call = builder.ins().call(allocate_ref, &[buf_size]);
+
+        let ptr = builder.inst_results(allocate_call)[0];
+
+        let Some(FuncOrDataId::Func(store_id)) = ctx.module().get_name("rt_store") else {
+            bail!("RT func 'store' is not define")
+        };
+
+        let store_ref = ctx
+            .module_mut()
+            .declare_func_in_func(store_id, &mut builder.func);
+
+        let u8_type = Type::int(8).unwrap();
+        let h = builder.ins().iconst(pointer_type, 'H' as u8 as i64);
+        let e = builder.ins().iconst(pointer_type, 'e' as u8 as i64);
+        let l = builder.ins().iconst(pointer_type, 'l' as u8 as i64);
+        let o = builder.ins().iconst(pointer_type, 'o' as u8 as i64);
+
+        let u8_type_size = builder.ins().iconst(pointer_type, 1);
+        let i0 = builder.ins().iconst(pointer_type, 0);
+        let i1 = builder.ins().iconst(pointer_type, 1);
+        let i2 = builder.ins().iconst(pointer_type, 2);
+        let i3 = builder.ins().iconst(pointer_type, 3);
+        let i4 = builder.ins().iconst(pointer_type, 4);
+
+        builder.ins().call(store_ref, &[ptr, h, u8_type_size, i0]);
+        builder.ins().call(store_ref, &[ptr, e, u8_type_size, i1]);
+        builder.ins().call(store_ref, &[ptr, l, u8_type_size, i2]);
+        builder.ins().call(store_ref, &[ptr, l, u8_type_size, i3]);
+        builder.ins().call(store_ref, &[ptr, o, u8_type_size, i4]);
+
+        let Some(FuncOrDataId::Func(exit_id)) = ctx.module().get_name("rt_exit") else {
             bail!("RT func 'exit' is not define")
         };
 
@@ -115,8 +137,7 @@ impl Runtime {
             .module_mut()
             .declare_func_in_func(exit_id, &mut builder.func);
 
-        let zero = builder.ins().iconst(pointer_type, 0);
-
+        let zero = builder.inst_results(allocate_call)[0];
         builder.ins().call(exit_ref, &[zero]);
         builder.ins().trap(TrapCode::user(0xDE).unwrap());
 

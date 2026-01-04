@@ -1,5 +1,5 @@
 #[unsafe(no_mangle)]
-unsafe extern "C" fn syscall(
+unsafe extern "C" fn rt_syscall(
     n: usize,
     a1: usize,
     a2: usize,
