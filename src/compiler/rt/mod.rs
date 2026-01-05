@@ -32,14 +32,12 @@ impl Default for Runtime {
 }
 
 impl Runtime {
-    fn init(&self, ctx: CompilerCtx) -> Result<CompilerCtx> {
+    pub fn init(&self, ctx: CompilerCtx) -> Result<CompilerCtx> {
         init_rw(init_heap_memory_funcs(init_mmap_func(init_exit_func(
             init_syscall_wrapper(ctx)?,
         )?)?)?)
     }
-    pub fn build(self, ctx: CompilerCtx) -> Result<CompilerCtx> {
-        let mut ctx = self.init(ctx)?;
-
+    pub fn build(self, mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         let pointer_type = ctx.module().target_config().pointer_type();
         let mut builder_ctx = FunctionBuilderContext::default();
         let mut module_ctx = ctx.module().make_context();
@@ -90,6 +88,17 @@ impl Runtime {
                 .ins()
                 .store(MemFlags::new(), heap_end_addr, heap_end_ptr, 0);
         }
+
+        let Some(FuncOrDataId::Func(main_id)) = ctx.module().get_name("main") else {
+            bail!("main is not declare");
+        };
+
+        let main_ref = ctx
+            .module_mut()
+            .declare_func_in_func(main_id, &mut builder.func);
+        let branch_id = ctx.lookup_param_count("main", 0).unwrap();
+        let branch_id_val = builder.ins().iconst(pointer_type, branch_id as i64);
+        builder.ins().call(main_ref, &[branch_id_val]);
 
         let Some(FuncOrDataId::Func(exit_id)) = ctx.module().get_name("rt_exit") else {
             bail!("RT func 'exit' is not define")

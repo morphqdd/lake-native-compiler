@@ -1,12 +1,21 @@
+use std::collections::HashMap;
+
+use anyhow::Result;
 use cranelift::{
     module::default_libcall_names,
     native,
     object::{ObjectBuilder, ObjectModule, ObjectProduct},
-    prelude::{Configurable, settings},
+    prelude::{Configurable, Type, settings},
 };
+
+use crate::compiler::ctx::compiler_type::CompilerType;
+
+pub mod compiler_type;
 
 pub struct CompilerCtx {
     module: ObjectModule,
+    machine_map: HashMap<String, HashMap<u64, (usize, u128)>>,
+    ty_map: HashMap<String, CompilerType>,
 }
 
 impl Default for CompilerCtx {
@@ -23,7 +32,14 @@ impl Default for CompilerCtx {
 
         let builder = ObjectBuilder::new(isa, "lake-program", default_libcall_names()).unwrap();
         let module = ObjectModule::new(builder);
-        Self { module }
+        Self {
+            module,
+            machine_map: HashMap::new(),
+            ty_map: HashMap::from([
+                ("i64".into(), CompilerType::Simple(Type::int(64).unwrap())),
+                ("str".into(), CompilerType::Simple(Type::int(64).unwrap())),
+            ]),
+        }
     }
 }
 
@@ -38,5 +54,42 @@ impl CompilerCtx {
 
     pub fn finish(self) -> ObjectProduct {
         self.module.finish()
+    }
+
+    pub fn add_machine(&mut self, ident: &str) {
+        self.machine_map.insert(ident.to_string(), HashMap::new());
+    }
+
+    pub fn insert_pattern(
+        &mut self,
+        ident: &str,
+        hash: u64,
+        param_count: usize,
+        block_id: u128,
+    ) -> Result<()> {
+        self.machine_map
+            .get_mut(ident)
+            .ok_or(anyhow::anyhow!("Not found machine with name: {ident}"))?
+            .insert(hash, (param_count, block_id));
+        Ok(())
+    }
+
+    pub fn lookup_param_count(&self, ident: &str, count: usize) -> Option<u128> {
+        match self.machine_map.get(ident) {
+            Some(machine) => machine
+                .values()
+                .find(|(param_count, _)| param_count == &count)
+                .map(|(_, block_id)| block_id)
+                .copied(),
+            None => None,
+        }
+    }
+
+    pub fn machines(&self) -> &HashMap<String, HashMap<u64, (usize, u128)>> {
+        &self.machine_map
+    }
+
+    pub fn lookup_type(&self, ty: &str) -> Option<&CompilerType> {
+        self.ty_map.get(ty)
     }
 }

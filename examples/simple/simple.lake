@@ -1,4 +1,3 @@
 main is {
-  n i32.1 -> { rt_write(1 n 1) }
-  n i32 -> { rt_write(1 n 1) }
+  n str."Hello, world!" -> { rt_write_static(1 n 13) }
 }
