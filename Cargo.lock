@@ -101,6 +101,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "base64ct"
+version = "1.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d809780667f4410e7c41b07f52439b94d2bdf8528eeedc287fa38d3b7f95d82"
+
+[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -645,7 +651,7 @@ dependencies = [
 [[package]]
 name = "lake-frontend"
 version = "0.1.0"
-source = "git+https://github.com/morphqdd/lake_frontend.git?branch=dev#c7a35a563549e3c28ae6534e0368b550435ff779"
+source = "git+https://github.com/morphqdd/lake_frontend.git?branch=dev#35b0f746631060b0e2b3b5c91463161969f15f4d"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -660,6 +666,7 @@ name = "lake-native-compiler"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64ct",
  "blink",
  "cranelift",
  "cranelift-wasm",

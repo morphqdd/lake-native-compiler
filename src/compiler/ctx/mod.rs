@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use cranelift::{
-    module::default_libcall_names,
+    codegen::ir::{FuncRef, Function},
+    module::{FuncId, FuncOrDataId, Module, default_libcall_names},
     native,
     object::{ObjectBuilder, ObjectModule, ObjectProduct},
-    prelude::{Configurable, Type, settings},
+    prelude::{Configurable, FunctionBuilder, Type, settings},
 };
 
 use crate::compiler::ctx::compiler_type::CompilerType;
@@ -16,6 +17,7 @@ pub struct CompilerCtx {
     module: ObjectModule,
     machine_map: HashMap<String, HashMap<u64, (usize, u128)>>,
     ty_map: HashMap<String, CompilerType>,
+    declared_funcs_in_funcs: HashMap<String, HashMap<String, FuncRef>>,
 }
 
 impl Default for CompilerCtx {
@@ -39,6 +41,7 @@ impl Default for CompilerCtx {
                 ("i64".into(), CompilerType::Simple(Type::int(64).unwrap())),
                 ("str".into(), CompilerType::Simple(Type::int(64).unwrap())),
             ]),
+            declared_funcs_in_funcs: HashMap::new(),
         }
     }
 }
@@ -91,5 +94,40 @@ impl CompilerCtx {
 
     pub fn lookup_type(&self, ty: &str) -> Option<&CompilerType> {
         self.ty_map.get(ty)
+    }
+
+    pub fn get_func(&mut self, builder: &mut FunctionBuilder, ident: &str) -> Result<FuncRef> {
+        let func_id = match self
+            .declared_funcs_in_funcs
+            .get(&builder.func.name.to_string())
+        {
+            Some(func_map) => match func_map.get(ident) {
+                Some(func_ref) => return Ok(func_ref.clone()),
+                None => {
+                    let Some(FuncOrDataId::Func(func_id)) = self.module.get_name(ident) else {
+                        bail!("Function {ident} is not declare")
+                    };
+                    func_id
+                }
+            },
+            None => {
+                self.declared_funcs_in_funcs
+                    .insert(builder.func.name.clone().to_string(), HashMap::new());
+                let Some(FuncOrDataId::Func(func_id)) = self.module.get_name(ident) else {
+                    bail!("Function {ident} is not declare")
+                };
+                func_id
+            }
+        };
+
+        let func_ref = self
+            .module_mut()
+            .declare_func_in_func(func_id, builder.func);
+
+        if let Some(func_map) = self.declared_funcs_in_funcs.get_mut(ident) {
+            func_map.insert(ident.to_string(), func_ref.clone());
+        }
+
+        Ok(func_ref)
     }
 }

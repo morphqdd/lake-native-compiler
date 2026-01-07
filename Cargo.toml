@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
+base64ct = {version = "1.8.2", features = ['alloc']}
 blink = { git = "https://github.com/morphqdd/blink", version = "0.0.0" }
 cranelift = { version = "0.127.0", features = ["module", "native", "object"] }
 cranelift-wasm = "0.112.3"

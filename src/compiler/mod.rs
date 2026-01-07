@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{Result, bail};
+use base64ct::{Base64, Encoding};
 use cranelift::{
     codegen::ir::BlockArg,
     frontend::Switch,
@@ -17,7 +18,7 @@ use cranelift::{
 };
 use lake_frontend::{
     api::{
-        ast::{Branch, Machine, Pattern, Type},
+        ast::{Branch, Ident, Machine, Pattern, Type},
         expr::Expr,
     },
     prelude::parse,
@@ -27,6 +28,11 @@ use crate::compiler::{ctx::CompilerCtx, rt::Runtime};
 
 mod ctx;
 mod rt;
+
+const BRANCH_ID: i64 = 0;
+const BLOCK_ID: i64 = 8;
+const TEMP_VAL: i64 = 16;
+const VARIABLES: i64 = 24;
 
 pub fn link<BP: AsRef<Path>>(build_path: BP, name: &str, bytes: &[u8]) -> Result<()> {
     fs::create_dir_all(&build_path)?;
@@ -93,7 +99,7 @@ pub fn compile<SP: AsRef<Path>>(source_path: SP) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn hash(patterns: &[Pattern<'_>]) -> (u64, usize) {
+fn hash_pattern(patterns: &[Pattern<'_>]) -> (u64, usize) {
     let mut param_count = 0;
     let mut hasher = DefaultHasher::new();
     for pattern in patterns {
@@ -118,16 +124,19 @@ fn compile_machine(mut ctx: CompilerCtx, machine: &Machine<'_>) -> Result<Compil
     let mut builder = FunctionBuilder::new(&mut module_ctx.func, &mut builder_ctx);
 
     builder.func.signature.params.push(AbiParam::new(ptr_ty));
+    builder.func.signature.returns.push(AbiParam::new(ptr_ty));
 
     let entry = builder.create_block();
     let default_block = builder.create_block();
     let switch_block = builder.create_block();
     builder.append_block_param(entry, ptr_ty);
-    builder.append_block_param(switch_block, ptr_ty);
 
     builder.switch_to_block(entry);
-    let val = builder.block_params(entry)[0];
-    builder.ins().jump(switch_block, &[BlockArg::Value(val)]);
+    let ctx_ptr = builder.block_params(entry)[0];
+    let machine_ctx_var = builder.declare_var(ptr_ty);
+    builder.def_var(machine_ctx_var, ctx_ptr);
+
+    builder.ins().jump(switch_block, &[]);
 
     let mut switch = Switch::new();
 
@@ -139,15 +148,32 @@ fn compile_machine(mut ctx: CompilerCtx, machine: &Machine<'_>) -> Result<Compil
             &mut switch,
             block_id as u128,
             branch,
+            machine_ctx_var,
         )?;
     }
 
     builder.switch_to_block(switch_block);
-    let val = builder.block_params(switch_block)[0];
-    switch.emit(&mut builder, val, default_block);
+    let ctx_ptr = builder.use_var(machine_ctx_var);
+
+    let Some(FuncOrDataId::Func(rt_load_u64_id)) = ctx.module().get_name("rt_load_u64") else {
+        bail!("rt_load_u64 is not declare");
+    };
+
+    let rt_load_u64_ref = ctx
+        .module_mut()
+        .declare_func_in_func(rt_load_u64_id, &mut builder.func);
+
+    let branch_id_offset = builder.ins().iconst(ptr_ty, BRANCH_ID);
+    let call_inst = builder
+        .ins()
+        .call(rt_load_u64_ref, &[ctx_ptr, branch_id_offset]);
+    let branch_id = builder.inst_results(call_inst)[0];
+    switch.emit(&mut builder, branch_id, default_block);
 
     builder.switch_to_block(default_block);
-    builder.ins().return_(&[]);
+
+    let neg = builder.ins().iconst(ptr_ty, -1);
+    builder.ins().return_(&[neg]);
 
     builder.seal_all_blocks();
 
@@ -156,9 +182,9 @@ fn compile_machine(mut ctx: CompilerCtx, machine: &Machine<'_>) -> Result<Compil
     let id = ctx
         .module_mut()
         .declare_function(&machine_ident, Linkage::Export, &machine_sig)?;
-    ctx.module_mut().define_function(id, &mut module_ctx)?;
 
     println!("{machine_ident}: {}", module_ctx.func);
+    ctx.module_mut().define_function(id, &mut module_ctx)?;
 
     ctx.module_mut().clear_context(&mut module_ctx);
 
@@ -172,61 +198,77 @@ fn compile_branch(
     switch: &mut Switch,
     block_id: u128,
     branch: &Branch<'_>,
+    machine_ctx_var: Variable,
 ) -> Result<CompilerCtx> {
+    let ptr_ty = ctx.module().target_config().pointer_type();
     let patterns = branch.patterns();
-    let (hash, count) = hash(&patterns);
+    let (hash, count) = hash_pattern(&patterns);
     ctx.insert_pattern(&machine_ident, hash, count, block_id)?;
 
-    let branch_block = builder.create_block();
-    builder.switch_to_block(branch_block);
-    switch.set_entry(block_id, branch_block);
+    let branch_entry_block = builder.create_block();
+    let branch_switch_block = builder.create_block();
+    builder.append_block_param(branch_switch_block, ptr_ty);
+    let default_branch_block = builder.create_block();
+    builder.switch_to_block(default_branch_block);
+    let neg = builder.ins().iconst(ptr_ty, -1);
+    builder.ins().return_(&[neg]);
+
+    switch.set_entry(block_id, branch_entry_block);
+
+    builder.switch_to_block(branch_entry_block);
+
+    let ctx_ptr = builder.use_var(machine_ctx_var);
+    let load_u64_ref = ctx.get_func(builder, "rt_load_u64")?;
+    let block_id_offset = builder.ins().iconst(ptr_ty, BLOCK_ID);
+
+    let call = builder
+        .ins()
+        .call(load_u64_ref, &[ctx_ptr, block_id_offset]);
+
+    let block_id = builder.inst_results(call)[0];
+
+    builder
+        .ins()
+        .jump(branch_switch_block, &[BlockArg::Value(block_id)]);
 
     let mut state = HashMap::new();
 
-    for pattern in patterns {
+    // for pattern in patterns {
+    //     if pattern.has_default() {
+    //         let ident = pattern.ident();
+    //         let ty_str = pattern.ty().to_string();
+    //         let ty = ctx.lookup_type(&ty_str).unwrap().clone();
+    //         let var_id = compile_expr(&mut ctx, builder, &state, &pattern.default().unwrap())?;
+    //         state.insert(ident.to_string(), var_id);
+    //     }
+    // }
+
+    let mut branch_switch = Switch::new();
+    let mut block_id = 0;
+    for pattern in &patterns {
         if pattern.has_default() {
-            let ident = pattern.ident();
-            let ty_str = pattern.ty().to_string();
-            let ty = ctx.lookup_type(&ty_str).unwrap().clone();
-            let default_val = compile_expr(
+            let next_block = compile_expr(
                 &mut ctx,
                 builder,
-                &state,
-                pattern.default().unwrap(),
-                &ty_str,
+                machine_ctx_var,
+                block_id,
+                &mut branch_switch,
+                &mut state,
+                &Expr::from(pattern),
             )?;
-            let var = builder.declare_var(ty.unwrap_simple());
-            builder.def_var(var, default_val);
-            state.insert(ident.to_string(), var);
+            block_id = next_block
         }
     }
 
     let body = branch.body();
 
-    for expr in body {
-        match expr {
-            Expr::Jump { ident, args } => match ident.inner {
-                Expr::Var(v) => match ctx.module().get_name(v) {
-                    Some(FuncOrDataId::Func(func_id)) => {
-                        let mut parsed_args = vec![];
-                        for arg in args {
-                            let val = compile_expr(&mut ctx, builder, &state, arg.inner, "i64")?;
-                            parsed_args.push(val);
-                        }
-                        let func_ref = ctx
-                            .module_mut()
-                            .declare_func_in_func(func_id, &mut builder.func);
-                        builder.ins().call(func_ref, &parsed_args);
-                    }
-                    _ => bail!("Machine is not declare: {v}"),
-                },
-                _ => todo!(),
-            },
-            _ => todo!(),
-        }
+    for expr in &body {
+        // let next_id = compile_expr(&mut ctx, builder, &state, expr);
     }
 
-    builder.ins().return_(&[]);
+    builder.switch_to_block(branch_switch_block);
+    let block_id = builder.block_params(branch_switch_block)[0];
+    branch_switch.emit(builder, block_id, default_branch_block);
 
     println!("{hash} state: {state:?}");
 
@@ -236,19 +278,157 @@ fn compile_branch(
 fn compile_expr(
     ctx: &mut CompilerCtx,
     builder: &mut FunctionBuilder,
-    state: &HashMap<String, Variable>,
-    expr: Expr<'_>,
-    ty: &str,
-) -> Result<Value> {
+    machine_ctx_var: Variable,
+    block_id: usize,
+    branch_switch: &mut Switch,
+    state: &mut HashMap<String, (cranelift::prelude::Type, usize)>,
+    expr: &Expr<'_>,
+) -> Result<usize> {
     let ptr_ty = ctx.module().target_config().pointer_type();
     match expr {
-        Expr::Num(num_str) => match ty {
-            "i64" => Ok(builder.ins().iconst(
-                cranelift::prelude::Type::int(64).unwrap(),
-                num_str.parse::<i64>()?,
-            )),
-            _ => todo!(),
-        },
+        Expr::Let { ident, ty, default } => {
+            let next_id = match default {
+                Some(default) => compile_expr(
+                    ctx,
+                    builder,
+                    machine_ctx_var,
+                    block_id,
+                    branch_switch,
+                    state,
+                    default,
+                )?,
+                None => block_id,
+            };
+
+            let b = builder.create_block();
+            builder.switch_to_block(b);
+
+            let var_index = state
+                .values()
+                .map(|(_, x)| x)
+                .max()
+                .map(|x| x + 1)
+                .unwrap_or(0);
+
+            state.insert(
+                ident.to_string(),
+                (
+                    ctx.lookup_type(&ty.to_string())
+                        .cloned()
+                        .unwrap()
+                        .unwrap_simple(),
+                    var_index,
+                ),
+            );
+
+            let ctx_ptr = builder.use_var(machine_ctx_var);
+            let store_ref = ctx.get_func(builder, "rt_store")?;
+            let load_u64_ref = ctx.get_func(builder, "rt_load_u64")?;
+            let temp_val_offset = builder.ins().iconst(ptr_ty, TEMP_VAL);
+            let call = builder
+                .ins()
+                .call(load_u64_ref, &[ctx_ptr, temp_val_offset]);
+            let temp_val = builder.inst_results(call)[0];
+            let size = builder.ins().iconst(ptr_ty, 8);
+            let var_offset = builder.ins().iconst(ptr_ty, var_index as i64 * 8);
+            builder
+                .ins()
+                .call(store_ref, &[ctx_ptr, temp_val, size, var_offset]);
+            let next_id_val = builder.ins().iconst(ptr_ty, next_id as i64 + 1);
+            builder.ins().return_(&[next_id_val]);
+
+            branch_switch.set_entry(next_id as u128, b);
+
+            Ok(next_id + 1)
+        }
+        Expr::String(str) => {
+            let b = builder.create_block();
+            builder.switch_to_block(b);
+
+            let mut hasher = DefaultHasher::new();
+            str.hash(&mut hasher);
+            let hash = hasher.finish();
+            let encoded_str = Base64::encode_string(&hash.to_be_bytes());
+            let data_id = match ctx.module().get_name(&encoded_str) {
+                Some(FuncOrDataId::Data(str_id)) => str_id,
+                _ => ctx
+                    .module_mut()
+                    .declare_data(&encoded_str, Linkage::Export, false, false)?,
+            };
+            let mut data = DataDescription::new();
+            data.define(str.as_bytes().to_vec().into_boxed_slice());
+            ctx.module_mut().define_data(data_id, &data)?;
+
+            let data_gv = ctx
+                .module_mut()
+                .declare_data_in_func(data_id, &mut builder.func);
+            let data_ptr = builder.ins().global_value(ptr_ty, data_gv);
+
+            let data_fat_ptr_name = format!("fp_{encoded_str}");
+            let data_fat_ptr_id = match ctx.module().get_name(&data_fat_ptr_name) {
+                Some(FuncOrDataId::Data(id)) => id,
+                _ => ctx.module_mut().declare_data(
+                    &data_fat_ptr_name,
+                    Linkage::Export,
+                    true,
+                    false,
+                )?,
+            };
+
+            let mut fat_ptr_data = DataDescription::new();
+            fat_ptr_data.define_zeroinit(16);
+            ctx.module_mut()
+                .define_data(data_fat_ptr_id, &fat_ptr_data)?;
+
+            let data_fat_ptr_gv = ctx
+                .module_mut()
+                .declare_data_in_func(data_fat_ptr_id, builder.func);
+
+            let data_fat_ptr = builder.ins().global_value(ptr_ty, data_fat_ptr_gv);
+            let end_ptr = builder
+                .ins()
+                .iadd_imm(data_ptr, str.as_bytes().len() as i64);
+
+            builder
+                .ins()
+                .store(MemFlags::new(), data_ptr, data_fat_ptr, 0);
+            builder
+                .ins()
+                .store(MemFlags::new(), end_ptr, data_fat_ptr, 8);
+
+            let ctx_ptr = builder.use_var(machine_ctx_var);
+            let store_ref = ctx.get_func(builder, "rt_store")?;
+            let temp_val_offset = builder.ins().iconst(ptr_ty, TEMP_VAL);
+            let size = builder.ins().iconst(ptr_ty, 8);
+
+            builder
+                .ins()
+                .call(store_ref, &[ctx_ptr, data_fat_ptr, size, temp_val_offset]);
+
+            let next_id_val = builder.ins().iconst(ptr_ty, block_id as i64 + 1);
+            builder.ins().return_(&[next_id_val]);
+
+            branch_switch.set_entry(block_id as u128, b);
+
+            Ok(block_id + 1)
+        }
+        _ => todo!(),
+    }
+}
+
+fn _compile_expr(
+    ctx: &mut CompilerCtx,
+    builder: &mut FunctionBuilder,
+    ctx_ptr: Variable,
+    state: &HashMap<String, usize>,
+    expr: &Expr<'_>,
+) -> Result<usize> {
+    let ptr_ty = ctx.module().target_config().pointer_type();
+    let d: Result<Value> = match expr {
+        Expr::Num(num_str) => Ok(builder.ins().iconst(
+            cranelift::prelude::Type::int(64).unwrap(),
+            num_str.parse::<i64>()?,
+        )),
         Expr::String(str) => {
             let data_id = match ctx.module().get_name(str) {
                 Some(FuncOrDataId::Data(str_id)) => str_id,
@@ -266,7 +446,7 @@ fn compile_expr(
             let data_ptr = builder.ins().global_value(ptr_ty, data_gv);
             Ok(data_ptr)
         }
-        Expr::Var(v) => Ok(builder.use_var(state.get(v).unwrap().clone())),
+        // Expr::Var(v) => Ok(builder.use_var(state.get(*v).unwrap().clone())),
         Expr::Bool(_) => todo!(),
         Expr::Path(path) => todo!(),
         Expr::Let { ident, ty, default } => todo!(),
@@ -277,7 +457,10 @@ fn compile_expr(
         Expr::Sub(spanned, spanned1) => todo!(),
         Expr::Branch { var_pattern, body } => todo!(),
         Expr::Machine { ident, branches } => todo!(),
-    }
+        _ => todo!(),
+    };
+
+    todo!()
 }
 
 #[cfg(test)]
