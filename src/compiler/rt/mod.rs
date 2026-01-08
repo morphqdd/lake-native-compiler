@@ -49,48 +49,48 @@ impl Runtime {
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
 
-        if let Some(FuncOrDataId::Func(mmap_id)) = ctx.module().get_name("rt_mmap")
-            && let Some(FuncOrDataId::Data(heap_base_id)) = ctx.module().get_name("heap_base")
-            && let Some(FuncOrDataId::Data(heap_curr_id)) = ctx.module().get_name("heap_curr")
-            && let Some(FuncOrDataId::Data(heap_end_id)) = ctx.module().get_name("heap_end")
-        {
-            let mmap_ref = ctx
-                .module_mut()
-                .declare_func_in_func(mmap_id, &mut builder.func);
-            let heap_size = builder.ins().iconst(pointer_type, HEAP_SIZE);
-
-            let mmap_call = builder.ins().call(mmap_ref, &[heap_size]);
-
-            let heap_base_addr = builder.inst_results(mmap_call)[0];
-            let heap_end_addr = builder.ins().iadd(heap_base_addr, heap_size);
-
-            let heap_base_gv = ctx
-                .module_mut()
-                .declare_data_in_func(heap_base_id, &mut builder.func);
-
-            let heap_curr_gv = ctx
-                .module_mut()
-                .declare_data_in_func(heap_curr_id, &mut builder.func);
-
-            let heap_end_gv = ctx
-                .module_mut()
-                .declare_data_in_func(heap_end_id, &mut builder.func);
-
-            let heap_base_ptr = builder.ins().global_value(pointer_type, heap_base_gv);
-            let heap_curr_ptr = builder.ins().global_value(pointer_type, heap_curr_gv);
-            let heap_end_ptr = builder.ins().global_value(pointer_type, heap_end_gv);
-
-            builder
-                .ins()
-                .store(MemFlags::new(), heap_base_addr, heap_base_ptr, 0);
-            builder
-                .ins()
-                .store(MemFlags::new(), heap_base_addr, heap_curr_ptr, 0);
-            builder
-                .ins()
-                .store(MemFlags::new(), heap_end_addr, heap_end_ptr, 0);
-        }
-
+        // if let Some(FuncOrDataId::Func(mmap_id)) = ctx.module().get_name("rt_mmap")
+        //     && let Some(FuncOrDataId::Data(heap_base_id)) = ctx.module().get_name("heap_base")
+        //     && let Some(FuncOrDataId::Data(heap_curr_id)) = ctx.module().get_name("heap_curr")
+        //     && let Some(FuncOrDataId::Data(heap_end_id)) = ctx.module().get_name("heap_end")
+        // {
+        //     let mmap_ref = ctx
+        //         .module_mut()
+        //         .declare_func_in_func(mmap_id, &mut builder.func);
+        //     let heap_size = builder.ins().iconst(pointer_type, HEAP_SIZE);
+        //
+        //     let mmap_call = builder.ins().call(mmap_ref, &[heap_size]);
+        //
+        //     let heap_base_addr = builder.inst_results(mmap_call)[0];
+        //     let heap_end_addr = builder.ins().iadd(heap_base_addr, heap_size);
+        //
+        //     let heap_base_gv = ctx
+        //         .module_mut()
+        //         .declare_data_in_func(heap_base_id, &mut builder.func);
+        //
+        //     let heap_curr_gv = ctx
+        //         .module_mut()
+        //         .declare_data_in_func(heap_curr_id, &mut builder.func);
+        //
+        //     let heap_end_gv = ctx
+        //         .module_mut()
+        //         .declare_data_in_func(heap_end_id, &mut builder.func);
+        //
+        //     let heap_base_ptr = builder.ins().global_value(pointer_type, heap_base_gv);
+        //     let heap_curr_ptr = builder.ins().global_value(pointer_type, heap_curr_gv);
+        //     let heap_end_ptr = builder.ins().global_value(pointer_type, heap_end_gv);
+        //
+        //     builder
+        //         .ins()
+        //         .store(MemFlags::new(), heap_base_addr, heap_base_ptr, 0);
+        //     builder
+        //         .ins()
+        //         .store(MemFlags::new(), heap_base_addr, heap_curr_ptr, 0);
+        //     builder
+        //         .ins()
+        //         .store(MemFlags::new(), heap_end_addr, heap_end_ptr, 0);
+        // }
+        //
         let main_ref = ctx.get_func(&mut builder, "main")?;
 
         let branch_id = ctx.lookup_param_count("main", 0).unwrap();
