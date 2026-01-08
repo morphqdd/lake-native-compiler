@@ -15,7 +15,7 @@ pub mod compiler_type;
 
 pub struct CompilerCtx {
     module: ObjectModule,
-    machine_map: HashMap<String, HashMap<u64, (usize, u128)>>,
+    machine_map: HashMap<String, HashMap<u64, (usize, u128, usize)>>,
     ty_map: HashMap<String, CompilerType>,
     declared_funcs_in_funcs: HashMap<String, HashMap<String, FuncRef>>,
 }
@@ -69,11 +69,12 @@ impl CompilerCtx {
         hash: u64,
         param_count: usize,
         block_id: u128,
+        ctx_variables: usize,
     ) -> Result<()> {
         self.machine_map
             .get_mut(ident)
             .ok_or(anyhow::anyhow!("Not found machine with name: {ident}"))?
-            .insert(hash, (param_count, block_id));
+            .insert(hash, (param_count, block_id, ctx_variables));
         Ok(())
     }
 
@@ -81,14 +82,14 @@ impl CompilerCtx {
         match self.machine_map.get(ident) {
             Some(machine) => machine
                 .values()
-                .find(|(param_count, _)| param_count == &count)
-                .map(|(_, block_id)| block_id)
+                .find(|(param_count, _, _)| param_count == &count)
+                .map(|(_, block_id, _)| block_id)
                 .copied(),
             None => None,
         }
     }
 
-    pub fn machines(&self) -> &HashMap<String, HashMap<u64, (usize, u128)>> {
+    pub fn machines(&self) -> &HashMap<String, HashMap<u64, (usize, u128, usize)>> {
         &self.machine_map
     }
 
@@ -129,5 +130,12 @@ impl CompilerCtx {
         }
 
         Ok(func_ref)
+    }
+
+    pub fn lookup_vars_count(&self, branch_id: u128) -> Option<usize> {
+        self.machine_map
+            .values()
+            .find_map(|map| map.values().find(|(_, id, _)| id == &branch_id))
+            .map(|&(_, _, vars_count)| vars_count)
     }
 }

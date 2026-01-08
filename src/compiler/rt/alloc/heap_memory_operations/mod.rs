@@ -60,7 +60,7 @@ fn init_allocate(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
         let cond = builder
             .ins()
-            .icmp(IntCC::UnsignedLessThan, end_addr, heap_end_addr);
+            .icmp(IntCC::UnsignedLessThanOrEqual, end_addr, heap_end_addr);
         builder.ins().trapz(cond, TrapCode::HEAP_OUT_OF_BOUNDS);
 
         builder
@@ -122,7 +122,7 @@ fn init_store(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let user_data_end_ptr = builder.ins().load(ty, MemFlags::new(), fat_ptr, 8);
 
     let cond = builder.ins().icmp(
-        IntCC::UnsignedLessThan,
+        IntCC::UnsignedLessThanOrEqual,
         ptr_to_end_of_val,
         user_data_end_ptr,
     );
@@ -176,14 +176,14 @@ fn init_load(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
             bail!("Need 2 params")
         };
 
-        let size = builder.ins().iconst(ty, bit as i64);
+        let size = builder.ins().iconst(ty, (bit / 8) as i64);
         let user_data_base_ptr = builder.ins().load(ty, MemFlags::new(), fat_ptr, 0);
         let user_data_offeset_ptr = builder.ins().iadd(user_data_base_ptr, offset);
         let ptr_to_end_of_val = builder.ins().iadd(user_data_offeset_ptr, size);
         let user_data_end_ptr = builder.ins().load(ty, MemFlags::new(), fat_ptr, 8);
 
         let cond = builder.ins().icmp(
-            IntCC::UnsignedLessThan,
+            IntCC::UnsignedLessThanOrEqual,
             ptr_to_end_of_val,
             user_data_end_ptr,
         );

@@ -46,7 +46,7 @@ pub fn init_write(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let user_data_end_ptr = builder.ins().load(ty, MemFlags::new(), fat_ptr, 8);
 
     let cond = builder.ins().icmp(
-        IntCC::UnsignedLessThan,
+        IntCC::UnsignedLessThanOrEqual,
         ptr_to_end_of_val,
         user_data_end_ptr,
     );

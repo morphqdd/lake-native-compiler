@@ -29,10 +29,12 @@ use crate::compiler::{ctx::CompilerCtx, rt::Runtime};
 mod ctx;
 mod rt;
 
-const BRANCH_ID: i64 = 0;
-const BLOCK_ID: i64 = 8;
-const TEMP_VAL: i64 = 16;
-const VARIABLES: i64 = 24;
+pub const CTX_SIZE: i64 = 40;
+pub const BRANCH_ID: i64 = 0;
+pub const BLOCK_ID: i64 = 8;
+pub const TEMP_VAL: i64 = 16;
+pub const VARIABLES: i64 = 24;
+pub const JUMP_ARGS: i64 = 32;
 
 pub fn link<BP: AsRef<Path>>(build_path: BP, name: &str, bytes: &[u8]) -> Result<()> {
     fs::create_dir_all(&build_path)?;
@@ -196,14 +198,13 @@ fn compile_branch(
     builder: &mut FunctionBuilder,
     machine_ident: &str,
     switch: &mut Switch,
-    block_id: u128,
+    branch_id: u128,
     branch: &Branch<'_>,
     machine_ctx_var: Variable,
 ) -> Result<CompilerCtx> {
     let ptr_ty = ctx.module().target_config().pointer_type();
     let patterns = branch.patterns();
     let (hash, count) = hash_pattern(&patterns);
-    ctx.insert_pattern(&machine_ident, hash, count, block_id)?;
 
     let branch_entry_block = builder.create_block();
     let branch_switch_block = builder.create_block();
@@ -213,7 +214,7 @@ fn compile_branch(
     let neg = builder.ins().iconst(ptr_ty, -1);
     builder.ins().return_(&[neg]);
 
-    switch.set_entry(block_id, branch_entry_block);
+    switch.set_entry(branch_id, branch_entry_block);
 
     builder.switch_to_block(branch_entry_block);
 
@@ -263,7 +264,16 @@ fn compile_branch(
     let body = branch.body();
 
     for expr in &body {
-        // let next_id = compile_expr(&mut ctx, builder, &state, expr);
+        let next_block = compile_expr(
+            &mut ctx,
+            builder,
+            machine_ctx_var,
+            block_id,
+            &mut branch_switch,
+            &mut state,
+            expr,
+        )?;
+        block_id = next_block
     }
 
     builder.switch_to_block(branch_switch_block);
@@ -272,6 +282,13 @@ fn compile_branch(
 
     println!("{hash} state: {state:?}");
 
+    ctx.insert_pattern(
+        &machine_ident,
+        hash,
+        count,
+        branch_id,
+        state.values().count(),
+    )?;
     Ok(ctx)
 }
 
@@ -279,12 +296,13 @@ fn compile_expr(
     ctx: &mut CompilerCtx,
     builder: &mut FunctionBuilder,
     machine_ctx_var: Variable,
-    block_id: usize,
+    block_id: i64,
     branch_switch: &mut Switch,
     state: &mut HashMap<String, (cranelift::prelude::Type, usize)>,
     expr: &Expr<'_>,
-) -> Result<usize> {
+) -> Result<i64> {
     let ptr_ty = ctx.module().target_config().pointer_type();
+    println!("BLOCK_ID: {block_id}");
     match expr {
         Expr::Let { ident, ty, default } => {
             let next_id = match default {
@@ -330,10 +348,14 @@ fn compile_expr(
                 .call(load_u64_ref, &[ctx_ptr, temp_val_offset]);
             let temp_val = builder.inst_results(call)[0];
             let size = builder.ins().iconst(ptr_ty, 8);
+            let var_offset = builder.ins().iconst(ptr_ty, VARIABLES);
+
+            let call = builder.ins().call(load_u64_ref, &[ctx_ptr, var_offset]);
+            let var_ptr = builder.inst_results(call)[0];
             let var_offset = builder.ins().iconst(ptr_ty, var_index as i64 * 8);
             builder
                 .ins()
-                .call(store_ref, &[ctx_ptr, temp_val, size, var_offset]);
+                .call(store_ref, &[var_ptr, temp_val, size, var_offset]);
             let next_id_val = builder.ins().iconst(ptr_ty, next_id as i64 + 1);
             builder.ins().return_(&[next_id_val]);
 
@@ -406,6 +428,140 @@ fn compile_expr(
                 .call(store_ref, &[ctx_ptr, data_fat_ptr, size, temp_val_offset]);
 
             let next_id_val = builder.ins().iconst(ptr_ty, block_id as i64 + 1);
+            builder.ins().return_(&[next_id_val]);
+
+            branch_switch.set_entry(block_id as u128, b);
+
+            Ok(block_id + 1)
+        }
+        Expr::Jump { ident, args } => {
+            let mut next_id = block_id;
+
+            for (i, arg) in args.iter().enumerate() {
+                let id = compile_expr(
+                    ctx,
+                    builder,
+                    machine_ctx_var,
+                    next_id,
+                    branch_switch,
+                    state,
+                    &arg,
+                )?;
+
+                let b = builder.create_block();
+                builder.switch_to_block(b);
+
+                let load_u64_ref = ctx.get_func(builder, "rt_load_u64")?;
+                let ctx_ptr = builder.use_var(machine_ctx_var);
+                let temp_val_offset = builder.ins().iconst(ptr_ty, TEMP_VAL);
+                let load_call = builder
+                    .ins()
+                    .call(load_u64_ref, &[ctx_ptr, temp_val_offset]);
+                let arg_val = builder.inst_results(load_call)[0];
+
+                let jump_args_offset = builder.ins().iconst(ptr_ty, JUMP_ARGS);
+                let load_call = builder
+                    .ins()
+                    .call(load_u64_ref, &[ctx_ptr, jump_args_offset]);
+                let args_ptr = builder.inst_results(load_call)[0];
+                let store_ref = ctx.get_func(builder, "rt_store")?;
+                let size = builder.ins().iconst(ptr_ty, 8);
+                let offset = builder.ins().iconst(ptr_ty, i as i64 * 8);
+                builder
+                    .ins()
+                    .call(store_ref, &[args_ptr, arg_val, size, offset]);
+                let next_block = builder.ins().iconst(ptr_ty, id + 1);
+                builder.ins().return_(&[next_block]);
+
+                branch_switch.set_entry(id as u128, b);
+
+                next_id = id + 1;
+            }
+
+            let b = builder.create_block();
+            builder.switch_to_block(b);
+
+            let Expr::Var(ident) = ident.inner else {
+                bail!("Ident must be var")
+            };
+
+            let load_u64_ref = ctx.get_func(builder, "rt_load_u64")?;
+            let ctx_ptr = builder.use_var(machine_ctx_var);
+            let jump_args_offset = builder.ins().iconst(ptr_ty, JUMP_ARGS);
+            let load_call = builder
+                .ins()
+                .call(load_u64_ref, &[ctx_ptr, jump_args_offset]);
+            let args_ptr = builder.inst_results(load_call)[0];
+
+            let mut vals = vec![];
+
+            for i in 0..args.len() {
+                let args_offset = builder.ins().iconst(ptr_ty, i as i64 * 8);
+                let call = builder.ins().call(load_u64_ref, &[args_ptr, args_offset]);
+                let val = builder.inst_results(call)[0];
+                vals.push(val);
+            }
+
+            let func_ref = ctx.get_func(builder, ident)?;
+
+            builder.ins().call(func_ref, &vals);
+
+            let next_block = builder.ins().iconst(ptr_ty, -1);
+            builder.ins().return_(&[next_block]);
+
+            branch_switch.set_entry(next_id as u128, b);
+            Ok(next_id + 1)
+        }
+        Expr::Num(num_str) => {
+            let num = num_str.parse::<i64>()?;
+
+            let b = builder.create_block();
+            builder.switch_to_block(b);
+
+            let num_val = builder.ins().iconst(ptr_ty, num);
+
+            let ctx_ptr = builder.use_var(machine_ctx_var);
+            let store_ref = ctx.get_func(builder, "rt_store")?;
+            let temp_val_offset = builder.ins().iconst(ptr_ty, TEMP_VAL);
+            let size = builder.ins().iconst(ptr_ty, 8);
+
+            builder
+                .ins()
+                .call(store_ref, &[ctx_ptr, num_val, size, temp_val_offset]);
+
+            let next_id_val = builder.ins().iconst(ptr_ty, block_id + 1);
+            builder.ins().return_(&[next_id_val]);
+            branch_switch.set_entry(block_id as u128, b);
+            Ok(block_id + 1)
+        }
+        Expr::Var(v) => {
+            let (_, var_index) = state.get(&v.to_string()).unwrap();
+
+            let b = builder.create_block();
+            builder.switch_to_block(b);
+
+            let var_val_offset = builder.ins().iconst(ptr_ty, *var_index as i64 * 8);
+            let load_u64_ref = ctx.get_func(builder, "rt_load_u64")?;
+            let vars_offset = builder.ins().iconst(ptr_ty, VARIABLES);
+            let ctx_ptr = builder.use_var(machine_ctx_var);
+            let call = builder.ins().call(load_u64_ref, &[ctx_ptr, vars_offset]);
+            let vars_ptr = builder.inst_results(call)[0];
+
+            let call = builder
+                .ins()
+                .call(load_u64_ref, &[vars_ptr, var_val_offset]);
+            let val = builder.inst_results(call)[0];
+
+            let ctx_ptr = builder.use_var(machine_ctx_var);
+            let store_ref = ctx.get_func(builder, "rt_store")?;
+            let temp_val_offset = builder.ins().iconst(ptr_ty, TEMP_VAL);
+            let size = builder.ins().iconst(ptr_ty, 8);
+
+            builder
+                .ins()
+                .call(store_ref, &[ctx_ptr, val, size, temp_val_offset]);
+
+            let next_id_val = builder.ins().iconst(ptr_ty, block_id + 1);
             builder.ins().return_(&[next_id_val]);
 
             branch_switch.set_entry(block_id as u128, b);
