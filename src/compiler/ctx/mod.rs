@@ -2,22 +2,31 @@ use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 use cranelift::{
-    codegen::ir::{FuncRef, Function},
+    codegen::ir::FuncRef,
     module::{FuncId, FuncOrDataId, Module, default_libcall_names},
     native,
     object::{ObjectBuilder, ObjectModule, ObjectProduct},
     prelude::{Configurable, FunctionBuilder, Type, settings},
 };
 
-use crate::compiler::ctx::compiler_type::CompilerType;
-
 pub mod compiler_type;
+pub mod registry;
+pub mod rt_funcs;
+
+use compiler_type::CompilerType;
+use registry::MachineRegistry;
+use rt_funcs::RtFuncs;
 
 pub struct CompilerCtx {
     module: ObjectModule,
-    machine_map: HashMap<String, HashMap<u64, (usize, u128, usize)>>,
+    /// Registry of all machines and their branch metadata.
+    registry: MachineRegistry,
+    /// Type map: Lake type name → Cranelift type.
     ty_map: HashMap<String, CompilerType>,
-    declared_funcs_in_funcs: HashMap<String, HashMap<String, FuncRef>>,
+    /// Typed handles to runtime functions. Set after `RuntimeBuilder::build()`.
+    rt_funcs: Option<RtFuncs>,
+    /// Cache of FuncRef declarations per (current_function_name, callee_name).
+    func_ref_cache: HashMap<(String, String), FuncRef>,
 }
 
 impl Default for CompilerCtx {
@@ -31,22 +40,25 @@ impl Default for CompilerCtx {
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
             .unwrap();
-
         let builder = ObjectBuilder::new(isa, "lake-program", default_libcall_names()).unwrap();
         let module = ObjectModule::new(builder);
         Self {
             module,
-            machine_map: HashMap::new(),
+            registry: MachineRegistry::default(),
             ty_map: HashMap::from([
                 ("i64".into(), CompilerType::Simple(Type::int(64).unwrap())),
+                ("i32".into(), CompilerType::Simple(Type::int(32).unwrap())),
                 ("str".into(), CompilerType::Simple(Type::int(64).unwrap())),
             ]),
-            declared_funcs_in_funcs: HashMap::new(),
+            rt_funcs: None,
+            func_ref_cache: HashMap::new(),
         }
     }
 }
 
 impl CompilerCtx {
+    // ── Module access ────────────────────────────────────────────────────────
+
     pub fn module(&self) -> &ObjectModule {
         &self.module
     }
@@ -59,83 +71,94 @@ impl CompilerCtx {
         self.module.finish()
     }
 
-    pub fn add_machine(&mut self, ident: &str) {
-        self.machine_map.insert(ident.to_string(), HashMap::new());
+    // ── Machine registry ─────────────────────────────────────────────────────
+
+    pub fn add_machine(&mut self, name: &str) {
+        self.registry.add_machine(name);
     }
 
     pub fn insert_pattern(
         &mut self,
-        ident: &str,
+        machine: &str,
         hash: u64,
         param_count: usize,
-        block_id: u128,
-        ctx_variables: usize,
+        branch_id: u128,
+        var_count: usize,
     ) -> Result<()> {
-        self.machine_map
-            .get_mut(ident)
-            .ok_or(anyhow::anyhow!("Not found machine with name: {ident}"))?
-            .insert(hash, (param_count, block_id, ctx_variables));
-        Ok(())
+        self.registry
+            .insert_branch(machine, hash, param_count, branch_id, var_count)
     }
 
-    pub fn lookup_param_count(&self, ident: &str, count: usize) -> Option<u128> {
-        match self.machine_map.get(ident) {
-            Some(machine) => machine
-                .values()
-                .find(|(param_count, _, _)| param_count == &count)
-                .map(|(_, block_id, _)| block_id)
-                .copied(),
-            None => None,
+    /// Return the `branch_id` for the branch of `machine` that takes `param_count` parameters.
+    pub fn lookup_param_count(&self, machine: &str, param_count: usize) -> Option<u128> {
+        self.registry.branch_id_by_param_count(machine, param_count)
+    }
+
+    /// Return the variable count for the branch identified by `branch_id`.
+    pub fn lookup_vars_count(&self, branch_id: u128) -> Option<usize> {
+        self.registry.var_count_by_branch_id(branch_id)
+    }
+
+    pub fn machines(&self) -> impl Iterator<Item = &str> {
+        self.registry.machine_names()
+    }
+
+    // ── Type system ──────────────────────────────────────────────────────────
+
+    pub fn lookup_type(&self, name: &str) -> Option<&CompilerType> {
+        self.ty_map.get(name)
+    }
+
+    // ── Runtime function handles ─────────────────────────────────────────────
+
+    /// Populate the typed runtime function handles.
+    /// Called by `RuntimeBuilder` after all rt functions have been declared.
+    pub fn set_rt_funcs(&mut self, rt: RtFuncs) {
+        self.rt_funcs = Some(rt);
+    }
+
+    pub fn rt_funcs(&self) -> &RtFuncs {
+        self.rt_funcs
+            .as_ref()
+            .expect("Runtime functions not yet initialised")
+    }
+
+    // ── FuncRef helper ───────────────────────────────────────────────────────
+
+    /// Call at the start of every new function compilation to reset the
+    /// per-function FuncRef cache.  FuncRefs are only valid within the
+    /// function they were declared in, so they must not be reused across
+    /// function compilations.
+    pub fn begin_function(&mut self) {
+        self.func_ref_cache.clear();
+    }
+
+    /// Get a `FuncRef` for `callee` usable inside the function currently being
+    /// built with `builder`. Results are cached per callee within the current
+    /// function scope (reset with `begin_function`).
+    pub fn get_func(&mut self, builder: &mut FunctionBuilder, callee: &str) -> Result<FuncRef> {
+        let key = (String::new(), callee.to_string());
+
+        if let Some(func_ref) = self.func_ref_cache.get(&key) {
+            return Ok(*func_ref);
         }
-    }
 
-    pub fn machines(&self) -> &HashMap<String, HashMap<u64, (usize, u128, usize)>> {
-        &self.machine_map
-    }
-
-    pub fn lookup_type(&self, ty: &str) -> Option<&CompilerType> {
-        self.ty_map.get(ty)
-    }
-
-    pub fn get_func(&mut self, builder: &mut FunctionBuilder, ident: &str) -> Result<FuncRef> {
-        let func_id = match self
-            .declared_funcs_in_funcs
-            .get(&builder.func.name.to_string())
-        {
-            Some(func_map) => match func_map.get(ident) {
-                Some(func_ref) => return Ok(func_ref.clone()),
-                None => {
-                    let Some(FuncOrDataId::Func(func_id)) = self.module.get_name(ident) else {
-                        bail!("Function {ident} is not declare")
-                    };
-                    func_id
-                }
-            },
-            None => {
-                self.declared_funcs_in_funcs
-                    .insert(builder.func.name.clone().to_string(), HashMap::new());
-                let Some(FuncOrDataId::Func(func_id)) = self.module.get_name(ident) else {
-                    bail!("Function {ident} is not declare")
-                };
-                func_id
-            }
+        let func_id = match self.module.get_name(callee) {
+            Some(FuncOrDataId::Func(id)) => id,
+            _ => bail!("Function '{callee}' is not declared"),
         };
 
-        let func_ref = self
-            .module_mut()
-            .declare_func_in_func(func_id, builder.func);
-
-        if let Some(func_map) = self.declared_funcs_in_funcs.get_mut(ident) {
-            func_map.insert(ident.to_string(), func_ref.clone());
-        }
-
+        let func_ref = self.module.declare_func_in_func(func_id, builder.func);
+        self.func_ref_cache.insert(key, func_ref);
         Ok(func_ref)
     }
 
-    pub fn lookup_vars_count(&self, branch_id: u128) -> Option<usize> {
-        self.machine_map
-            .values()
-            .find_map(|map| map.values().find(|(_, id, _)| id == &branch_id))
-            .map(|&(_, _, vars_count)| vars_count)
+    /// Like `get_func` but takes a `FuncId` directly (no string lookup).
+    pub fn declare_func_in_func(
+        &mut self,
+        func_id: FuncId,
+        builder: &mut FunctionBuilder,
+    ) -> FuncRef {
+        self.module.declare_func_in_func(func_id, builder.func)
     }
 }

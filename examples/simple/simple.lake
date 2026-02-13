@@ -1,3 +1,5 @@
 main is {
-  n str."Hello, world!" -> { rt_write(1 n 13) }
+  n str."Hello, world!" -> { 
+    rt_write(1 n 13)
+  }
 }

@@ -1,309 +1,224 @@
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow};
 use cranelift::{
     codegen::ir::BlockArg,
-    module::{DataDescription, FuncOrDataId, Linkage, Module},
+    module::{DataDescription, Linkage, Module},
     prelude::{
-        AbiParam, EntityRef, FunctionBuilder, FunctionBuilderContext, Imm64, InstBuilder, IntCC,
-        MemFlags, TrapCode, Type, Value,
+        FunctionBuilder, FunctionBuilderContext, InstBuilder, IntCC, MemFlags, TrapCode,
     },
 };
 
 use crate::compiler::{
-    BLOCK_ID, BRANCH_ID, CTX_SIZE, JUMP_ARGS, VARIABLES,
-    ctx::CompilerCtx,
+    ctx::{CompilerCtx, rt_funcs::RtFuncs},
     rt::{
-        alloc::{heap_memory_operations::init_heap_memory_funcs, mmap::init_mmap_func},
-        rt_utils::{exit::init_exit_func, init_syscall_wrapper},
-        rw::init_rw,
+        funcs::{
+            alloc::{define_allocate, define_loads, define_store},
+            exit::define_exit,
+            mmap::define_mmap,
+            syscall::declare_syscall_wrapper,
+            write::{define_write, define_write_static},
+        },
+        layout::{ExecCtxLayout, FatPtrLayout},
     },
 };
 
-mod alloc;
-mod process;
-mod rt_utils;
-mod rw;
+pub mod funcs;
+pub mod layout;
+pub mod scheduler;
 
-const HEAP_SIZE: i64 = 16 * 1024 * 1024;
+/// Builds the runtime layer of the compiled program.
+///
+/// Call `init()` before compiling any machines, then `build()` after all
+/// machines have been compiled. `build()` emits the `_start` entry point that
+/// contains the scheduler loop.
+pub struct RuntimeBuilder;
 
-pub struct Runtime {}
+impl RuntimeBuilder {
+    /// Declare and define all runtime functions.  Must be called first.
+    pub fn init(ctx: CompilerCtx) -> Result<CompilerCtx> {
+        let ctx = declare_syscall_wrapper(ctx)?;
+        let ctx = define_exit(ctx)?;
+        let ctx = define_mmap(ctx)?;
+        let ctx = define_allocate(ctx)?;
+        let ctx = define_store(ctx)?;
+        let ctx = define_loads(ctx)?;
+        let ctx = define_write(ctx)?;
+        let ctx = define_write_static(ctx)?;
 
-impl Default for Runtime {
-    fn default() -> Self {
-        Self {}
+        // Resolve and cache all FuncIds in the context.
+        let mut ctx = ctx;
+        let rt = RtFuncs::resolve(ctx.module())?;
+        ctx.set_rt_funcs(rt);
+        Ok(ctx)
     }
-}
 
-impl Runtime {
-    pub fn init(&self, ctx: CompilerCtx) -> Result<CompilerCtx> {
-        init_rw(init_heap_memory_funcs(init_mmap_func(init_exit_func(
-            init_syscall_wrapper(ctx)?,
-        )?)?)?)
-    }
-    pub fn build(self, mut ctx: CompilerCtx) -> Result<CompilerCtx> {
-        let pointer_type = ctx.module().target_config().pointer_type();
+    /// Emit `_start` — the scheduler loop that drives the main machine.
+    pub fn build(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
+        let ptr_ty = ctx.module().target_config().pointer_type();
         let mut builder_ctx = FunctionBuilderContext::default();
         let mut module_ctx = ctx.module().make_context();
         let mut builder = FunctionBuilder::new(&mut module_ctx.func, &mut builder_ctx);
+        ctx.begin_function();
 
         let entry_block = builder.create_block();
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
 
-        // if let Some(FuncOrDataId::Func(mmap_id)) = ctx.module().get_name("rt_mmap")
-        //     && let Some(FuncOrDataId::Data(heap_base_id)) = ctx.module().get_name("heap_base")
-        //     && let Some(FuncOrDataId::Data(heap_curr_id)) = ctx.module().get_name("heap_curr")
-        //     && let Some(FuncOrDataId::Data(heap_end_id)) = ctx.module().get_name("heap_end")
-        // {
-        //     let mmap_ref = ctx
-        //         .module_mut()
-        //         .declare_func_in_func(mmap_id, &mut builder.func);
-        //     let heap_size = builder.ins().iconst(pointer_type, HEAP_SIZE);
-        //
-        //     let mmap_call = builder.ins().call(mmap_ref, &[heap_size]);
-        //
-        //     let heap_base_addr = builder.inst_results(mmap_call)[0];
-        //     let heap_end_addr = builder.ins().iadd(heap_base_addr, heap_size);
-        //
-        //     let heap_base_gv = ctx
-        //         .module_mut()
-        //         .declare_data_in_func(heap_base_id, &mut builder.func);
-        //
-        //     let heap_curr_gv = ctx
-        //         .module_mut()
-        //         .declare_data_in_func(heap_curr_id, &mut builder.func);
-        //
-        //     let heap_end_gv = ctx
-        //         .module_mut()
-        //         .declare_data_in_func(heap_end_id, &mut builder.func);
-        //
-        //     let heap_base_ptr = builder.ins().global_value(pointer_type, heap_base_gv);
-        //     let heap_curr_ptr = builder.ins().global_value(pointer_type, heap_curr_gv);
-        //     let heap_end_ptr = builder.ins().global_value(pointer_type, heap_end_gv);
-        //
-        //     builder
-        //         .ins()
-        //         .store(MemFlags::new(), heap_base_addr, heap_base_ptr, 0);
-        //     builder
-        //         .ins()
-        //         .store(MemFlags::new(), heap_base_addr, heap_curr_ptr, 0);
-        //     builder
-        //         .ins()
-        //         .store(MemFlags::new(), heap_end_addr, heap_end_ptr, 0);
-        // }
-        //
-        let main_ref = ctx.get_func(&mut builder, "main")?;
+        // ── Resolve main branch metadata ──────────────────────────────────────
+        let branch_id = ctx
+            .lookup_param_count("main", 0)
+            .ok_or_else(|| anyhow!("No zero-parameter branch in 'main'"))?;
+        let var_count = ctx
+            .lookup_vars_count(branch_id)
+            .ok_or_else(|| anyhow!("Variable count for branch {branch_id} not found"))?;
 
-        let branch_id = ctx.lookup_param_count("main", 0).unwrap();
-        let branch_vars_count = ctx.lookup_vars_count(branch_id).unwrap();
+        // ── Allocate the variables buffer ─────────────────────────────────────
+        let (_main_vars_ptr, main_vars_fat_ptr) =
+            alloc_static_buffer(&mut ctx, &mut builder, ptr_ty, "main_vars", var_count * 8)?;
 
-        println!("branch_vars_count: {branch_vars_count}");
+        // ── Allocate the jump-arguments buffer (256 slots) ────────────────────
+        let (_main_args_ptr, main_args_fat_ptr) =
+            alloc_static_buffer(&mut ctx, &mut builder, ptr_ty, "main_args", 256 * 8)?;
 
-        let main_vars_id =
-            ctx.module_mut()
-                .declare_data("main_vars", Linkage::Export, true, false)?;
-        let mut main_vars_data = DataDescription::new();
-        main_vars_data.define_zeroinit(branch_vars_count * 8);
-        ctx.module_mut()
-            .define_data(main_vars_id, &main_vars_data)?;
-        let main_vars_gv = ctx
-            .module_mut()
-            .declare_data_in_func(main_vars_id, &mut builder.func);
-        let main_vars_ptr = builder.ins().global_value(pointer_type, main_vars_gv);
-
-        let main_vars_fat_ptr_id =
-            ctx.module_mut()
-                .declare_data("main_vars_fat_ptr", Linkage::Export, true, false)?;
-        let mut main_vars_fat_ptr_data = DataDescription::new();
-        main_vars_fat_ptr_data.define_zeroinit(16);
-        ctx.module_mut()
-            .define_data(main_vars_fat_ptr_id, &main_vars_fat_ptr_data)?;
-        let main_vars_fat_ptr_gv = ctx
-            .module_mut()
-            .declare_data_in_func(main_vars_fat_ptr_id, &mut builder.func);
-        let main_vars_fat_ptr = builder
-            .ins()
-            .global_value(pointer_type, main_vars_fat_ptr_gv);
-
-        let end_ptr = builder
-            .ins()
-            .iadd_imm(main_vars_ptr, branch_vars_count as i64 * 8);
-        builder
-            .ins()
-            .store(MemFlags::new(), main_vars_ptr, main_vars_fat_ptr, 0);
-        builder
-            .ins()
-            .store(MemFlags::new(), end_ptr, main_vars_fat_ptr, 8);
-
-        let main_args_id =
-            ctx.module_mut()
-                .declare_data("main_args", Linkage::Export, true, false)?;
-        let mut main_args_data = DataDescription::new();
-        main_args_data.define_zeroinit(256 * 8);
-        ctx.module_mut()
-            .define_data(main_args_id, &main_args_data)?;
-        let main_args_gv = ctx
-            .module_mut()
-            .declare_data_in_func(main_args_id, &mut builder.func);
-        let main_args_ptr = builder.ins().global_value(pointer_type, main_args_gv);
-        let main_args_fat_ptr_id =
-            ctx.module_mut()
-                .declare_data("main_args_fat_ptr", Linkage::Export, true, false)?;
-        let mut main_args_fat_ptr_data = DataDescription::new();
-        main_args_fat_ptr_data.define_zeroinit(16);
-        ctx.module_mut()
-            .define_data(main_args_fat_ptr_id, &main_args_fat_ptr_data)?;
-        let main_args_fat_ptr_gv = ctx
-            .module_mut()
-            .declare_data_in_func(main_args_fat_ptr_id, &mut builder.func);
-        let main_args_fat_ptr = builder
-            .ins()
-            .global_value(pointer_type, main_args_fat_ptr_gv);
-
-        let end_ptr = builder.ins().iadd_imm(main_args_ptr, 256 * 8);
-        builder
-            .ins()
-            .store(MemFlags::new(), main_args_ptr, main_args_fat_ptr, 0);
-        builder
-            .ins()
-            .store(MemFlags::new(), end_ptr, main_args_fat_ptr, 8);
-
-        let branch_id_val = builder.ins().iconst(pointer_type, branch_id as i64);
-
+        // ── Allocate the execution context ────────────────────────────────────
         let main_ctx_id =
             ctx.module_mut()
                 .declare_data("main_ctx", Linkage::Export, true, false)?;
-
         let mut main_ctx_data = DataDescription::new();
-
-        main_ctx_data.define_zeroinit(CTX_SIZE as usize);
-
+        main_ctx_data.define_zeroinit(ExecCtxLayout::SIZE as usize);
         ctx.module_mut().define_data(main_ctx_id, &main_ctx_data)?;
 
-        let main_ctx_fat_ptr =
+        let main_ctx_fat_ptr_id =
             ctx.module_mut()
                 .declare_data("main_ctx_fat_ptr", Linkage::Export, true, false)?;
-        let mut main_ctx_fat_ptr_data = DataDescription::new();
-        main_ctx_fat_ptr_data.define_zeroinit(16);
+        let mut fat_ptr_data = DataDescription::new();
+        fat_ptr_data.define_zeroinit(FatPtrLayout::SIZE);
         ctx.module_mut()
-            .define_data(main_ctx_fat_ptr, &main_ctx_fat_ptr_data)?;
+            .define_data(main_ctx_fat_ptr_id, &fat_ptr_data)?;
 
         let main_ctx_gv = ctx
             .module_mut()
             .declare_data_in_func(main_ctx_id, &mut builder.func);
-        let main_ctx_ptr = builder.ins().global_value(pointer_type, main_ctx_gv);
-        let init_block_id = builder.ins().iconst(pointer_type, 0);
-        builder.ins().store(
-            MemFlags::new(),
-            init_block_id,
-            main_ctx_ptr,
-            BLOCK_ID as i32,
-        );
-        builder.ins().store(
-            MemFlags::new(),
-            branch_id_val,
-            main_ctx_ptr,
-            BRANCH_ID as i32,
-        );
-        builder.ins().store(
-            MemFlags::new(),
-            main_vars_fat_ptr,
-            main_ctx_ptr,
-            VARIABLES as i32,
-        );
-        builder.ins().store(
-            MemFlags::new(),
-            main_args_fat_ptr,
-            main_ctx_ptr,
-            JUMP_ARGS as i32,
-        );
-
         let main_ctx_fat_ptr_gv = ctx
             .module_mut()
-            .declare_data_in_func(main_ctx_fat_ptr, &mut builder.func);
-        let main_ctx_fat_ptr = builder
+            .declare_data_in_func(main_ctx_fat_ptr_id, &mut builder.func);
+
+        let main_ctx_ptr = builder.ins().global_value(ptr_ty, main_ctx_gv);
+        let main_ctx_fat_ptr = builder.ins().global_value(ptr_ty, main_ctx_fat_ptr_gv);
+
+        // Initialise ExecCtx fields.
+        let branch_id_val = builder.ins().iconst(ptr_ty, branch_id as i64);
+        let zero = builder.ins().iconst(ptr_ty, 0);
+        ExecCtxLayout::store(&mut builder, branch_id_val, main_ctx_ptr, ExecCtxLayout::BRANCH_ID);
+        ExecCtxLayout::store(&mut builder, zero, main_ctx_ptr, ExecCtxLayout::BLOCK_ID);
+        ExecCtxLayout::store(&mut builder, main_vars_fat_ptr, main_ctx_ptr, ExecCtxLayout::VARIABLES);
+        ExecCtxLayout::store(&mut builder, main_args_fat_ptr, main_ctx_ptr, ExecCtxLayout::JUMP_ARGS);
+
+        // Initialise ctx fat pointer.
+        let ctx_end = builder.ins().iadd_imm(main_ctx_ptr, ExecCtxLayout::SIZE as i64);
+        FatPtrLayout::store_start(&mut builder, main_ctx_fat_ptr, main_ctx_ptr);
+        FatPtrLayout::store_end(&mut builder, main_ctx_fat_ptr, ctx_end);
+
+        // ── Resolve main function ref ─────────────────────────────────────────
+        let main_ref = ctx.get_func(&mut builder, "main")?;
+
+        // ── Scheduler loop ────────────────────────────────────────────────────
+        // Structure:
+        //   loop_block:
+        //     next_block_id = main(ctx_fat_ptr)
+        //     if next_block_id == -1: goto exit_block
+        //     store next_block_id into ctx.BLOCK_ID
+        //     goto loop_block
+        //   exit_block:
+        //     rt_exit(0)
+
+        let loop_block = builder.create_block();
+        let exit_block = builder.create_block();
+        let continue_block = builder.create_block();
+        builder.append_block_param(continue_block, ptr_ty); // next_block_id
+
+        builder.ins().jump(loop_block, &[]);
+
+        builder.switch_to_block(loop_block);
+        let call = builder.ins().call(main_ref, &[main_ctx_fat_ptr]);
+        let next_block_id = builder.inst_results(call)[0];
+        let is_done = builder
             .ins()
-            .global_value(pointer_type, main_ctx_fat_ptr_gv);
-
-        let end_ptr = builder.ins().iadd_imm(main_ctx_ptr, CTX_SIZE);
-        builder
-            .ins()
-            .store(MemFlags::new(), main_ctx_ptr, main_ctx_fat_ptr, 0);
-        builder
-            .ins()
-            .store(MemFlags::new(), end_ptr, main_ctx_fat_ptr, 8);
-
-        let current_ctx = builder.declare_var(pointer_type);
-        let steps = builder.declare_var(pointer_type);
-        let zero = builder.ins().iconst(pointer_type, 0);
-        builder.def_var(current_ctx, main_ctx_fat_ptr);
-        builder.def_var(steps, zero);
-
-        let action_block = builder.create_block();
-        let after_action_block = builder.create_block();
-        builder.append_block_param(after_action_block, pointer_type);
-        let else_block = builder.create_block();
-        let end_block = builder.create_block();
-        let cond_block = builder.create_block();
-        builder.ins().jump(cond_block, &[]);
-        builder.switch_to_block(cond_block);
-
-        let curr_steps_count = builder.use_var(steps);
-        let cond = builder
-            .ins()
-            .icmp_imm(IntCC::UnsignedLessThan, curr_steps_count, 256);
-        builder.ins().brif(cond, action_block, &[], else_block, &[]);
-
-        builder.switch_to_block(action_block);
-        let ctx_fat_ptr = builder.use_var(current_ctx);
-        let res = builder.ins().call(main_ref, &[ctx_fat_ptr]);
-        let next_block = builder.inst_results(res)[0];
-        let cond = builder.ins().icmp_imm(IntCC::NotEqual, next_block, -1);
+            .icmp_imm(IntCC::Equal, next_block_id, -1);
         builder.ins().brif(
-            cond,
-            after_action_block,
-            &[BlockArg::Value(next_block)],
-            end_block,
+            is_done,
+            exit_block,
             &[],
+            continue_block,
+            &[BlockArg::Value(next_block_id)],
         );
 
-        builder.switch_to_block(after_action_block);
-        let next_block_id = builder.block_params(after_action_block)[0];
-        let ctx_fat_ptr = builder.use_var(current_ctx);
+        builder.switch_to_block(continue_block);
+        let next_id = builder.block_params(continue_block)[0];
         let store_ref = ctx.get_func(&mut builder, "rt_store")?;
-        let block_offset = builder.ins().iconst(pointer_type, BLOCK_ID);
-        let size = builder.ins().iconst(pointer_type, 8);
+        let block_id_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::BLOCK_ID as i64);
+        let size = builder.ins().iconst(ptr_ty, 8);
         builder
             .ins()
-            .call(store_ref, &[ctx_fat_ptr, next_block_id, size, block_offset]);
-        let curr_steps_count = builder.use_var(steps);
-        let inc_steps_count = builder.ins().iadd_imm(curr_steps_count, 1);
-        builder.def_var(steps, inc_steps_count);
-        builder.ins().jump(cond_block, &[]);
+            .call(store_ref, &[main_ctx_fat_ptr, next_id, size, block_id_offset]);
+        builder.ins().jump(loop_block, &[]);
 
-        builder.switch_to_block(else_block);
-        let zero = builder.ins().iconst(pointer_type, 0);
-        builder.def_var(steps, zero);
-        builder.ins().jump(cond_block, &[]);
-
-        builder.switch_to_block(end_block);
+        builder.switch_to_block(exit_block);
         let exit_ref = ctx.get_func(&mut builder, "rt_exit")?;
-
-        let zero = builder.ins().iconst(pointer_type, 0);
+        let zero = builder.ins().iconst(ptr_ty, 0);
         builder.ins().call(exit_ref, &[zero]);
         builder.ins().trap(TrapCode::user(0xDE).unwrap());
 
         builder.seal_all_blocks();
 
-        let rt_sig = builder.func.signature.clone();
-
+        let sig = builder.func.signature.clone();
         let id = ctx
             .module_mut()
-            .declare_function("_start", Linkage::Export, &rt_sig)?;
+            .declare_function("_start", Linkage::Export, &sig)?;
         ctx.module_mut().define_function(id, &mut module_ctx)?;
-
-        println!("rt: {}", module_ctx.func);
-
         ctx.module_mut().clear_context(&mut module_ctx);
+
         Ok(ctx)
     }
+}
+
+/// Allocate a zero-initialised static buffer and return
+/// `(data_ptr, fat_ptr_global_value)` where both are Cranelift `Value`s
+/// ready for use in the current function.
+fn alloc_static_buffer(
+    ctx: &mut CompilerCtx,
+    builder: &mut FunctionBuilder,
+    ptr_ty: cranelift::prelude::Type,
+    name: &str,
+    byte_size: usize,
+) -> Result<(cranelift::prelude::Value, cranelift::prelude::Value)> {
+    let data_id = ctx
+        .module_mut()
+        .declare_data(name, Linkage::Export, true, false)?;
+    let mut data_desc = DataDescription::new();
+    data_desc.define_zeroinit(byte_size);
+    ctx.module_mut().define_data(data_id, &data_desc)?;
+
+    let fat_ptr_name = format!("{name}_fat_ptr");
+    let fat_ptr_id = ctx
+        .module_mut()
+        .declare_data(&fat_ptr_name, Linkage::Export, true, false)?;
+    let mut fat_desc = DataDescription::new();
+    fat_desc.define_zeroinit(FatPtrLayout::SIZE);
+    ctx.module_mut().define_data(fat_ptr_id, &fat_desc)?;
+
+    let data_gv = ctx
+        .module_mut()
+        .declare_data_in_func(data_id, &mut builder.func);
+    let fat_ptr_gv = ctx
+        .module_mut()
+        .declare_data_in_func(fat_ptr_id, &mut builder.func);
+
+    let data_ptr = builder.ins().global_value(ptr_ty, data_gv);
+    let fat_ptr = builder.ins().global_value(ptr_ty, fat_ptr_gv);
+
+    let end = builder.ins().iadd_imm(data_ptr, byte_size as i64);
+    builder.ins().store(MemFlags::new(), data_ptr, fat_ptr, 0);
+    builder.ins().store(MemFlags::new(), end, fat_ptr, 8);
+
+    Ok((data_ptr, fat_ptr))
 }
