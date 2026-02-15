@@ -8,6 +8,7 @@ use lake_frontend::api::expr::Expr;
 
 use crate::compiler::{
     ctx::CompilerCtx,
+    hash_call_args,
     pipeline::expr::{BranchState, compile_expr, spawn_expr},
     rt::layout::ExecCtxLayout,
 };
@@ -112,16 +113,16 @@ pub fn compile(
         builder.ins().call(func_ref, &arg_vals);
 
         // Return -1: this branch is complete; scheduler should not re-enter it.
-        let done = builder.ins().iconst(ptr_ty, -1);
+        let done = builder.ins().iconst(ptr_ty, next_id + 1);
         builder.ins().return_(&[done]);
 
         branch_switch.set_entry(next_id as u128, b);
         Ok(next_id + 1)
     } else {
         // ── Spawn a new process ───────────────────────────────────────────────
-        // Args have already been staged into JUMP_ARGS by the loop above.
-        // spawn_expr creates its own block, copies JUMP_ARGS → spawned VARIABLES,
-        // and returns next_id + 1 so the spawning process continues.
+        // Compute the pattern hash from argument types at compile time — this
+        // gives O(1) branch dispatch via the registry HashMap.
+        let call_hash = hash_call_args(args);
         spawn_expr::compile_spawn(
             ctx,
             builder,
@@ -129,7 +130,7 @@ pub fn compile(
             next_id,
             branch_switch,
             callee_name,
-            args.len(),
+            call_hash,
         )
     }
 }
