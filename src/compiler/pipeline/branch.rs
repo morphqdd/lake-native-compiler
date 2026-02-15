@@ -1,11 +1,15 @@
 use anyhow::Result;
+use log::debug;
 use cranelift::{
     codegen::ir::BlockArg,
     frontend::Switch,
     module::Module,
     prelude::{FunctionBuilder, InstBuilder, Variable},
 };
-use lake_frontend::api::{ast::Branch, expr::Expr};
+use lake_frontend::api::{
+    ast::{Branch, Clean, Ident, Pattern},
+    expr::Expr,
+};
 
 use crate::compiler::{
     ctx::CompilerCtx,
@@ -28,12 +32,10 @@ pub fn compile_branch(
 ) -> Result<CompilerCtx> {
     let ptr_ty = ctx.module().target_config().pointer_type();
     let rt_funcs = ctx.rt_funcs().clone();
-    let patterns = branch.patterns();
+    let patterns = Clean::<Vec<Pattern<'_>>>::clean(branch);
 
-    // ── Hash the pattern signature ────────────────────────────────────────────
     let (hash, param_count) = crate::compiler::hash_pattern(&patterns);
 
-    // ── Per-branch infrastructure ─────────────────────────────────────────────
     let branch_entry_block = builder.create_block();
     let branch_switch_block = builder.create_block();
     builder.append_block_param(branch_switch_block, ptr_ty);
@@ -63,8 +65,17 @@ pub fn compile_branch(
     let mut branch_switch = Switch::new();
     let mut block_id: i64 = 0;
 
+    // Pre-allocate slots for non-default params so they occupy indices 0..N-1.
+    // These are the "input parameters" of the branch, filled by the spawner.
     for pattern in &patterns {
-        if pattern.has_default() {
+        if pattern.default.is_none() {
+            let ident_str = Clean::<Ident<'_>>::clean(pattern).to_string();
+            state.insert(ident_str, ptr_ty);
+        }
+    }
+
+    for pattern in &patterns {
+        if pattern.default.is_some() {
             block_id = compile_expr(
                 &mut ctx,
                 builder,
@@ -77,7 +88,7 @@ pub fn compile_branch(
         }
     }
 
-    for expr in branch.body() {
+    for expr in branch.body.iter() {
         block_id = compile_expr(
             &mut ctx,
             builder,
@@ -95,6 +106,14 @@ pub fn compile_branch(
     branch_switch.emit(builder, block_id_val, default_branch_block);
 
     // ── Register pattern metadata ─────────────────────────────────────────────
+    debug!(
+        "  branch[{}]: hash={:#018x}, params={}, vars={}, blocks={}",
+        branch_id,
+        hash,
+        param_count,
+        state.len(),
+        block_id,
+    );
     ctx.insert_pattern(machine_ident, hash, param_count, branch_id, state.len())?;
 
     Ok(ctx)

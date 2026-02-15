@@ -1,4 +1,9 @@
-use cranelift::prelude::{FunctionBuilder, InstBuilder, MemFlags, Type, Value};
+use cranelift::{
+    module::Module,
+    prelude::{FunctionBuilder, InstBuilder, MemFlags, Type, Value},
+};
+
+use crate::compiler::ctx::CompilerCtx;
 
 /// Runtime execution context layout.
 /// Single source of truth for all field offsets.
@@ -28,6 +33,24 @@ impl ExecCtxLayout {
     /// Emit a direct store of a value into a field via a raw ctx pointer.
     pub fn store(builder: &mut FunctionBuilder, val: Value, ctx_ptr: Value, offset: i32) {
         builder.ins().store(MemFlags::new(), val, ctx_ptr, offset);
+    }
+
+    pub fn set_next_block(
+        exec_ctx: Value,
+        next_block: Value,
+        ctx: &mut CompilerCtx,
+        builder: &mut FunctionBuilder,
+    ) {
+        let ptr_ty = ctx.module().target_config().pointer_type();
+        let ptr_size = builder.ins().iconst(ptr_ty, ptr_ty.bytes() as i64);
+        let rt_funcs = ctx.rt_funcs().clone();
+        let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
+
+        let next_block_offset = builder.ins().iconst(ptr_ty, Self::BLOCK_ID as i64);
+        builder.ins().call(
+            store_ref,
+            &[exec_ctx, next_block, ptr_size, next_block_offset],
+        );
     }
 }
 

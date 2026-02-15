@@ -1,10 +1,11 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
+use log::{debug, trace};
 use cranelift::{
     frontend::Switch,
     module::{Linkage, Module},
     prelude::{AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder},
 };
-use lake_frontend::api::ast::Machine;
+use lake_frontend::api::ast::{Machine, MachineItem};
 
 use crate::compiler::{
     ctx::CompilerCtx, pipeline::branch::compile_branch, rt::layout::ExecCtxLayout,
@@ -15,7 +16,8 @@ use crate::compiler::{
 /// The generated function signature is `fn(ctx_fat_ptr: i64) -> i64` where the
 /// return value is the next block_id, or -1 when the branch is done.
 pub fn compile_machine(mut ctx: CompilerCtx, machine: &Machine<'_>) -> Result<CompilerCtx> {
-    let machine_ident = machine.ident().to_string();
+    let machine_ident = machine.ident.to_string();
+    debug!("  branches: {}", machine.items.len());
     ctx.add_machine(&machine_ident);
 
     let ptr_ty = ctx.module().target_config().pointer_type();
@@ -45,7 +47,11 @@ pub fn compile_machine(mut ctx: CompilerCtx, machine: &Machine<'_>) -> Result<Co
 
     // ── Compile branches ──────────────────────────────────────────────────────
     let mut machine_switch = Switch::new();
-    for (branch_id, branch) in machine.branches().iter().enumerate() {
+    for (branch_id, item) in machine.items.iter().enumerate() {
+        let MachineItem::Branch(ref branch) = item.inner else {
+            bail!("Except branch, but found: {:?}", item);
+        };
+
         ctx = compile_branch(
             ctx,
             &mut builder,
@@ -79,6 +85,8 @@ pub fn compile_machine(mut ctx: CompilerCtx, machine: &Machine<'_>) -> Result<Co
     builder.ins().return_(&[neg]);
 
     builder.seal_all_blocks();
+
+    trace!("CLIF [{}]:\n{}", machine_ident, builder.func);
 
     // ── Emit the function ─────────────────────────────────────────────────────
     let machine_sig = builder.func.signature.clone();

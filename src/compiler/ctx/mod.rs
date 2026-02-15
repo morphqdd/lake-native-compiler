@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{Result, bail};
 use cranelift::{
@@ -27,6 +27,7 @@ pub struct CompilerCtx {
     rt_funcs: Option<RtFuncs>,
     /// Cache of FuncRef declarations per (current_function_name, callee_name).
     func_ref_cache: HashMap<(String, String), FuncRef>,
+    declared_in_prog_rt_func: BTreeSet<String>,
 }
 
 impl Default for CompilerCtx {
@@ -52,6 +53,7 @@ impl Default for CompilerCtx {
             ]),
             rt_funcs: None,
             func_ref_cache: HashMap::new(),
+            declared_in_prog_rt_func: BTreeSet::new(),
         }
     }
 }
@@ -94,9 +96,9 @@ impl CompilerCtx {
         self.registry.branch_id_by_param_count(machine, param_count)
     }
 
-    /// Return the variable count for the branch identified by `branch_id`.
-    pub fn lookup_vars_count(&self, branch_id: u128) -> Option<usize> {
-        self.registry.var_count_by_branch_id(branch_id)
+    /// Return the variable count for the branch identified by `branch_id` within `machine`.
+    pub fn lookup_vars_count(&self, machine: &str, branch_id: u128) -> Option<usize> {
+        self.registry.var_count_by_branch_id(machine, branch_id)
     }
 
     pub fn machines(&self) -> impl Iterator<Item = &str> {
@@ -160,5 +162,13 @@ impl CompilerCtx {
         builder: &mut FunctionBuilder,
     ) -> FuncRef {
         self.module.declare_func_in_func(func_id, builder.func)
+    }
+
+    pub fn declare_rt_func_in_prog(&mut self, func_name: &str) {
+        self.declared_in_prog_rt_func.insert(func_name.to_string());
+    }
+
+    pub fn is_declared_rt_func_in_prog(&self, func_name: &str) -> bool {
+        self.declared_in_prog_rt_func.contains(func_name)
     }
 }

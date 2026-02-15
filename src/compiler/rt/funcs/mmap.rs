@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use cranelift::{
     module::{DataDescription, FuncOrDataId, Linkage, Module},
-    prelude::{AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder},
+    prelude::{AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder, MemFlags},
 };
 
 use crate::compiler::ctx::CompilerCtx;
@@ -68,6 +68,80 @@ pub fn define_mmap(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let id = ctx
         .module_mut()
         .declare_function("rt_mmap", Linkage::Export, &sig)?;
+    ctx.module_mut().define_function(id, &mut module_ctx)?;
+    ctx.module_mut().clear_context(&mut module_ctx);
+
+    Ok(ctx)
+}
+
+/// Build `rt_init_heap()` — calls `rt_mmap(HEAP_SIZE)` once and writes the
+/// result into the three heap globals (`heap_base`, `heap_curr`, `heap_end`).
+///
+/// Must be called at the very start of `_start`, before any allocation.
+pub fn define_init_heap(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
+    let ty = ctx.module().target_config().pointer_type();
+
+    let (heap_base_id, heap_curr_id, heap_end_id) = match (
+        ctx.module().get_name("heap_base"),
+        ctx.module().get_name("heap_curr"),
+        ctx.module().get_name("heap_end"),
+    ) {
+        (
+            Some(FuncOrDataId::Data(b)),
+            Some(FuncOrDataId::Data(c)),
+            Some(FuncOrDataId::Data(e)),
+        ) => (b, c, e),
+        _ => return Err(anyhow!("Heap globals must be declared before rt_init_heap")),
+    };
+
+    let mmap_id = match ctx.module().get_name("rt_mmap") {
+        Some(FuncOrDataId::Func(id)) => id,
+        _ => return Err(anyhow!("rt_mmap must be declared before rt_init_heap")),
+    };
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut module_ctx = ctx.module().make_context();
+    let mut builder = FunctionBuilder::new(&mut module_ctx.func, &mut builder_ctx);
+
+    let entry = builder.create_block();
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+
+    let mmap_ref = ctx
+        .module_mut()
+        .declare_func_in_func(mmap_id, &mut builder.func);
+
+    let heap_base_gv = ctx
+        .module_mut()
+        .declare_data_in_func(heap_base_id, &mut builder.func);
+    let heap_curr_gv = ctx
+        .module_mut()
+        .declare_data_in_func(heap_curr_id, &mut builder.func);
+    let heap_end_gv = ctx
+        .module_mut()
+        .declare_data_in_func(heap_end_id, &mut builder.func);
+
+    let heap_base_ptr = builder.ins().global_value(ty, heap_base_gv);
+    let heap_curr_ptr = builder.ins().global_value(ty, heap_curr_gv);
+    let heap_end_ptr = builder.ins().global_value(ty, heap_end_gv);
+
+    // base = rt_mmap(HEAP_SIZE)
+    let size = builder.ins().iconst(ty, HEAP_SIZE);
+    let call = builder.ins().call(mmap_ref, &[size]);
+    let base = builder.inst_results(call)[0];
+
+    let end = builder.ins().iadd_imm(base, HEAP_SIZE);
+
+    builder.ins().store(MemFlags::new(), base, heap_base_ptr, 0);
+    builder.ins().store(MemFlags::new(), base, heap_curr_ptr, 0);
+    builder.ins().store(MemFlags::new(), end, heap_end_ptr, 0);
+
+    builder.ins().return_(&[]);
+
+    let sig = builder.func.signature.clone();
+    let id = ctx
+        .module_mut()
+        .declare_function("rt_init_heap", Linkage::Export, &sig)?;
     ctx.module_mut().define_function(id, &mut module_ctx)?;
     ctx.module_mut().clear_context(&mut module_ctx);
 

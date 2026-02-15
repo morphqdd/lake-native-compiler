@@ -8,7 +8,7 @@ use lake_frontend::api::expr::Expr;
 
 use crate::compiler::{
     ctx::CompilerCtx,
-    pipeline::expr::{BranchState, compile_expr},
+    pipeline::expr::{BranchState, compile_expr, spawn_expr},
     rt::layout::ExecCtxLayout,
 };
 
@@ -31,12 +31,12 @@ pub fn compile(
     args: &[Expr<'_>],
 ) -> Result<i64> {
     let ptr_ty = ctx.module().target_config().pointer_type();
+    let rt_funcs = ctx.rt_funcs().clone();
 
-    let Expr::Var(callee_name) = ident else {
+    let Expr::Var(callee_name, ty) = ident else {
         bail!("Jump target must be a variable/identifier");
     };
 
-    // ── Compile each argument ────────────────────────────────────────────────
     let mut next_id = block_id;
 
     for (i, arg) in args.iter().enumerate() {
@@ -56,15 +56,19 @@ pub fn compile(
         builder.switch_to_block(b);
 
         let ctx_ptr = builder.use_var(machine_ctx_var);
-        let load_u64_ref = ctx.get_func(builder, "rt_load_u64")?;
-        let store_ref = ctx.get_func(builder, "rt_store")?;
+        let load_u64_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
+        let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
 
         let temp_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::TEMP_VAL as i64);
         let temp_call = builder.ins().call(load_u64_ref, &[ctx_ptr, temp_offset]);
         let arg_val = builder.inst_results(temp_call)[0];
 
-        let jump_args_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::JUMP_ARGS as i64);
-        let args_call = builder.ins().call(load_u64_ref, &[ctx_ptr, jump_args_offset]);
+        let jump_args_offset = builder
+            .ins()
+            .iconst(ptr_ty, ExecCtxLayout::JUMP_ARGS as i64);
+        let args_call = builder
+            .ins()
+            .call(load_u64_ref, &[ctx_ptr, jump_args_offset]);
         let args_ptr = builder.inst_results(args_call)[0];
 
         let slot_offset = builder.ins().iconst(ptr_ty, i as i64 * 8);
@@ -80,31 +84,52 @@ pub fn compile(
         next_id = after_arg_id + 1;
     }
 
-    // ── Call block: load all args and call the target machine ────────────────
-    let b = builder.create_block();
-    builder.switch_to_block(b);
+    if ctx.is_declared_rt_func_in_prog(callee_name) {
+        // ── Direct rt function call ───────────────────────────────────────────
+        // Load all staged args from JUMP_ARGS and call the function directly.
+        let b = builder.create_block();
+        builder.switch_to_block(b);
 
-    let ctx_ptr = builder.use_var(machine_ctx_var);
-    let load_u64_ref = ctx.get_func(builder, "rt_load_u64")?;
+        let ctx_ptr = builder.use_var(machine_ctx_var);
+        let load_u64_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
 
-    let jump_args_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::JUMP_ARGS as i64);
-    let args_call = builder.ins().call(load_u64_ref, &[ctx_ptr, jump_args_offset]);
-    let args_ptr = builder.inst_results(args_call)[0];
+        let jump_args_offset = builder
+            .ins()
+            .iconst(ptr_ty, ExecCtxLayout::JUMP_ARGS as i64);
+        let args_call = builder
+            .ins()
+            .call(load_u64_ref, &[ctx_ptr, jump_args_offset]);
+        let args_ptr = builder.inst_results(args_call)[0];
 
-    let mut arg_vals = Vec::with_capacity(args.len());
-    for i in 0..args.len() {
-        let slot_offset = builder.ins().iconst(ptr_ty, i as i64 * 8);
-        let val_call = builder.ins().call(load_u64_ref, &[args_ptr, slot_offset]);
-        arg_vals.push(builder.inst_results(val_call)[0]);
+        let mut arg_vals = Vec::with_capacity(args.len());
+        for i in 0..args.len() {
+            let slot_offset = builder.ins().iconst(ptr_ty, i as i64 * 8);
+            let val_call = builder.ins().call(load_u64_ref, &[args_ptr, slot_offset]);
+            arg_vals.push(builder.inst_results(val_call)[0]);
+        }
+
+        let func_ref = ctx.get_func(builder, callee_name)?;
+        builder.ins().call(func_ref, &arg_vals);
+
+        // Return -1: this branch is complete; scheduler should not re-enter it.
+        let done = builder.ins().iconst(ptr_ty, -1);
+        builder.ins().return_(&[done]);
+
+        branch_switch.set_entry(next_id as u128, b);
+        Ok(next_id + 1)
+    } else {
+        // ── Spawn a new process ───────────────────────────────────────────────
+        // Args have already been staged into JUMP_ARGS by the loop above.
+        // spawn_expr creates its own block, copies JUMP_ARGS → spawned VARIABLES,
+        // and returns next_id + 1 so the spawning process continues.
+        spawn_expr::compile_spawn(
+            ctx,
+            builder,
+            machine_ctx_var,
+            next_id,
+            branch_switch,
+            callee_name,
+            args.len(),
+        )
     }
-
-    let func_ref = ctx.get_func(builder, callee_name)?;
-    builder.ins().call(func_ref, &arg_vals);
-
-    // Return -1: this branch is complete; the scheduler should not re-enter it.
-    let done = builder.ins().iconst(ptr_ty, -1);
-    builder.ins().return_(&[done]);
-
-    branch_switch.set_entry(next_id as u128, b);
-    Ok(next_id + 1)
 }

@@ -1,0 +1,1 @@
+/home/morphe/compiler/lake-native-compiler/examples/simple/other_langs/async_rust/target/release/async_hello: /home/morphe/compiler/lake-native-compiler/examples/simple/other_langs/async_rust/src/main.rs

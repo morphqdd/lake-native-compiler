@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, bail};
-use cranelift::{frontend::Switch, prelude::{FunctionBuilder, Type, Variable}};
+use cranelift::{
+    frontend::Switch,
+    prelude::{FunctionBuilder, Type, Variable},
+};
 use lake_frontend::api::expr::Expr;
 
 use crate::compiler::ctx::CompilerCtx;
@@ -9,6 +12,7 @@ use crate::compiler::ctx::CompilerCtx;
 pub mod jump_expr;
 pub mod let_expr;
 pub mod num_expr;
+pub mod spawn_expr;
 pub mod string_expr;
 pub mod var_expr;
 
@@ -56,26 +60,45 @@ pub fn compile_expr(
         Expr::Let { ident, ty, default } => {
             let ident_str = ident.inner.to_string();
             let_expr::compile(
-                ctx, builder, machine_ctx_var, block_id, branch_switch, state,
-                &ident_str, &ty.inner, default.as_ref().map(|b| &b.inner),
+                ctx,
+                builder,
+                machine_ctx_var,
+                block_id,
+                branch_switch,
+                state,
+                &ident_str,
+                &ty.inner,
+                default.as_ref().map(|b| &b.inner),
             )
         }
-        Expr::String(s) => {
+        Expr::String(s, ty) => {
             string_expr::compile(ctx, builder, machine_ctx_var, block_id, branch_switch, s)
         }
         Expr::Jump { ident, args } => {
             let args_inner: Vec<Expr<'_>> = args.iter().map(|a| a.inner.clone()).collect();
             jump_expr::compile(
-                ctx, builder, machine_ctx_var, block_id, branch_switch, state,
-                &ident.inner, &args_inner,
+                ctx,
+                builder,
+                machine_ctx_var,
+                block_id,
+                branch_switch,
+                state,
+                &ident.inner,
+                &args_inner,
             )
         }
-        Expr::Num(n) => {
+        Expr::Num(n, ty) => {
             num_expr::compile(ctx, builder, machine_ctx_var, block_id, branch_switch, n)
         }
-        Expr::Var(v) => {
-            var_expr::compile(ctx, builder, machine_ctx_var, block_id, branch_switch, state, v)
-        }
+        Expr::Var(v, ty) => var_expr::compile(
+            ctx,
+            builder,
+            machine_ctx_var,
+            block_id,
+            branch_switch,
+            state,
+            v,
+        ),
         _ => bail!("Unsupported expression type: {:?}", expr),
     }
 }

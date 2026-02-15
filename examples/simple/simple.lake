@@ -1,5 +1,14 @@
+@rt(rt_write)
+
+worker is {
+  n str -> {
+    rt_write(1 n 8)
+  }
+}
+
 main is {
-  n str."Hello, world!" -> { 
-    rt_write(1 n 13)
+  n i64.0 -> { 
+    worker("worker1\n")
+    worker("worker2\n")
   }
 }

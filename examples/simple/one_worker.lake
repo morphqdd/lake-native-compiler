@@ -1,0 +1,13 @@
+@rt(rt_write)
+
+worker is {
+  n str."ok\n" -> {
+    rt_write(1 n 3)
+  }
+}
+
+main is {
+  n str."Hello, world!" -> {
+    worker()
+  }
+}

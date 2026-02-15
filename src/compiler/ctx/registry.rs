@@ -84,11 +84,11 @@ impl MachineRegistry {
             .map(|b| b.branch_id)
     }
 
-    /// Look up the var_count for the branch with the given branch_id (searches all machines).
-    pub fn var_count_by_branch_id(&self, branch_id: u128) -> Option<usize> {
+    /// Look up the var_count for the branch with the given branch_id, scoped to a specific machine.
+    pub fn var_count_by_branch_id(&self, machine: &str, branch_id: u128) -> Option<usize> {
         self.machines
-            .values()
-            .find_map(|m| m.branch_by_id(branch_id))
+            .get(machine)?
+            .branch_by_id(branch_id)
             .map(|b| b.var_count)
     }
 
@@ -121,9 +121,11 @@ mod tests {
     #[test]
     fn var_count_by_branch_id() {
         let reg = make_registry();
-        assert_eq!(reg.var_count_by_branch_id(42), Some(3));
-        assert_eq!(reg.var_count_by_branch_id(43), Some(5));
-        assert_eq!(reg.var_count_by_branch_id(99), None);
+        assert_eq!(reg.var_count_by_branch_id("main", 42), Some(3));
+        assert_eq!(reg.var_count_by_branch_id("main", 43), Some(5));
+        assert_eq!(reg.var_count_by_branch_id("main", 99), None);
+        // Wrong machine name returns None even for valid branch_id.
+        assert_eq!(reg.var_count_by_branch_id("ghost", 42), None);
     }
 
     #[test]

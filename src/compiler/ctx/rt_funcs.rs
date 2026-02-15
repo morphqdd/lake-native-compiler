@@ -43,30 +43,26 @@ impl RtFuncs {
     }
 
     /// Declare `store` for use in the function currently being built.
-    pub fn store_ref(
-        &self,
-        module: &mut ObjectModule,
-        builder: &mut FunctionBuilder,
-    ) -> FuncRef {
+    pub fn store_ref(&self, module: &mut ObjectModule, builder: &mut FunctionBuilder) -> FuncRef {
         module.declare_func_in_func(self.store, builder.func)
     }
 
     /// Declare `write` for use in the function currently being built.
-    pub fn write_ref(
-        &self,
-        module: &mut ObjectModule,
-        builder: &mut FunctionBuilder,
-    ) -> FuncRef {
+    pub fn write_ref(&self, module: &mut ObjectModule, builder: &mut FunctionBuilder) -> FuncRef {
         module.declare_func_in_func(self.write, builder.func)
     }
 
     /// Declare `exit` for use in the function currently being built.
-    pub fn exit_ref(
+    pub fn exit_ref(&self, module: &mut ObjectModule, builder: &mut FunctionBuilder) -> FuncRef {
+        module.declare_func_in_func(self.exit, builder.func)
+    }
+
+    pub fn allocate_ref(
         &self,
         module: &mut ObjectModule,
         builder: &mut FunctionBuilder,
     ) -> FuncRef {
-        module.declare_func_in_func(self.exit, builder.func)
+        module.declare_func_in_func(self.allocate, builder.func)
     }
 }
 
