@@ -96,6 +96,15 @@ impl CompilerCtx {
         self.registry.branch_id_by_param_count(machine, param_count)
     }
 
+    /// O(1) dispatch lookup: hash(arg_types) → (branch_id, var_count, param_count).
+    pub fn lookup_branch_by_hash(
+        &self,
+        machine: &str,
+        hash: u64,
+    ) -> Option<(u128, usize, usize)> {
+        self.registry.branch_by_hash(machine, hash)
+    }
+
     /// Return the variable count for the branch identified by `branch_id` within `machine`.
     pub fn lookup_vars_count(&self, machine: &str, branch_id: u128) -> Option<usize> {
         self.registry.var_count_by_branch_id(machine, branch_id)

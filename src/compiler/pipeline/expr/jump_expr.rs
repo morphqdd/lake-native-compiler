@@ -112,7 +112,6 @@ pub fn compile(
         let func_ref = ctx.get_func(builder, callee_name)?;
         builder.ins().call(func_ref, &arg_vals);
 
-        // Return -1: this branch is complete; scheduler should not re-enter it.
         let done = builder.ins().iconst(ptr_ty, next_id + 1);
         builder.ins().return_(&[done]);
 

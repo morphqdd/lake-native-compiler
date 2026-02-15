@@ -84,6 +84,13 @@ impl MachineRegistry {
             .map(|b| b.branch_id)
     }
 
+    /// Look up (branch_id, var_count, param_count) by the pattern hash.
+    /// This is the primary O(1) dispatch lookup: hash(arg_types) → branch.
+    pub fn branch_by_hash(&self, machine: &str, hash: u64) -> Option<(u128, usize, usize)> {
+        let info = self.machines.get(machine)?.branches.get(&hash)?;
+        Some((info.branch_id, info.var_count, info.param_count))
+    }
+
     /// Look up the var_count for the branch with the given branch_id, scoped to a specific machine.
     pub fn var_count_by_branch_id(&self, machine: &str, branch_id: u128) -> Option<usize> {
         self.machines

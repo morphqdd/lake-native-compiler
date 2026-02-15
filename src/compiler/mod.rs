@@ -86,18 +86,34 @@ pub fn link<BP: AsRef<Path>>(build_path: BP, name: &str, bytes: &[u8]) -> Result
 }
 
 /// Hash a branch's pattern to produce a unique u64 key and the non-default
-/// parameter count.  Used by both `compile_branch` and `CompilerCtx`.
+/// parameter count.  Only the *type* of each non-default parameter is hashed
+/// (not the binding name) so the hash is identical to `hash_call_args` when
+/// the caller passes values of matching types.
 pub(crate) fn hash_pattern(patterns: &[Pattern<'_>]) -> (u64, usize) {
     let mut param_count = 0;
     let mut hasher = DefaultHasher::new();
     for p in patterns {
         if p.default.is_none() {
             param_count += 1;
-            Clean::<Ident<'_>>::clean(p).hash(&mut hasher);
             Clean::<Type<'_>>::clean(p).to_string().hash(&mut hasher);
         }
     }
     (hasher.finish(), param_count)
+}
+
+/// Hash the types of call-site arguments to produce the same key as
+/// `hash_pattern` for a branch whose parameter types match.
+pub(crate) fn hash_call_args(args: &[lake_frontend::api::expr::Expr<'_>]) -> u64 {
+    use lake_frontend::api::expr::Expr;
+    let mut hasher = DefaultHasher::new();
+    for arg in args {
+        let ty_str = match arg {
+            Expr::Var(_, ty) | Expr::Num(_, ty) | Expr::String(_, ty) => ty.to_string(),
+            _ => continue,
+        };
+        ty_str.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 #[cfg(test)]

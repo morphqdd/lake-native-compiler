@@ -16,8 +16,11 @@ use crate::compiler::{
 
 /// Compile a spawn expression: allocate a new ExecCtx + ProcessCtx,
 /// copy staged args from the spawning process's JUMP_ARGS into the spawned
-/// process's VARIABLES (slots 0..arg_count-1), then register the new process
+/// process's VARIABLES (slots 0..param_count-1), then register the new process
 /// with the scheduler.
+///
+/// `call_hash` is produced by `hash_call_args` and identifies the target branch
+/// in O(1) via the registry's HashMap.
 ///
 /// The spawning process continues: returns `block_id + 1`.
 pub fn compile_spawn(
@@ -27,17 +30,14 @@ pub fn compile_spawn(
     block_id: i64,
     branch_switch: &mut Switch,
     machine_name: &str,
-    arg_count: usize,
+    call_hash: u64,
 ) -> Result<i64> {
     let ptr_ty = ctx.module().target_config().pointer_type();
     let rt_funcs = ctx.rt_funcs().clone();
 
-    let branch_id = ctx
-        .lookup_param_count(machine_name, arg_count)
-        .ok_or_else(|| anyhow!("No branch with {} params in '{}'", arg_count, machine_name))?;
-    let var_count = ctx
-        .lookup_vars_count(machine_name, branch_id)
-        .ok_or_else(|| anyhow!("Variable count for branch {} not found in '{}'", branch_id, machine_name))?;
+    let (branch_id, var_count, arg_count) = ctx
+        .lookup_branch_by_hash(machine_name, call_hash)
+        .ok_or_else(|| anyhow!("No branch matching call hash {:#018x} in '{}'", call_hash, machine_name))?;
 
     let b = builder.create_block();
     builder.switch_to_block(b);

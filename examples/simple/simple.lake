@@ -1,14 +1,18 @@
 @rt(rt_write)
 
 worker is {
-  n str -> {
+  n str b str -> {
+    rt_write(1 n 8)
+    rt_write(1 b 6)
+  }
+  n str b i64 -> {
     rt_write(1 n 8)
   }
 }
 
 main is {
   n i64.0 -> { 
-    worker("worker1\n")
-    worker("worker2\n")
+    worker("worker1\n" "hello\n")
+    worker("worker2\n" 5)
   }
 }
