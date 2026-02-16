@@ -1,11 +1,11 @@
 use anyhow::{Result, bail};
-use log::{debug, trace};
 use cranelift::{
     frontend::Switch,
     module::{Linkage, Module},
     prelude::{AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder},
 };
 use lake_frontend::api::ast::{Machine, MachineItem};
+use log::{debug, trace};
 
 use crate::compiler::{
     ctx::CompilerCtx, pipeline::branch::compile_branch, rt::layout::ExecCtxLayout,
@@ -15,7 +15,7 @@ use crate::compiler::{
 ///
 /// The generated function signature is `fn(ctx_fat_ptr: i64) -> i64` where the
 /// return value is the next block_id, or -1 when the branch is done.
-pub fn compile_machine(mut ctx: CompilerCtx, machine: &Machine<'_>) -> Result<CompilerCtx> {
+pub fn compile_machine(ctx: &mut CompilerCtx, machine: &Machine<'_>) -> Result<()> {
     let machine_ident = machine.ident.to_string();
     debug!("  branches: {}", machine.items.len());
     ctx.add_machine(&machine_ident);
@@ -52,7 +52,7 @@ pub fn compile_machine(mut ctx: CompilerCtx, machine: &Machine<'_>) -> Result<Co
             bail!("Except branch, but found: {:?}", item);
         };
 
-        ctx = compile_branch(
+        compile_branch(
             ctx,
             &mut builder,
             &machine_ident,
@@ -97,5 +97,5 @@ pub fn compile_machine(mut ctx: CompilerCtx, machine: &Machine<'_>) -> Result<Co
     ctx.module_mut().define_function(id, &mut module_ctx)?;
     ctx.module_mut().clear_context(&mut module_ctx);
 
-    Ok(ctx)
+    Ok(())
 }

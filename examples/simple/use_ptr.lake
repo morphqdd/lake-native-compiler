@@ -1,0 +1,20 @@
+@rt(rt_write)
+@rt(rt_store)
+@rt(rt_allocate)
+@rt(rt_load_u64)
+
+writer is {
+  ptr {} val str -> {
+    rt_store(ptr rt_load_u64(val 0) 8 0)
+    rt_write(1 ptr 4)
+    rt_store(ptr rt_load_u64(val 4) 8 0)
+    rt_write(1 ptr 8)
+    rt_write(1 "\n" 1)
+  }
+}
+
+main is {
+  n str."Hello, world!\n" -> {
+    writer(rt_allocate(8) n)
+  }
+}

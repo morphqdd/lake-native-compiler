@@ -6,7 +6,6 @@ use std::{
 };
 
 use anyhow::{Result, bail};
-use log::{debug, info};
 use lake_frontend::{
     api::{
         ast::{Clean, Ident, Pattern, Type},
@@ -14,6 +13,7 @@ use lake_frontend::{
     },
     prelude::parse,
 };
+use log::{debug, error, info};
 
 use crate::compiler::{ctx::CompilerCtx, pipeline::machine::compile_machine, rt::RuntimeBuilder};
 
@@ -38,7 +38,11 @@ pub fn compile<SP: AsRef<Path>>(source_path: SP) -> Result<Vec<u8>> {
         match &expr.inner {
             Expr::Machine(machine) => {
                 info!("compiling machine '{}'", machine.inner.ident.to_string());
-                ctx = compile_machine(ctx, &machine.inner)?;
+                if let Err(err) = compile_machine(&mut ctx, &machine.inner) {
+                    error!("{}", err);
+                    debug!("{:#?}", ctx.get_registry());
+                    panic!();
+                }
             }
             Expr::Directive(directive) => match directive.name.as_str() {
                 "rt" => {
@@ -95,7 +99,9 @@ pub(crate) fn hash_pattern(patterns: &[Pattern<'_>]) -> (u64, usize) {
     for p in patterns {
         if p.default.is_none() {
             param_count += 1;
-            Clean::<Type<'_>>::clean(p).to_string().hash(&mut hasher);
+            let ty = Clean::<Type<'_>>::clean(p);
+            debug!("Hashed pattern ty: {ty}");
+            ty.to_string().hash(&mut hasher);
         }
     }
     (hasher.finish(), param_count)
@@ -103,14 +109,40 @@ pub(crate) fn hash_pattern(patterns: &[Pattern<'_>]) -> (u64, usize) {
 
 /// Hash the types of call-site arguments to produce the same key as
 /// `hash_pattern` for a branch whose parameter types match.
-pub(crate) fn hash_call_args(args: &[lake_frontend::api::expr::Expr<'_>]) -> u64 {
+///
+/// `var_types` maps variable names to their Lake-level type strings as
+/// declared in the enclosing branch pattern.  When the frontend emits `{}`
+/// for a variable whose type is actually known (e.g. `n` declared as `i64`),
+/// the map is used to recover the correct type string.
+pub(crate) fn hash_call_args(
+    args: &[lake_frontend::api::expr::Expr<'_>],
+    var_types: &std::collections::HashMap<String, String>,
+) -> u64 {
     use lake_frontend::api::expr::Expr;
     let mut hasher = DefaultHasher::new();
     for arg in args {
+        debug!("Hashed arg: {:?}", arg);
         let ty_str = match arg {
-            Expr::Var(_, ty) | Expr::Num(_, ty) | Expr::String(_, ty) => ty.to_string(),
+            Expr::Var(name, ty) => {
+                let raw = ty.to_string();
+                if raw == "{}" {
+                    var_types
+                        .get(name.to_string().as_str())
+                        .map(|s| s.as_str())
+                        .unwrap_or("{}")
+                        .to_string()
+                } else {
+                    raw
+                }
+            }
+            Expr::Num(_, ty) | Expr::String(_, ty) => ty.to_string(),
+            Expr::Jump { ident, .. } => match &ident.inner {
+                Expr::Var(_, ty) => ty.to_string(),
+                _ => continue,
+            },
             _ => continue,
         };
+        debug!("Hashed arg ty: {ty_str}");
         ty_str.hash(&mut hasher);
     }
     hasher.finish()
@@ -187,7 +219,11 @@ mod tests {
         let src = r#"@rt(rt_write) worker is { n str."ok" -> { rt_write(1 n 2) } } main is { n i64.0 -> { worker() worker() } }"#;
         let (code, stdout) = compile_and_run_output(src)?;
         assert_eq!(code, 0);
-        assert_eq!(stdout, b"okok", "two workers output missing: got {:?}", stdout);
+        assert_eq!(
+            stdout, b"okok",
+            "two workers output missing: got {:?}",
+            stdout
+        );
         Ok(())
     }
 
@@ -207,7 +243,11 @@ mod tests {
         let src = r#"@rt(rt_write) worker3 is { n str."w3" -> { rt_write(1 n 2) } } worker2 is { n str."w2" -> { worker3() worker3() rt_write(1 n 2) } } main is { n str."hi" -> { worker2() } }"#;
         let (code, stdout) = compile_and_run_output(src)?;
         assert_eq!(code, 0);
-        assert!(stdout.windows(2).any(|w| w == b"w2"), "w2 missing from {:?}", stdout);
+        assert!(
+            stdout.windows(2).any(|w| w == b"w2"),
+            "w2 missing from {:?}",
+            stdout
+        );
         Ok(())
     }
 
@@ -217,7 +257,11 @@ mod tests {
         let src = r#"@rt(rt_write) worker is { n str."ok" -> { rt_write(1 n 2) } } main is { n str."Hello, world!" -> { worker() } }"#;
         let (code, stdout) = compile_and_run_output(src)?;
         assert_eq!(code, 0);
-        assert_eq!(stdout, b"ok", "single worker output missing: got {:?}", stdout);
+        assert_eq!(
+            stdout, b"ok",
+            "single worker output missing: got {:?}",
+            stdout
+        );
         Ok(())
     }
 

@@ -97,11 +97,7 @@ impl CompilerCtx {
     }
 
     /// O(1) dispatch lookup: hash(arg_types) → (branch_id, var_count, param_count).
-    pub fn lookup_branch_by_hash(
-        &self,
-        machine: &str,
-        hash: u64,
-    ) -> Option<(u128, usize, usize)> {
+    pub fn lookup_branch_by_hash(&self, machine: &str, hash: u64) -> Option<(u128, usize, usize)> {
         self.registry.branch_by_hash(machine, hash)
     }
 
@@ -179,5 +175,9 @@ impl CompilerCtx {
 
     pub fn is_declared_rt_func_in_prog(&self, func_name: &str) -> bool {
         self.declared_in_prog_rt_func.contains(func_name)
+    }
+
+    pub fn get_registry(&self) -> &MachineRegistry {
+        &self.registry
     }
 }

@@ -54,7 +54,7 @@ pub fn compile(
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("Unknown type '{}'", ty.to_string()))?
         .unwrap_simple();
-    let var_index = state.insert(ident.to_string(), cranelift_ty);
+    let var_index = state.insert_with_lake_type(ident.to_string(), cranelift_ty, ty.to_string());
 
     // Read TEMP_VAL (the initialiser result) and write it into vars[var_index].
     let ctx_ptr = builder.use_var(machine_ctx_var);

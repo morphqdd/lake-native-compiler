@@ -5,6 +5,7 @@ use cranelift::{
     prelude::{FunctionBuilder, InstBuilder, Variable},
 };
 use lake_frontend::api::expr::Expr;
+use log::debug;
 
 use crate::compiler::{
     ctx::CompilerCtx,
@@ -38,9 +39,19 @@ pub fn compile(
         bail!("Jump target must be a variable/identifier");
     };
 
+    // Snapshot the current base; nested calls within our args will be given
+    // a base of `call_base + args.len()` so they never overwrite already-
+    // staged slots of the current call.
+    let call_base = state.jump_args_base;
+
     let mut next_id = block_id;
 
     for (i, arg) in args.iter().enumerate() {
+        // Advance the base for any nested calls inside this argument so that
+        // they stage into JUMP_ARGS[call_base + args.len() ..] and leave our
+        // slots [call_base .. call_base + args.len()] untouched.
+        state.jump_args_base = call_base + args.len();
+
         // Compile the argument; result ends up in TEMP_VAL.
         let after_arg_id = compile_expr(
             ctx,
@@ -52,7 +63,10 @@ pub fn compile(
             arg,
         )?;
 
-        // Block: move TEMP_VAL → JUMP_ARGS[i].
+        // Restore base after the arg is compiled.
+        state.jump_args_base = call_base;
+
+        // Block: move TEMP_VAL → JUMP_ARGS[call_base + i].
         let b = builder.create_block();
         builder.switch_to_block(b);
 
@@ -72,7 +86,7 @@ pub fn compile(
             .call(load_u64_ref, &[ctx_ptr, jump_args_offset]);
         let args_ptr = builder.inst_results(args_call)[0];
 
-        let slot_offset = builder.ins().iconst(ptr_ty, i as i64 * 8);
+        let slot_offset = builder.ins().iconst(ptr_ty, (call_base + i) as i64 * 8);
         let size = builder.ins().iconst(ptr_ty, 8);
         builder
             .ins()
@@ -104,13 +118,24 @@ pub fn compile(
 
         let mut arg_vals = Vec::with_capacity(args.len());
         for i in 0..args.len() {
-            let slot_offset = builder.ins().iconst(ptr_ty, i as i64 * 8);
+            let slot_offset = builder.ins().iconst(ptr_ty, (call_base + i) as i64 * 8);
             let val_call = builder.ins().call(load_u64_ref, &[args_ptr, slot_offset]);
             arg_vals.push(builder.inst_results(val_call)[0]);
         }
 
+        let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
         let func_ref = ctx.get_func(builder, callee_name)?;
-        builder.ins().call(func_ref, &arg_vals);
+        let call = builder.ins().call(func_ref, &arg_vals);
+
+        // If the rt function returns a value, store it in TEMP_VAL so that
+        // the caller can stage it as an argument for a subsequent spawn.
+        let ret_val = builder.inst_results(call).first().copied();
+        if let Some(val) = ret_val {
+            let ctx_ptr = builder.use_var(machine_ctx_var);
+            let temp_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::TEMP_VAL as i64);
+            let size = builder.ins().iconst(ptr_ty, 8);
+            builder.ins().call(store_ref, &[ctx_ptr, val, size, temp_offset]);
+        }
 
         let done = builder.ins().iconst(ptr_ty, next_id + 1);
         builder.ins().return_(&[done]);
@@ -121,7 +146,8 @@ pub fn compile(
         // ── Spawn a new process ───────────────────────────────────────────────
         // Compute the pattern hash from argument types at compile time — this
         // gives O(1) branch dispatch via the registry HashMap.
-        let call_hash = hash_call_args(args);
+        let call_hash = hash_call_args(args, state.lake_types());
+        debug!("Args: {:?}", args);
         spawn_expr::compile_spawn(
             ctx,
             builder,
@@ -130,6 +156,7 @@ pub fn compile(
             branch_switch,
             callee_name,
             call_hash,
+            call_base,
         )
     }
 }

@@ -1,5 +1,4 @@
 use anyhow::Result;
-use log::debug;
 use cranelift::{
     codegen::ir::BlockArg,
     frontend::Switch,
@@ -7,9 +6,10 @@ use cranelift::{
     prelude::{FunctionBuilder, InstBuilder, Variable},
 };
 use lake_frontend::api::{
-    ast::{Branch, Clean, Ident, Pattern},
+    ast::{Branch, Clean, Ident, Pattern, Type},
     expr::Expr,
 };
+use log::debug;
 
 use crate::compiler::{
     ctx::CompilerCtx,
@@ -22,14 +22,14 @@ use crate::compiler::{
 ///
 /// Returns the updated context and the number of local variables.
 pub fn compile_branch(
-    mut ctx: CompilerCtx,
+    ctx: &mut CompilerCtx,
     builder: &mut FunctionBuilder,
     machine_ident: &str,
     machine_switch: &mut Switch,
     branch_id: u128,
     branch: &Branch<'_>,
     machine_ctx_var: Variable,
-) -> Result<CompilerCtx> {
+) -> Result<()> {
     let ptr_ty = ctx.module().target_config().pointer_type();
     let rt_funcs = ctx.rt_funcs().clone();
     let patterns = Clean::<Vec<Pattern<'_>>>::clean(branch);
@@ -70,14 +70,15 @@ pub fn compile_branch(
     for pattern in &patterns {
         if pattern.default.is_none() {
             let ident_str = Clean::<Ident<'_>>::clean(pattern).to_string();
-            state.insert(ident_str, ptr_ty);
+            let lake_ty = Clean::<Type<'_>>::clean(pattern).to_string();
+            state.insert_with_lake_type(ident_str, ptr_ty, lake_ty);
         }
     }
 
     for pattern in &patterns {
         if pattern.default.is_some() {
             block_id = compile_expr(
-                &mut ctx,
+                ctx,
                 builder,
                 machine_ctx_var,
                 block_id,
@@ -90,7 +91,7 @@ pub fn compile_branch(
 
     for expr in branch.body.iter() {
         block_id = compile_expr(
-            &mut ctx,
+            ctx,
             builder,
             machine_ctx_var,
             block_id,
@@ -116,5 +117,5 @@ pub fn compile_branch(
     );
     ctx.insert_pattern(machine_ident, hash, param_count, branch_id, state.len())?;
 
-    Ok(ctx)
+    Ok(())
 }

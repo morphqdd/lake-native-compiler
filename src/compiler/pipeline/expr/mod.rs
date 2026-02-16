@@ -21,6 +21,15 @@ pub mod var_expr;
 #[derive(Debug, Default)]
 pub struct BranchState {
     vars: HashMap<String, (Type, usize)>,
+    /// Lake-level type strings for variables (e.g. "i64", "str", "{}").
+    /// Used to resolve the correct type when the frontend emits `{}` for
+    /// variables whose type is known from the pattern declaration.
+    lake_types: HashMap<String, String>,
+    /// Current base slot in JUMP_ARGS for the innermost call being compiled.
+    /// Nested calls advance this by the outer call's arg count so that they
+    /// write to a disjoint range and never overwrite already-staged args.
+    /// This is a compile-time constant captured into `iconst` instructions.
+    pub jump_args_base: usize,
 }
 
 impl BranchState {
@@ -33,6 +42,23 @@ impl BranchState {
         let idx = self.next_index();
         self.vars.insert(name, (ty, idx));
         idx
+    }
+
+    /// Insert a variable together with its Lake-level type string.
+    pub fn insert_with_lake_type(&mut self, name: String, ty: Type, lake_ty: String) -> usize {
+        let idx = self.insert(name.clone(), ty);
+        self.lake_types.insert(name, lake_ty);
+        idx
+    }
+
+    /// Look up the Lake-level type string for a variable by name.
+    pub fn lake_type_of(&self, name: &str) -> Option<&str> {
+        self.lake_types.get(name).map(|s| s.as_str())
+    }
+
+    /// Access the full Lake-type map (name → type string).
+    pub fn lake_types(&self) -> &HashMap<String, String> {
+        &self.lake_types
     }
 
     /// Number of variables currently tracked (= number of occupied slots).

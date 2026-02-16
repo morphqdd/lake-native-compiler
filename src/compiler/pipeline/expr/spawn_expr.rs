@@ -31,6 +31,7 @@ pub fn compile_spawn(
     branch_switch: &mut Switch,
     machine_name: &str,
     call_hash: u64,
+    jump_args_base: usize,
 ) -> Result<i64> {
     let ptr_ty = ctx.module().target_config().pointer_type();
     let rt_funcs = ctx.rt_funcs().clone();
@@ -81,7 +82,7 @@ pub fn compile_spawn(
         for i in 0..arg_count {
             let val = builder
                 .ins()
-                .load(ptr_ty, MemFlags::new(), spawning_ja_start, i as i32 * 8);
+                .load(ptr_ty, MemFlags::new(), spawning_ja_start, (jump_args_base + i) as i32 * 8);
             builder
                 .ins()
                 .store(MemFlags::new(), val, vars_start, i as i32 * 8);
