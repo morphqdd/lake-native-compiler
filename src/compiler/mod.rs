@@ -15,21 +15,25 @@ use lake_frontend::{
 };
 use log::{debug, error, info};
 
-use crate::compiler::{ctx::CompilerCtx, pipeline::machine::compile_machine, rt::RuntimeBuilder};
+use crate::compiler::{
+    ctx::{CompilerCtx, OptLevel},
+    pipeline::machine::compile_machine,
+    rt::RuntimeBuilder,
+};
 
 pub mod ctx;
 pub mod pipeline;
 pub mod rt;
 
-pub fn compile<SP: AsRef<Path>>(source_path: SP) -> Result<Vec<u8>> {
+pub fn compile<SP: AsRef<Path>>(source_path: SP, opt: OptLevel) -> Result<Vec<u8>> {
     let path = source_path.as_ref();
-    info!("compile: {}", path.display());
+    info!("compile: {} (opt={})", path.display(), opt.as_str());
 
     let src = fs::read_to_string(path)?;
     let ast = parse(path, &src)?;
     info!("parsed {} top-level expressions", ast.len());
 
-    let mut ctx = CompilerCtx::default();
+    let mut ctx = CompilerCtx::new(opt);
 
     info!("initializing runtime");
     ctx = RuntimeBuilder::init(ctx)?;
@@ -66,25 +70,32 @@ pub fn compile<SP: AsRef<Path>>(source_path: SP) -> Result<Vec<u8>> {
     Ok(obj.emit()?)
 }
 
-pub fn link<BP: AsRef<Path>>(build_path: BP, name: &str, bytes: &[u8]) -> Result<()> {
+pub fn link<BP: AsRef<Path>>(
+    build_path: BP,
+    name: &str,
+    bytes: &[u8],
+    strip: bool,
+    linker: &str,
+) -> Result<()> {
     fs::create_dir_all(&build_path)?;
     let obj_path = build_path.as_ref().join(format!("{name}.o"));
     let out_path = build_path.as_ref().join(name);
     fs::write(&obj_path, bytes)?;
 
-    let ok = Command::new("mold")
-        .args([
-            "-static",
-            "external/build/syscall.o",
-            obj_path.to_string_lossy().as_ref(),
-            "-o",
-            out_path.to_string_lossy().as_ref(),
-        ])
-        .status()?
-        .success();
+    let mut args = vec![
+        "-static".to_string(),
+        "external/build/syscall.o".to_string(),
+        obj_path.to_string_lossy().into_owned(),
+        "-o".to_string(),
+        out_path.to_string_lossy().into_owned(),
+    ];
+    if strip {
+        args.push("--strip-all".to_string());
+    }
 
+    let ok = Command::new(linker).args(&args).status()?.success();
     if !ok {
-        bail!("mold linker failed");
+        bail!("{linker} linker failed");
     }
     Ok(())
 }
@@ -155,15 +166,15 @@ mod tests {
     use anyhow::Result;
     use tempfile::tempdir;
 
-    use crate::compiler::{compile, link};
+    use crate::compiler::{compile, ctx::OptLevel, link};
 
     /// Compile `source`, link it, run it and return the exit code.
     fn compile_and_run(source: &str) -> Result<i32> {
         let dir = tempdir()?;
         let src_path = dir.path().join("prog.lake");
         fs::write(&src_path, source)?;
-        let bytes = compile(&src_path)?;
-        link(dir.path(), "prog", &bytes)?;
+        let bytes = compile(&src_path, OptLevel::None)?;
+        link(dir.path(), "prog", &bytes, false, "mold")?;
         let status = Command::new(dir.path().join("prog")).status()?;
         Ok(status.code().unwrap_or(-1))
     }
@@ -173,8 +184,8 @@ mod tests {
         let dir = tempdir()?;
         let src_path = dir.path().join("prog.lake");
         fs::write(&src_path, source)?;
-        let bytes = compile(&src_path)?;
-        link(dir.path(), "prog", &bytes)?;
+        let bytes = compile(&src_path, OptLevel::None)?;
+        link(dir.path(), "prog", &bytes, false, "mold")?;
         let out = Command::new(dir.path().join("prog")).output()?;
         Ok((out.status.code().unwrap_or(-1), out.stdout))
     }

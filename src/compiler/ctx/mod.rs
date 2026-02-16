@@ -30,10 +30,35 @@ pub struct CompilerCtx {
     declared_in_prog_rt_func: BTreeSet<String>,
 }
 
+/// Cranelift optimisation level.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum OptLevel {
+    #[default]
+    None,
+    Speed,
+    SpeedAndSize,
+}
+
+impl OptLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OptLevel::None => "none",
+            OptLevel::Speed => "speed",
+            OptLevel::SpeedAndSize => "speed_and_size",
+        }
+    }
+}
+
 impl Default for CompilerCtx {
     fn default() -> Self {
+        Self::new(OptLevel::None)
+    }
+}
+
+impl CompilerCtx {
+    pub fn new(opt: OptLevel) -> Self {
         let mut flag_builder = settings::builder();
-        flag_builder.set("opt_level", "speed_and_size").unwrap();
+        flag_builder.set("opt_level", opt.as_str()).unwrap();
         flag_builder.set("use_colocated_libcalls", "false").unwrap();
         flag_builder.set("is_pic", "false").unwrap();
         let isa_builder =
