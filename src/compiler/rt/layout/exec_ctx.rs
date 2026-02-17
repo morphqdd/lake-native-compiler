@@ -42,15 +42,11 @@ impl ExecCtxLayout {
         builder: &mut FunctionBuilder,
     ) {
         let ptr_ty = ctx.module().target_config().pointer_type();
-        let ptr_size = builder.ins().iconst(ptr_ty, ptr_ty.bytes() as i64);
-        let rt_funcs = ctx.rt_funcs().clone();
-        let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
-
-        let next_block_offset = builder.ins().iconst(ptr_ty, Self::BLOCK_ID as i64);
-        builder.ins().call(
-            store_ref,
-            &[exec_ctx, next_block, ptr_size, next_block_offset],
-        );
+        // INLINED: was rt_store(exec_ctx, next_block, 8, BLOCK_ID)
+        let exec_start = builder.ins().load(ptr_ty, MemFlags::trusted(), exec_ctx, 0);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), next_block, exec_start, Self::BLOCK_ID);
     }
 }
 

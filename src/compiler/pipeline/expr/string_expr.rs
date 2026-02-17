@@ -3,12 +3,13 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use anyhow::Result;
 use base64ct::{Base64, Encoding};
 use cranelift::{
+    codegen::ir::BlockArg,
     frontend::Switch,
     module::{DataDescription, FuncOrDataId, Linkage, Module},
     prelude::{FunctionBuilder, InstBuilder, MemFlags, Variable},
 };
 
-use crate::compiler::{ctx::CompilerCtx, rt::layout::ExecCtxLayout};
+use crate::compiler::{ctx::CompilerCtx, pipeline::expr::StmtOutcome, rt::layout::ExecCtxLayout};
 
 /// Process escape sequences in a Lake string literal.
 /// `\n` → 0x0A, `\t` → 0x09, `\r` → 0x0D, `\\` → 0x5C, `\"` → 0x22.
@@ -52,7 +53,7 @@ pub fn compile(
     block_id: i64,
     branch_switch: &mut Switch,
     s: &str,
-) -> Result<i64> {
+) -> Result<StmtOutcome> {
     let ptr_ty = ctx.module().target_config().pointer_type();
 
     // Deduplicate strings by hashing their contents.
@@ -123,8 +124,9 @@ pub fn compile(
         .call(store_ref, &[ctx_ptr, fat_ptr, size, temp_val_offset]);
 
     let next_block_id = builder.ins().iconst(ptr_ty, block_id + 1);
-    builder.ins().return_(&[next_block_id]);
+    let qb = ctx.quantum_block();
+    builder.ins().jump(qb, &[BlockArg::Value(next_block_id)]);
 
     branch_switch.set_entry(block_id as u128, b);
-    Ok(block_id + 1)
+    Ok(StmtOutcome::Continue(block_id + 1))
 }

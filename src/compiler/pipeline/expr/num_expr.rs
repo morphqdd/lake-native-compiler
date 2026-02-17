@@ -1,11 +1,12 @@
 use anyhow::Result;
 use cranelift::{
+    codegen::ir::BlockArg,
     frontend::Switch,
     module::Module,
     prelude::{FunctionBuilder, InstBuilder, Variable},
 };
 
-use crate::compiler::{ctx::CompilerCtx, rt::layout::ExecCtxLayout};
+use crate::compiler::{ctx::CompilerCtx, pipeline::expr::StmtOutcome, rt::layout::ExecCtxLayout};
 
 /// Compile a numeric literal.
 ///
@@ -17,7 +18,7 @@ pub fn compile(
     block_id: i64,
     branch_switch: &mut Switch,
     num_str: &str,
-) -> Result<i64> {
+) -> Result<StmtOutcome> {
     let ptr_ty = ctx.module().target_config().pointer_type();
     let num: i64 = num_str.parse()?;
 
@@ -34,8 +35,9 @@ pub fn compile(
         .call(store_ref, &[ctx_ptr, num_val, size, temp_val_offset]);
 
     let next_block_id = builder.ins().iconst(ptr_ty, block_id + 1);
-    builder.ins().return_(&[next_block_id]);
+    let qb = ctx.quantum_block();
+    builder.ins().jump(qb, &[BlockArg::Value(next_block_id)]);
 
     branch_switch.set_entry(block_id as u128, b);
-    Ok(block_id + 1)
+    Ok(StmtOutcome::Continue(block_id + 1))
 }

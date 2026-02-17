@@ -3,7 +3,7 @@ use cranelift::{
     codegen::ir::BlockArg,
     frontend::Switch,
     module::Module,
-    prelude::{FunctionBuilder, InstBuilder, Variable},
+    prelude::{FunctionBuilder, InstBuilder, MemFlags, Variable},
 };
 use lake_frontend::api::{
     ast::{Branch, Clean, Ident, Pattern, Type},
@@ -13,14 +13,15 @@ use log::debug;
 
 use crate::compiler::{
     ctx::CompilerCtx,
-    pipeline::expr::{BranchState, compile_expr},
+    pipeline::expr::{BranchState, StmtOutcome, compile_expr},
     rt::layout::ExecCtxLayout,
 };
 
 /// Compile a single branch of a machine, appending blocks to the
 /// already-open `builder` / `machine_switch`.
 ///
-/// Returns the updated context and the number of local variables.
+/// The pattern hash and param count are fetched from the registry (set during
+/// the index pre-pass) rather than recomputed here.
 pub fn compile_branch(
     ctx: &mut CompilerCtx,
     builder: &mut FunctionBuilder,
@@ -31,10 +32,17 @@ pub fn compile_branch(
     machine_ctx_var: Variable,
 ) -> Result<()> {
     let ptr_ty = ctx.module().target_config().pointer_type();
-    let rt_funcs = ctx.rt_funcs().clone();
     let patterns = Clean::<Vec<Pattern<'_>>>::clean(branch);
 
-    let (hash, param_count) = crate::compiler::hash_pattern(&patterns);
+    // Fetch the hash that was computed once in the index pre-pass.
+    let hash = ctx
+        .get_branch_hash(machine_ident, branch_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Branch {branch_id} of '{machine_ident}' was not indexed — \
+                 run the index pre-pass before compilation"
+            )
+        })?;
 
     let branch_entry_block = builder.create_block();
     let branch_switch_block = builder.create_block();
@@ -50,12 +58,11 @@ pub fn compile_branch(
     // ── Branch entry: read BLOCK_ID and jump to the block switch ─────────────
     builder.switch_to_block(branch_entry_block);
     let ctx_ptr = builder.use_var(machine_ctx_var);
-    let load_u64_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
-    let block_id_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::BLOCK_ID as i64);
-    let call = builder
+    // INLINED: was rt_load_u64(ctx_ptr, BLOCK_ID)
+    let exec_start = builder.ins().load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
+    let block_id = builder
         .ins()
-        .call(load_u64_ref, &[ctx_ptr, block_id_offset]);
-    let block_id = builder.inst_results(call)[0];
+        .load(ptr_ty, MemFlags::trusted(), exec_start, ExecCtxLayout::BLOCK_ID);
     builder
         .ins()
         .jump(branch_switch_block, &[BlockArg::Value(block_id)]);
@@ -77,7 +84,7 @@ pub fn compile_branch(
 
     for pattern in &patterns {
         if pattern.default.is_some() {
-            block_id = compile_expr(
+            match compile_expr(
                 ctx,
                 builder,
                 machine_ctx_var,
@@ -85,12 +92,18 @@ pub fn compile_branch(
                 &mut branch_switch,
                 &mut state,
                 &Expr::from(pattern),
-            )?;
+            )? {
+                StmtOutcome::Continue(id) => block_id = id,
+                outcome => {
+                    block_id = outcome.next_available();
+                    break;
+                }
+            }
         }
     }
 
     for expr in branch.body.iter() {
-        block_id = compile_expr(
+        match compile_expr(
             ctx,
             builder,
             machine_ctx_var,
@@ -98,7 +111,13 @@ pub fn compile_branch(
             &mut branch_switch,
             &mut state,
             &expr,
-        )?;
+        )? {
+            StmtOutcome::Continue(id) => block_id = id,
+            outcome => {
+                block_id = outcome.next_available();
+                break;
+            }
+        }
     }
 
     // ── Emit the per-branch block switch ──────────────────────────────────────
@@ -106,16 +125,15 @@ pub fn compile_branch(
     let block_id_val = builder.block_params(branch_switch_block)[0];
     branch_switch.emit(builder, block_id_val, default_branch_block);
 
-    // ── Register pattern metadata ─────────────────────────────────────────────
+    // ── Update exact var_count in registry ────────────────────────────────────
     debug!(
-        "  branch[{}]: hash={:#018x}, params={}, vars={}, blocks={}",
+        "  branch[{}]: hash={:#018x}, vars={}, blocks={}",
         branch_id,
         hash,
-        param_count,
         state.len(),
         block_id,
     );
-    ctx.insert_pattern(machine_ident, hash, param_count, branch_id, state.len())?;
+    ctx.update_branch_var_count(machine_ident, branch_id, state.len());
 
     Ok(())
 }

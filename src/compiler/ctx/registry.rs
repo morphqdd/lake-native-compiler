@@ -5,41 +5,68 @@ use anyhow::{Result, anyhow};
 /// Information about a single branch of a machine.
 #[derive(Debug, Clone)]
 pub struct BranchInfo {
+    /// Pattern hash — computed once in the index pre-pass.
+    pub hash: u64,
     /// Number of non-default parameters in the branch pattern.
     pub param_count: usize,
     /// Branch identifier used as the switch entry in the machine's jump table.
     pub branch_id: u128,
     /// Number of local variables live in this branch.
+    /// Set to an estimated value during the pre-pass and updated with the
+    /// exact count after the branch is compiled.
     pub var_count: usize,
 }
 
 /// Per-machine registry entry.
+///
+/// Maintains two indices:
+/// - `by_id`   — primary index keyed by `branch_id` (used during compilation
+///               to fetch the pre-computed hash and to update `var_count`).
+/// - `by_hash` — dispatch index keyed by pattern hash (used at runtime for
+///               O(1) branch lookup in spawn / state-change calls).
 #[derive(Debug, Default)]
 pub struct MachineInfo {
-    /// Map from pattern hash → branch info.
-    branches: HashMap<u64, BranchInfo>,
+    by_id: HashMap<u128, BranchInfo>,
+    by_hash: HashMap<u64, u128>,
 }
 
 impl MachineInfo {
-    pub fn insert_branch(&mut self, hash: u64, info: BranchInfo) {
-        self.branches.insert(hash, info);
+    pub fn insert_branch(&mut self, info: BranchInfo) {
+        self.by_hash.insert(info.hash, info.branch_id);
+        self.by_id.insert(info.branch_id, info);
+    }
+
+    /// Look up branch info by pattern hash (O(1) dispatch path).
+    pub fn branch_by_hash(&self, hash: u64) -> Option<&BranchInfo> {
+        let id = self.by_hash.get(&hash)?;
+        self.by_id.get(id)
+    }
+
+    /// Look up branch info by branch id.
+    pub fn branch_by_id(&self, id: u128) -> Option<&BranchInfo> {
+        self.by_id.get(&id)
     }
 
     /// Find the branch whose `param_count` matches `count`.
-    /// Returns `None` if no such branch exists.
     pub fn branch_by_param_count(&self, count: usize) -> Option<&BranchInfo> {
-        self.branches
-            .values()
-            .find(|b| b.param_count == count)
+        self.by_id.values().find(|b| b.param_count == count)
     }
 
-    /// Find the branch whose `branch_id` matches `id`.
-    pub fn branch_by_id(&self, id: u128) -> Option<&BranchInfo> {
-        self.branches.values().find(|b| b.branch_id == id)
+    /// Update `var_count` for a branch after it has been fully compiled.
+    pub fn update_var_count(&mut self, branch_id: u128, var_count: usize) {
+        if let Some(info) = self.by_id.get_mut(&branch_id) {
+            info.var_count = var_count;
+        }
+    }
+
+    /// Maximum `var_count` across all branches of this machine.
+    /// Used to size the VARIABLES buffer so any state transition is safe.
+    pub fn max_var_count(&self) -> usize {
+        self.by_id.values().map(|b| b.var_count).max().unwrap_or(0)
     }
 }
 
-/// Registry for all machines and their branches compiled so far.
+/// Registry for all machines and their branches.
 #[derive(Debug, Default)]
 pub struct MachineRegistry {
     machines: HashMap<String, MachineInfo>,
@@ -65,15 +92,28 @@ impl MachineRegistry {
         self.machines
             .get_mut(machine)
             .ok_or_else(|| anyhow!("Machine '{machine}' is not registered"))?
-            .insert_branch(
+            .insert_branch(BranchInfo {
                 hash,
-                BranchInfo {
-                    param_count,
-                    branch_id,
-                    var_count,
-                },
-            );
+                param_count,
+                branch_id,
+                var_count,
+            });
         Ok(())
+    }
+
+    /// Return the pre-computed pattern hash for a specific branch.
+    pub fn hash_by_branch_id(&self, machine: &str, branch_id: u128) -> Option<u64> {
+        self.machines
+            .get(machine)?
+            .branch_by_id(branch_id)
+            .map(|b| b.hash)
+    }
+
+    /// Update the exact `var_count` for a branch after compilation.
+    pub fn update_var_count(&mut self, machine: &str, branch_id: u128, var_count: usize) {
+        if let Some(info) = self.machines.get_mut(machine) {
+            info.update_var_count(branch_id, var_count);
+        }
     }
 
     /// Look up the branch_id for a machine whose branch has the given param_count.
@@ -84,19 +124,23 @@ impl MachineRegistry {
             .map(|b| b.branch_id)
     }
 
-    /// Look up (branch_id, var_count, param_count) by the pattern hash.
-    /// This is the primary O(1) dispatch lookup: hash(arg_types) → branch.
+    /// O(1) dispatch lookup: hash(arg_types) → (branch_id, var_count, param_count).
     pub fn branch_by_hash(&self, machine: &str, hash: u64) -> Option<(u128, usize, usize)> {
-        let info = self.machines.get(machine)?.branches.get(&hash)?;
+        let info = self.machines.get(machine)?.branch_by_hash(hash)?;
         Some((info.branch_id, info.var_count, info.param_count))
     }
 
-    /// Look up the var_count for the branch with the given branch_id, scoped to a specific machine.
+    /// Look up the var_count for the branch with the given branch_id, scoped to a machine.
     pub fn var_count_by_branch_id(&self, machine: &str, branch_id: u128) -> Option<usize> {
         self.machines
             .get(machine)?
             .branch_by_id(branch_id)
             .map(|b| b.var_count)
+    }
+
+    /// Maximum `var_count` across all branches of `machine`.
+    pub fn max_var_count(&self, machine: &str) -> Option<usize> {
+        self.machines.get(machine).map(|m| m.max_var_count())
     }
 
     /// Iterate over all registered machine names.
@@ -131,8 +175,24 @@ mod tests {
         assert_eq!(reg.var_count_by_branch_id("main", 42), Some(3));
         assert_eq!(reg.var_count_by_branch_id("main", 43), Some(5));
         assert_eq!(reg.var_count_by_branch_id("main", 99), None);
-        // Wrong machine name returns None even for valid branch_id.
         assert_eq!(reg.var_count_by_branch_id("ghost", 42), None);
+    }
+
+    #[test]
+    fn hash_by_branch_id() {
+        let reg = make_registry();
+        assert_eq!(reg.hash_by_branch_id("main", 42), Some(0xABCD));
+        assert_eq!(reg.hash_by_branch_id("main", 43), Some(0xEF01));
+        assert_eq!(reg.hash_by_branch_id("main", 99), None);
+    }
+
+    #[test]
+    fn update_var_count() {
+        let mut reg = make_registry();
+        reg.update_var_count("main", 42, 99);
+        assert_eq!(reg.var_count_by_branch_id("main", 42), Some(99));
+        // other branch unchanged
+        assert_eq!(reg.var_count_by_branch_id("main", 43), Some(5));
     }
 
     #[test]

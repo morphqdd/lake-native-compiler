@@ -1,5 +1,7 @@
 use anyhow::{Result, anyhow, bail};
+use crate::compiler::pipeline::expr::StmtOutcome;
 use cranelift::{
+    codegen::ir::BlockArg,
     frontend::Switch,
     module::{FuncOrDataId, Module},
     prelude::{FunctionBuilder, InstBuilder, MemFlags, Variable},
@@ -8,9 +10,7 @@ use cranelift::{
 use crate::compiler::{
     ctx::CompilerCtx,
     rt::layout::{
-        ExecCtxLayout, FatPtrLayout,
-        process_ctx::ProcessCtxLayout,
-        sheduler_ctx::ShedulerCtxLayout,
+        ExecCtxLayout, FatPtrLayout, process_ctx::ProcessCtxLayout, sheduler_ctx::ShedulerCtxLayout,
     },
 };
 
@@ -32,13 +32,27 @@ pub fn compile_spawn(
     machine_name: &str,
     call_hash: u64,
     jump_args_base: usize,
-) -> Result<i64> {
+) -> Result<StmtOutcome> {
     let ptr_ty = ctx.module().target_config().pointer_type();
     let rt_funcs = ctx.rt_funcs().clone();
 
-    let (branch_id, var_count, arg_count) = ctx
+    let (branch_id, _var_count, arg_count) = ctx
         .lookup_branch_by_hash(machine_name, call_hash)
-        .ok_or_else(|| anyhow!("No branch matching call hash {:#018x} in '{}'", call_hash, machine_name))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "No branch matching call hash {:#018x} in '{}'",
+                call_hash,
+                machine_name
+            )
+        })?;
+
+    // Size the VARIABLES buffer by the maximum var_count across all branches of
+    // the target machine so that any future state transition (`self(...)`) is
+    // safe regardless of which branch is entered next.
+    let max_vars = ctx
+        .max_branch_var_count(machine_name)
+        .unwrap_or(1)
+        .max(1);
 
     let b = builder.create_block();
     builder.switch_to_block(b);
@@ -46,26 +60,19 @@ pub fn compile_spawn(
     let allocate_ref = rt_funcs.allocate_ref(ctx.module_mut(), builder);
     let load_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
 
-    // ── Allocate ExecCtx (fat ptr layout: header[0..16] + data[16..]) ────────
     let exec_ctx_size = builder.ins().iconst(ptr_ty, ExecCtxLayout::SIZE as i64);
     let call_exec = builder.ins().call(allocate_ref, &[exec_ctx_size]);
     let exec_ctx_fat_ptr = builder.inst_results(call_exec)[0];
-    // Raw data pointer for direct field stores.
     let exec_ctx_ptr = FatPtrLayout::load_start(builder, ptr_ty, exec_ctx_fat_ptr);
 
-    // ── Allocate VARIABLES buffer ─────────────────────────────────────────────
-    let vars_size = builder
-        .ins()
-        .iconst(ptr_ty, (var_count.max(1) * 8) as i64);
+    let vars_size = builder.ins().iconst(ptr_ty, (max_vars * 8) as i64);
     let call_vars = builder.ins().call(allocate_ref, &[vars_size]);
     let vars_fat_ptr = builder.inst_results(call_vars)[0];
 
-    // ── Allocate JUMP_ARGS buffer ─────────────────────────────────────────────
     let jump_args_size = builder.ins().iconst(ptr_ty, 256 * 8i64);
     let call_args = builder.ins().call(allocate_ref, &[jump_args_size]);
     let jump_args_fat_ptr = builder.inst_results(call_args)[0];
 
-    // ── Copy staged args from spawning process JUMP_ARGS → spawned VARIABLES ──
     if arg_count > 0 {
         let spawning_ctx_ptr = builder.use_var(machine_ctx_var);
         let jump_args_offset = builder
@@ -80,21 +87,33 @@ pub fn compile_spawn(
         let vars_start = FatPtrLayout::load_start(builder, ptr_ty, vars_fat_ptr);
 
         for i in 0..arg_count {
-            let val = builder
-                .ins()
-                .load(ptr_ty, MemFlags::new(), spawning_ja_start, (jump_args_base + i) as i32 * 8);
+            let val = builder.ins().load(
+                ptr_ty,
+                MemFlags::new(),
+                spawning_ja_start,
+                (jump_args_base + i) as i32 * 8,
+            );
             builder
                 .ins()
                 .store(MemFlags::new(), val, vars_start, i as i32 * 8);
         }
     }
 
-    // ── Initialise ExecCtx fields (raw stores into data region) ───────────────
     let branch_id_val = builder.ins().iconst(ptr_ty, branch_id as i64);
     let zero = builder.ins().iconst(ptr_ty, 0);
-    ExecCtxLayout::store(builder, branch_id_val, exec_ctx_ptr, ExecCtxLayout::BRANCH_ID);
+    ExecCtxLayout::store(
+        builder,
+        branch_id_val,
+        exec_ctx_ptr,
+        ExecCtxLayout::BRANCH_ID,
+    );
     ExecCtxLayout::store(builder, zero, exec_ctx_ptr, ExecCtxLayout::BLOCK_ID);
-    ExecCtxLayout::store(builder, vars_fat_ptr, exec_ctx_ptr, ExecCtxLayout::VARIABLES);
+    ExecCtxLayout::store(
+        builder,
+        vars_fat_ptr,
+        exec_ctx_ptr,
+        ExecCtxLayout::VARIABLES,
+    );
     ExecCtxLayout::store(
         builder,
         jump_args_fat_ptr,
@@ -102,11 +121,9 @@ pub fn compile_spawn(
         ExecCtxLayout::JUMP_ARGS,
     );
 
-    // ── Create ProcessCtx ─────────────────────────────────────────────────────
     let proc_ctx_fat_ptr =
         ProcessCtxLayout::init_ctx(ctx, builder, machine_name, exec_ctx_fat_ptr)?;
 
-    // ── Load scheduler fat ptr from global ────────────────────────────────────
     let sched_data_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
         Some(FuncOrDataId::Data(id)) => id,
         _ => bail!("sheduler_ctx_fat_ptr global not found"),
@@ -116,14 +133,13 @@ pub fn compile_spawn(
         .declare_data_in_func(sched_data_id, &mut builder.func);
     let sh_ctx_ptr = builder.ins().global_value(ptr_ty, sched_gv);
 
-    // ── Register with scheduler ───────────────────────────────────────────────
     ShedulerCtxLayout::new_process(sh_ctx_ptr, proc_ctx_fat_ptr, ctx, builder)?;
 
-    // Spawning process continues at the next block.
     let next_id = block_id + 1;
     let next_id_val = builder.ins().iconst(ptr_ty, next_id);
-    builder.ins().return_(&[next_id_val]);
+    let qb = ctx.quantum_block();
+    builder.ins().jump(qb, &[BlockArg::Value(next_id_val)]);
 
     branch_switch.set_entry(block_id as u128, b);
-    Ok(next_id)
+    Ok(StmtOutcome::Continue(next_id))
 }

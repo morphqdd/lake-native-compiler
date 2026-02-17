@@ -1,16 +1,16 @@
 use anyhow::{Result, bail};
 use cranelift::{
+    codegen::ir::BlockArg,
     frontend::Switch,
     module::Module,
     prelude::{FunctionBuilder, InstBuilder, Variable},
 };
 use lake_frontend::api::expr::Expr;
-use log::debug;
 
 use crate::compiler::{
     ctx::CompilerCtx,
     hash_call_args,
-    pipeline::expr::{BranchState, compile_expr, spawn_expr},
+    pipeline::expr::{BranchState, StmtOutcome, change_state_expr, compile_expr, spawn_expr},
     rt::layout::ExecCtxLayout,
 };
 
@@ -31,29 +31,24 @@ pub fn compile(
     state: &mut BranchState,
     ident: &Expr<'_>,
     args: &[Expr<'_>],
-) -> Result<i64> {
+) -> Result<StmtOutcome> {
     let ptr_ty = ctx.module().target_config().pointer_type();
     let rt_funcs = ctx.rt_funcs().clone();
 
-    let Expr::Var(callee_name, ty) = ident else {
+    let Expr::Var(callee_name, _ty) = ident else {
         bail!("Jump target must be a variable/identifier");
     };
 
-    // Snapshot the current base; nested calls within our args will be given
-    // a base of `call_base + args.len()` so they never overwrite already-
-    // staged slots of the current call.
     let call_base = state.jump_args_base;
 
     let mut next_id = block_id;
 
     for (i, arg) in args.iter().enumerate() {
-        // Advance the base for any nested calls inside this argument so that
-        // they stage into JUMP_ARGS[call_base + args.len() ..] and leave our
-        // slots [call_base .. call_base + args.len()] untouched.
         state.jump_args_base = call_base + args.len();
 
-        // Compile the argument; result ends up in TEMP_VAL.
-        let after_arg_id = compile_expr(
+        // Argument expressions must produce a value (Continue).
+        // A terminal (StateChange, Wait, …) has no return value to pass.
+        let after_arg_id = match compile_expr(
             ctx,
             builder,
             machine_ctx_var,
@@ -61,12 +56,19 @@ pub fn compile(
             branch_switch,
             state,
             arg,
-        )?;
+        )? {
+            StmtOutcome::Continue(id) => id,
+            other => bail!(
+                "argument #{} to '{}' is a terminal expression ({:?}); \
+                 terminals have no return value and cannot be used as arguments",
+                i,
+                callee_name,
+                other
+            ),
+        };
 
-        // Restore base after the arg is compiled.
         state.jump_args_base = call_base;
 
-        // Block: move TEMP_VAL → JUMP_ARGS[call_base + i].
         let b = builder.create_block();
         builder.switch_to_block(b);
 
@@ -93,15 +95,14 @@ pub fn compile(
             .call(store_ref, &[args_ptr, arg_val, size, slot_offset]);
 
         let next_block_val = builder.ins().iconst(ptr_ty, after_arg_id + 1);
-        builder.ins().return_(&[next_block_val]);
+        let qb = ctx.quantum_block();
+        builder.ins().jump(qb, &[BlockArg::Value(next_block_val)]);
 
         branch_switch.set_entry(after_arg_id as u128, b);
         next_id = after_arg_id + 1;
     }
 
     if ctx.is_declared_rt_func_in_prog(callee_name) {
-        // ── Direct rt function call ───────────────────────────────────────────
-        // Load all staged args from JUMP_ARGS and call the function directly.
         let b = builder.create_block();
         builder.switch_to_block(b);
 
@@ -134,29 +135,43 @@ pub fn compile(
             let ctx_ptr = builder.use_var(machine_ctx_var);
             let temp_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::TEMP_VAL as i64);
             let size = builder.ins().iconst(ptr_ty, 8);
-            builder.ins().call(store_ref, &[ctx_ptr, val, size, temp_offset]);
+            builder
+                .ins()
+                .call(store_ref, &[ctx_ptr, val, size, temp_offset]);
         }
 
         let done = builder.ins().iconst(ptr_ty, next_id + 1);
-        builder.ins().return_(&[done]);
+        let qb = ctx.quantum_block();
+        builder.ins().jump(qb, &[BlockArg::Value(done)]);
 
         branch_switch.set_entry(next_id as u128, b);
-        Ok(next_id + 1)
+        Ok(StmtOutcome::Continue(next_id + 1))
     } else {
-        // ── Spawn a new process ───────────────────────────────────────────────
-        // Compute the pattern hash from argument types at compile time — this
-        // gives O(1) branch dispatch via the registry HashMap.
         let call_hash = hash_call_args(args, state.lake_types());
-        debug!("Args: {:?}", args);
-        spawn_expr::compile_spawn(
-            ctx,
-            builder,
-            machine_ctx_var,
-            next_id,
-            branch_switch,
-            callee_name,
-            call_hash,
-            call_base,
-        )
+        if let Some(name) = ctx.get_current_machine()
+            && *callee_name == "self"
+        {
+            change_state_expr::compile(
+                ctx,
+                builder,
+                machine_ctx_var,
+                next_id,
+                branch_switch,
+                &name,
+                call_hash,
+                call_base,
+            )
+        } else {
+            spawn_expr::compile_spawn(
+                ctx,
+                builder,
+                machine_ctx_var,
+                next_id,
+                branch_switch,
+                callee_name,
+                call_hash,
+                call_base,
+            )
+        }
     }
 }

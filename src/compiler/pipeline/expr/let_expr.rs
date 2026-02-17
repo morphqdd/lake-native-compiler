@@ -1,5 +1,6 @@
 use anyhow::Result;
 use cranelift::{
+    codegen::ir::BlockArg,
     frontend::Switch,
     module::Module,
     prelude::{FunctionBuilder, InstBuilder, Variable},
@@ -8,7 +9,7 @@ use lake_frontend::api::{ast::Type, expr::Expr};
 
 use crate::compiler::{
     ctx::CompilerCtx,
-    pipeline::expr::{BranchState, compile_expr},
+    pipeline::expr::{BranchState, StmtOutcome, compile_expr},
     rt::layout::ExecCtxLayout,
 };
 
@@ -27,21 +28,17 @@ pub fn compile(
     ident: &str,
     ty: &Type<'_>,
     default: Option<&Expr<'_>>,
-) -> Result<i64> {
+) -> Result<StmtOutcome> {
     let ptr_ty = ctx.module().target_config().pointer_type();
     let rt_funcs = ctx.rt_funcs().clone();
 
     // Compile the initialiser (if any) first; it leaves its result in TEMP_VAL.
     let next_id = match default {
-        Some(d) => compile_expr(
-            ctx,
-            builder,
-            machine_ctx_var,
-            block_id,
-            branch_switch,
-            state,
-            d,
-        )?,
+        Some(d) => match compile_expr(ctx, builder, machine_ctx_var, block_id, branch_switch, state, d)? {
+            StmtOutcome::Continue(id) => id,
+            // A terminal default is unusual but we propagate it.
+            terminal => return Ok(terminal),
+        },
         None => block_id,
     };
 
@@ -80,8 +77,9 @@ pub fn compile(
         .call(store_ref, &[vars_ptr, temp_val, size, var_offset]);
 
     let next_block_id = builder.ins().iconst(ptr_ty, next_id + 1);
-    builder.ins().return_(&[next_block_id]);
+    let qb = ctx.quantum_block();
+    builder.ins().jump(qb, &[BlockArg::Value(next_block_id)]);
 
     branch_switch.set_entry(next_id as u128, b);
-    Ok(next_id + 1)
+    Ok(StmtOutcome::Continue(next_id + 1))
 }

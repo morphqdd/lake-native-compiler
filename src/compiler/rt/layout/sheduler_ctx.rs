@@ -44,7 +44,7 @@ impl ShedulerCtxLayout {
     pub const REAL_COUNT_OF_PROCESSES: i32 = 32;
     pub const REDUCTION_COUNTER: i32 = 40;
 
-    pub const REDUCTION_LIMIT_VALUE: i64 = 256;
+    pub const REDUCTION_LIMIT_VALUE: i64 = 1000;
 
     pub fn init(
         ctx: &mut crate::compiler::ctx::CompilerCtx,
@@ -98,13 +98,17 @@ impl ShedulerCtxLayout {
         let branch_id = ctx
             .lookup_param_count("main", 0)
             .ok_or_else(|| anyhow!("No zero-parameter branch in 'main'"))?;
-        let var_count = ctx
-            .lookup_vars_count("main", branch_id)
-            .ok_or_else(|| anyhow!("Variable count for branch {branch_id} not found in 'main'"))?;
+
+        // Size the buffer by the maximum var_count across all branches of main
+        // so that state transitions never overflow the variables array.
+        let max_vars = ctx
+            .max_branch_var_count("main")
+            .ok_or_else(|| anyhow!("No branches found in 'main'"))?
+            .max(1);
 
         // ── Allocate the variables buffer ─────────────────────────────────────
         let (_main_vars_ptr, main_vars_fat_ptr) =
-            alloc_static_buffer(ctx, builder, ptr_ty, "main_vars", var_count * 8)?;
+            alloc_static_buffer(ctx, builder, ptr_ty, "main_vars", max_vars * 8)?;
 
         // ── Allocate the jump-arguments buffer (256 slots) ────────────────────
         let (_main_args_ptr, main_args_fat_ptr) =

@@ -1,0 +1,23 @@
+@rt(rt_write)
+
+worker is {
+  steps i64 acc1 i64 acc2 i64 -> {
+    when 1 <= steps {
+      true  -> { self(steps-1 acc2 acc1+acc2) }
+      false -> { rt_write(1 ".\n" 2) }
+    }
+  }
+}
+
+main is {
+  _ i64.0 -> {
+    worker(100000 0 1)
+    worker(100000 0 1)
+    worker(100000 0 1)
+    worker(100000 0 1)
+    worker(100000 0 1)
+    worker(100000 0 1)
+    worker(100000 0 1)
+    worker(100000 0 1)
+  }
+}

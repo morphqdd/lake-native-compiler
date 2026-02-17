@@ -1,21 +1,22 @@
 use anyhow::Result;
 // Scheduler infrastructure (Cranelift IR level).
 //
-// The scheduler is the entity that:
-//   1. Maintains a queue of active processes (each process = machine fn + ExecCtx).
-//   2. Calls each machine function with its context for one block of work.
-//   3. Stores the returned next-block-id back into the context.
-//   4. Removes processes that return -1 (finished).
-//   5. Loops until the queue is empty, then calls rt_exit(0).
+// The scheduler drives the process queue.  Each machine function now runs its
+// own inner quantum loop and returns a stop code:
+//
+//   STOP_DONE  (-1)  — process finished; remove from queue.
+//   STOP_LIMIT (-2)  — quantum exhausted; BLOCK_ID already stored; round-robin.
+//
+// Future stop codes (STOP_WAIT etc.) will be added here as new variants.
 use cranelift::{
-    codegen::ir::BlockArg,
     module::Module,
     prelude::{AbiParam, FunctionBuilder, InstBuilder, IntCC, TrapCode},
 };
 
 use crate::compiler::{
     ctx::CompilerCtx,
-    rt::layout::{ExecCtxLayout, process_ctx::ProcessCtxLayout, sheduler_ctx::ShedulerCtxLayout},
+    pipeline::machine::STOP_DONE,
+    rt::layout::{process_ctx::ProcessCtxLayout, sheduler_ctx::ShedulerCtxLayout},
 };
 
 pub fn build_scheduler(ctx: &mut CompilerCtx, builder: &mut FunctionBuilder) -> Result<()> {
@@ -33,74 +34,49 @@ pub fn build_scheduler(ctx: &mut CompilerCtx, builder: &mut FunctionBuilder) -> 
     let sh_ptr_var = ShedulerCtxLayout::init(ctx, builder)?;
     ShedulerCtxLayout::init_main_process(sh_ptr_var, ctx, builder)?;
 
-    let loop_block = builder.create_block();
-    let limit_check_block = builder.create_block();
-    let exec_block = builder.create_block();
-    let exit_block = builder.create_block();
-    let continue_block = builder.create_block();
-    let next_process_block = builder.create_block();
+    // ── Blocks ────────────────────────────────────────────────────────────────
+    let loop_block          = builder.create_block();
+    let exec_block          = builder.create_block();
     let end_of_process_block = builder.create_block();
-    builder.append_block_param(continue_block, ptr_ty); // next_block_id
-    builder.append_block_param(continue_block, ptr_ty); // exec_ctx 
+    let next_process_block  = builder.create_block();
+    let exit_block          = builder.create_block();
 
     builder.ins().jump(loop_block, &[]);
+
+    // ── loop_block: any processes left? ───────────────────────────────────────
     builder.switch_to_block(loop_block);
+    let count = ShedulerCtxLayout::get_real_count_of_processes(sh_ptr_var, ctx, builder)?;
+    let has_procs = builder.ins().icmp_imm(IntCC::NotEqual, count, 0);
+    builder.ins().brif(has_procs, exec_block, &[], exit_block, &[]);
 
-    let real_count_of_processes =
-        ShedulerCtxLayout::get_real_count_of_processes(sh_ptr_var, ctx, builder)?;
-    let is_continue = builder
-        .ins()
-        .icmp_imm(IntCC::NotEqual, real_count_of_processes, 0);
-    builder
-        .ins()
-        .brif(is_continue, limit_check_block, &[], exit_block, &[]);
-
-    builder.switch_to_block(limit_check_block);
-    let counter = ShedulerCtxLayout::get_reduction_counter(sh_ptr_var, ctx, builder)?;
-    let limit = ShedulerCtxLayout::get_reduction_limit(sh_ptr_var, ctx, builder)?;
-
-    let is_limit_reached = builder
-        .ins()
-        .icmp(IntCC::UnsignedGreaterThanOrEqual, counter, limit);
-    builder
-        .ins()
-        .brif(is_limit_reached, next_process_block, &[], exec_block, &[]);
-
+    // ── exec_block: call current process's machine (runs quantum internally) ──
     builder.switch_to_block(exec_block);
-    let current_process_ctx = ShedulerCtxLayout::get_current_process(sh_ptr_var, ctx, builder)?;
-    let func_addr = ProcessCtxLayout::get_func_addr(current_process_ctx, ctx, builder)?;
-    let exec_ctx = ProcessCtxLayout::get_exec_ctx(current_process_ctx, ctx, builder)?;
-    let mut default_machine_sig = ctx.module().make_signature();
-    default_machine_sig.params.push(AbiParam::new(ptr_ty));
-    default_machine_sig.returns.push(AbiParam::new(ptr_ty));
-    let default_sig_ref = builder.import_signature(default_machine_sig);
+    let current = ShedulerCtxLayout::get_current_process(sh_ptr_var, ctx, builder)?;
+    let func_addr = ProcessCtxLayout::get_func_addr(current, ctx, builder)?;
+    let exec_ctx  = ProcessCtxLayout::get_exec_ctx(current, ctx, builder)?;
 
-    let call = builder
-        .ins()
-        .call_indirect(default_sig_ref, func_addr, &[exec_ctx]);
-    let next_block_id = builder.inst_results(call)[0];
-    let is_done = builder.ins().icmp_imm(IntCC::Equal, next_block_id, -1);
-    builder.ins().brif(
-        is_done,
-        end_of_process_block,
-        &[],
-        continue_block,
-        &[BlockArg::Value(next_block_id), BlockArg::Value(exec_ctx)],
-    );
+    let mut machine_sig = ctx.module().make_signature();
+    machine_sig.params.push(AbiParam::new(ptr_ty));
+    machine_sig.returns.push(AbiParam::new(ptr_ty));
+    let sig_ref = builder.import_signature(machine_sig);
 
-    builder.switch_to_block(continue_block);
-    let next_id = builder.block_params(continue_block)[0];
-    let exec_ctx = builder.block_params(continue_block)[1];
-    ExecCtxLayout::set_next_block(exec_ctx, next_id, ctx, builder);
-    ShedulerCtxLayout::increment_reduction_counter(sh_ptr_var, ctx, builder);
-    builder.ins().jump(loop_block, &[]);
+    let call      = builder.ins().call_indirect(sig_ref, func_addr, &[exec_ctx]);
+    let stop_code = builder.inst_results(call)[0];
 
+    // STOP_DONE (-1): process finished → remove it.
+    // STOP_LIMIT (-2) or anything else: quantum done → round-robin.
+    let is_done = builder.ins().icmp_imm(IntCC::Equal, stop_code, STOP_DONE);
+    builder.ins().brif(is_done, end_of_process_block, &[], next_process_block, &[]);
+
+    // ── end_of_process_block ──────────────────────────────────────────────────
     builder.switch_to_block(end_of_process_block);
     ShedulerCtxLayout::remove_current_process(sh_ptr_var, ctx, builder, loop_block)?;
 
+    // ── next_process_block: round-robin ───────────────────────────────────────
     builder.switch_to_block(next_process_block);
     ShedulerCtxLayout::next_process(sh_ptr_var, ctx, builder, loop_block);
 
+    // ── exit_block ────────────────────────────────────────────────────────────
     builder.switch_to_block(exit_block);
     let exit_ref = rt_funcs.exit_ref(ctx.module_mut(), builder);
     let zero = builder.ins().iconst(ptr_ty, 0);

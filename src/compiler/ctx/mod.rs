@@ -3,10 +3,10 @@ use std::collections::{BTreeSet, HashMap};
 use anyhow::{Result, bail};
 use cranelift::{
     codegen::ir::FuncRef,
-    module::{FuncId, FuncOrDataId, Module, default_libcall_names},
+    module::{FuncId, FuncOrDataId, Linkage, Module, default_libcall_names},
     native,
     object::{ObjectBuilder, ObjectModule, ObjectProduct},
-    prelude::{Configurable, FunctionBuilder, Type, settings},
+    prelude::{AbiParam, Block, Configurable, FunctionBuilder, Type, settings},
 };
 
 pub mod compiler_type;
@@ -28,6 +28,11 @@ pub struct CompilerCtx {
     /// Cache of FuncRef declarations per (current_function_name, callee_name).
     func_ref_cache: HashMap<(String, String), FuncRef>,
     declared_in_prog_rt_func: BTreeSet<String>,
+    current_machine: Option<String>,
+    /// The block inside the current machine function that CPS blocks jump to
+    /// instead of returning directly.  Set by `compile_machine` before branch
+    /// compilation; cleared by `begin_function`.
+    quantum_block: Option<Block>,
 }
 
 /// Cranelift optimisation level.
@@ -79,6 +84,8 @@ impl CompilerCtx {
             rt_funcs: None,
             func_ref_cache: HashMap::new(),
             declared_in_prog_rt_func: BTreeSet::new(),
+            current_machine: None,
+            quantum_block: None,
         }
     }
 }
@@ -131,6 +138,22 @@ impl CompilerCtx {
         self.registry.var_count_by_branch_id(machine, branch_id)
     }
 
+    /// Return the maximum variable count across all branches of `machine`.
+    /// Used to size the VARIABLES buffer so any state transition is safe.
+    pub fn max_branch_var_count(&self, machine: &str) -> Option<usize> {
+        self.registry.max_var_count(machine)
+    }
+
+    /// Return the pre-computed pattern hash for a branch (set during the index pre-pass).
+    pub fn get_branch_hash(&self, machine: &str, branch_id: u128) -> Option<u64> {
+        self.registry.hash_by_branch_id(machine, branch_id)
+    }
+
+    /// Update the exact variable count for a branch after it has been compiled.
+    pub fn update_branch_var_count(&mut self, machine: &str, branch_id: u128, var_count: usize) {
+        self.registry.update_var_count(machine, branch_id, var_count);
+    }
+
     pub fn machines(&self) -> impl Iterator<Item = &str> {
         self.registry.machine_names()
     }
@@ -163,6 +186,20 @@ impl CompilerCtx {
     /// function compilations.
     pub fn begin_function(&mut self) {
         self.func_ref_cache.clear();
+        self.quantum_block = None;
+    }
+
+    /// Set the quantum continuation block for the current machine function.
+    /// CPS blocks jump here instead of returning directly to the scheduler.
+    pub fn set_quantum_block(&mut self, block: Block) {
+        self.quantum_block = Some(block);
+    }
+
+    /// Get the quantum continuation block.  Panics if called outside a machine
+    /// function compilation (i.e. before `set_quantum_block`).
+    pub fn quantum_block(&self) -> Block {
+        self.quantum_block
+            .expect("quantum_block not set — call set_quantum_block before compiling branches")
     }
 
     /// Get a `FuncRef` for `callee` usable inside the function currently being
@@ -204,5 +241,29 @@ impl CompilerCtx {
 
     pub fn get_registry(&self) -> &MachineRegistry {
         &self.registry
+    }
+
+    pub fn set_current_machine(&mut self, name: Option<String>) {
+        self.current_machine = name;
+    }
+
+    pub fn get_current_machine(&mut self) -> Option<String> {
+        self.current_machine.clone()
+    }
+
+    /// Pre-declare a machine's Cranelift function before code generation.
+    ///
+    /// All machine functions share the same signature `fn(ctx_fat_ptr: ptr) -> ptr`.
+    /// Calling this before the main compilation pass allows any branch to reference
+    /// any machine regardless of declaration order in the source file.
+    pub fn predeclare_machine(&mut self, name: &str) -> anyhow::Result<()> {
+        let ptr_ty = self.module.target_config().pointer_type();
+        let mut module_ctx = self.module.make_context();
+        module_ctx.func.signature.params.push(AbiParam::new(ptr_ty));
+        module_ctx.func.signature.returns.push(AbiParam::new(ptr_ty));
+        let sig = module_ctx.func.signature.clone();
+        self.module.declare_function(name, Linkage::Export, &sig)?;
+        self.module.clear_context(&mut module_ctx);
+        Ok(())
     }
 }

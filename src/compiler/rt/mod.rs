@@ -1,9 +1,9 @@
 use anyhow::{Result, anyhow, bail};
-use log::debug;
 use cranelift::{
     module::{DataDescription, FuncOrDataId, Linkage, Module},
     prelude::{FunctionBuilder, FunctionBuilderContext, InstBuilder, MemFlags, Type},
 };
+use log::debug;
 
 use crate::compiler::{
     ctx::{CompilerCtx, rt_funcs::RtFuncs},
@@ -12,6 +12,7 @@ use crate::compiler::{
             alloc::{define_allocate, define_loads, define_store},
             exit::define_exit,
             mmap::{define_init_heap, define_mmap},
+            strings::{define_len, define_to_string, define_to_string_with_ln},
             syscall::declare_syscall_wrapper,
             write::{define_write, define_write_static},
         },
@@ -52,7 +53,12 @@ impl RuntimeBuilder {
         let ctx = define_write(ctx)?;
         debug!("rt: rt_write_static");
         let ctx = define_write_static(ctx)?;
-
+        debug!("rt: len");
+        let ctx = define_len(ctx)?;
+        debug!("rt: to_string_with_ln");
+        let ctx = define_to_string_with_ln(ctx)?;
+        debug!("rt: to_string");
+        let ctx = define_to_string(ctx)?;
         // Resolve and cache all FuncIds in the context.
         let mut ctx = ctx;
         let rt = RtFuncs::resolve(ctx.module())?;
