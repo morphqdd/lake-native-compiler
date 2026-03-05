@@ -1,0 +1,16 @@
+@rt(rt_write)
+
+sum is {
+  n i64 acc i64 -> {
+    when 0 == n {
+      true  -> { rt_write(1 "done\n" 5) }
+      false -> { self(n-1 acc+n) }
+    }
+  }
+}
+
+main is {
+  _ i64.0 -> {
+    sum(100 0)
+  }
+}

@@ -1,0 +1,18 @@
+@rt(rt_write)
+
+counter is {
+  n i64 -> {
+    when 0 == n {
+      true  -> { rt_write(1 "done\n" 5) }
+      false -> { self(n-1) }
+    }
+  }
+}
+
+main is {
+  _ i64.0 -> {
+    counter(5)
+    counter(3)
+    counter(7)
+  }
+}

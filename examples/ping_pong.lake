@@ -1,0 +1,22 @@
+@rt(rt_write)
+
+pong is {
+  _ i64.0 -> {
+    rt_write(1 "pong\n" 5)
+  }
+}
+
+ping is {
+  _ i64.0 -> {
+    rt_write(1 "ping\n" 5)
+    pong()
+  }
+}
+
+main is {
+  _ i64.0 -> {
+    ping()
+    ping()
+    ping()
+  }
+}

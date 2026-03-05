@@ -1,9 +1,25 @@
 [package]
-name = "lake-native-compiler"
+name = "lakec"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
+clap = { version = "4", features = ["derive"] }
+console = "0.15"
+indicatif = "0.17"
+log = "0.4"
+env_logger = "0.11"
+base64ct = {version = "1.8.2", features = ['alloc']}
+blink = { git = "https://github.com/morphqdd/blink", version = "0.0.0" }
 cranelift = { version = "0.127.0", features = ["module", "native", "object"] }
+cranelift-wasm = "0.112.3"
+lake-frontend = { git = "https://github.com/morphqdd/lake_frontend.git", branch = "master" }
+num_cpus = "1.17.0"
+
+[dev-dependencies]
+tempfile = "3.24.0"
+
+[build-dependencies]
+anyhow = "1.0.100"
 
