@@ -9,13 +9,14 @@ use anyhow::Result;
 //
 // Future stop codes (STOP_WAIT etc.) will be added here as new variants.
 use cranelift::{
+    codegen::ir::BlockArg,
     module::Module,
     prelude::{AbiParam, FunctionBuilder, InstBuilder, IntCC, TrapCode},
 };
 
 use crate::compiler::{
     ctx::CompilerCtx,
-    pipeline::machine::STOP_DONE,
+    pipeline::machine::{STOP_DONE, STOP_WAIT},
     rt::layout::{process_ctx::ProcessCtxLayout, sheduler_ctx::ShedulerCtxLayout},
 };
 
@@ -27,56 +28,82 @@ pub fn build_scheduler(ctx: &mut CompilerCtx, builder: &mut FunctionBuilder) -> 
     builder.switch_to_block(entry_block);
     builder.seal_block(entry_block);
 
-    // Initialise the heap before any allocations.
     let init_heap_ref = ctx.get_func(builder, "rt_init_heap")?;
     builder.ins().call(init_heap_ref, &[]);
 
     let sh_ptr_var = ShedulerCtxLayout::init(ctx, builder)?;
     ShedulerCtxLayout::init_main_process(sh_ptr_var, ctx, builder)?;
 
-    // ── Blocks ────────────────────────────────────────────────────────────────
-    let loop_block          = builder.create_block();
-    let exec_block          = builder.create_block();
+    let loop_block = builder.create_block();
+    let exec_block = builder.create_block();
     let end_of_process_block = builder.create_block();
-    let next_process_block  = builder.create_block();
-    let exit_block          = builder.create_block();
+    let is_wait_block = builder.create_block();
+    builder.append_block_param(is_wait_block, ptr_ty);
+    let go_to_wait_block = builder.create_block();
+    let next_process_block = builder.create_block();
+    let exit_block = builder.create_block();
 
     builder.ins().jump(loop_block, &[]);
 
-    // ── loop_block: any processes left? ───────────────────────────────────────
-    builder.switch_to_block(loop_block);
-    let count = ShedulerCtxLayout::get_real_count_of_processes(sh_ptr_var, ctx, builder)?;
-    let has_procs = builder.ins().icmp_imm(IntCC::NotEqual, count, 0);
-    builder.ins().brif(has_procs, exec_block, &[], exit_block, &[]);
+    let check_waited_block = builder.create_block();
 
-    // ── exec_block: call current process's machine (runs quantum internally) ──
+    builder.switch_to_block(loop_block);
+    let real_count = ShedulerCtxLayout::get_real_count_of_processes(sh_ptr_var, ctx, builder)?;
+    let has_active = builder.ins().icmp_imm(IntCC::NotEqual, real_count, 0);
+    builder
+        .ins()
+        .brif(has_active, exec_block, &[], check_waited_block, &[]);
+
+    // Нет активных процессов — проверяем, есть ли ждущие.
+    // Если есть — крутим loop (пока нет механизма пробуждения).
+    // Если нет — выходим.
+    builder.switch_to_block(check_waited_block);
+    let waited = ShedulerCtxLayout::get_waited_processes(sh_ptr_var, ctx, builder)?;
+    let has_waited = builder.ins().icmp_imm(IntCC::NotEqual, waited, 0);
+    builder
+        .ins()
+        .brif(has_waited, loop_block, &[], exit_block, &[]);
+
     builder.switch_to_block(exec_block);
     let current = ShedulerCtxLayout::get_current_process(sh_ptr_var, ctx, builder)?;
     let func_addr = ProcessCtxLayout::get_func_addr(current, ctx, builder)?;
-    let exec_ctx  = ProcessCtxLayout::get_exec_ctx(current, ctx, builder)?;
+    let exec_ctx = ProcessCtxLayout::get_exec_ctx(current, ctx, builder)?;
 
     let mut machine_sig = ctx.module().make_signature();
     machine_sig.params.push(AbiParam::new(ptr_ty));
     machine_sig.returns.push(AbiParam::new(ptr_ty));
     let sig_ref = builder.import_signature(machine_sig);
 
-    let call      = builder.ins().call_indirect(sig_ref, func_addr, &[exec_ctx]);
+    let call = builder.ins().call_indirect(sig_ref, func_addr, &[exec_ctx]);
     let stop_code = builder.inst_results(call)[0];
 
-    // STOP_DONE (-1): process finished → remove it.
-    // STOP_LIMIT (-2) or anything else: quantum done → round-robin.
     let is_done = builder.ins().icmp_imm(IntCC::Equal, stop_code, STOP_DONE);
-    builder.ins().brif(is_done, end_of_process_block, &[], next_process_block, &[]);
+    builder.ins().brif(
+        is_done,
+        end_of_process_block,
+        &[],
+        is_wait_block,
+        &[BlockArg::Value(stop_code)],
+    );
 
-    // ── end_of_process_block ──────────────────────────────────────────────────
     builder.switch_to_block(end_of_process_block);
     ShedulerCtxLayout::remove_current_process(sh_ptr_var, ctx, builder, loop_block)?;
 
-    // ── next_process_block: round-robin ───────────────────────────────────────
+    builder.switch_to_block(is_wait_block);
+    let stop_code = builder.block_params(is_wait_block)[0];
+    let is_wait = builder.ins().icmp_imm(IntCC::Equal, stop_code, STOP_WAIT);
+    builder
+        .ins()
+        .brif(is_wait, go_to_wait_block, &[], next_process_block, &[]);
+
+    builder.switch_to_block(go_to_wait_block);
+    let process = ShedulerCtxLayout::get_current_process(sh_ptr_var, ctx, builder)?;
+    ShedulerCtxLayout::wait_current_process(sh_ptr_var, process, ctx, builder)?;
+    ShedulerCtxLayout::remove_current_process(sh_ptr_var, ctx, builder, loop_block)?;
+
     builder.switch_to_block(next_process_block);
     ShedulerCtxLayout::next_process(sh_ptr_var, ctx, builder, loop_block);
 
-    // ── exit_block ────────────────────────────────────────────────────────────
     builder.switch_to_block(exit_block);
     let exit_ref = rt_funcs.exit_ref(ctx.module_mut(), builder);
     let zero = builder.ins().iconst(ptr_ty, 0);

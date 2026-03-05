@@ -17,7 +17,12 @@ pub enum StmtOutcome {
     /// `self(...)` state transition: the branch is done and the machine will
     /// be re-entered at block 0 under a new branch_id.
     /// `next_available` is the first block_id not yet claimed by this branch.
-    StateChange { next_available: i64 },
+    StateChange {
+        next_available: i64,
+    },
+    Wait {
+        next_avaitlable: i64,
+    },
 }
 
 impl StmtOutcome {
@@ -31,6 +36,7 @@ impl StmtOutcome {
         match self {
             StmtOutcome::Continue(id) => *id,
             StmtOutcome::StateChange { next_available } => *next_available,
+            StmtOutcome::Wait { next_avaitlable } => *next_avaitlable,
         }
     }
 }
@@ -44,6 +50,7 @@ pub mod pure_expr;
 pub mod spawn_expr;
 pub mod string_expr;
 pub mod var_expr;
+pub mod wait_expr;
 pub mod when_expr;
 
 /// Local variable table for a branch: maps name → (Cranelift type, slot index).
@@ -113,7 +120,15 @@ pub fn compile_expr(
     expr: &Expr<'_>,
 ) -> Result<StmtOutcome> {
     if pure_expr::is_pure(expr) {
-        return pure_expr::compile(ctx, builder, machine_ctx_var, block_id, branch_switch, state, expr);
+        return pure_expr::compile(
+            ctx,
+            builder,
+            machine_ctx_var,
+            block_id,
+            branch_switch,
+            state,
+            expr,
+        );
     }
 
     match expr {
@@ -164,6 +179,15 @@ pub fn compile_expr(
                     )
                 })
                 .collect(),
+        ),
+        Expr::Wait { handlers } => wait_expr::compile(
+            ctx,
+            builder,
+            machine_ctx_var,
+            block_id,
+            branch_switch,
+            state,
+            handlers.iter().map(|branch| branch.inner.clone()).collect(),
         ),
         _ => bail!("Unsupported expression type: {:?}", expr),
     }

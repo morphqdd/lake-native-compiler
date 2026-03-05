@@ -27,6 +27,8 @@ impl ShedulerCtxLayout {
             ("sheduler_ctx_fat_ptr", FatPtrLayout::SIZE),
             ("process_arr", 256 * 8),
             ("process_arr_fat_ptr", FatPtrLayout::SIZE),
+            ("wait_arr", 256 * 8),
+            ("wait_arr_fat_ptr", FatPtrLayout::SIZE),
         ] {
             let id = module.declare_data(name, Linkage::Export, true, false)?;
             let mut desc = DataDescription::new();
@@ -36,13 +38,15 @@ impl ShedulerCtxLayout {
         Ok(())
     }
 
-    pub const SIZE: i32 = 48;
+    pub const SIZE: i32 = 64;
     pub const PROCESS_ARR_FAT: i32 = 0;
     pub const CURRENT_PROCESS: i32 = 8;
     pub const LAST_PROCESS_INDEX: i32 = 16;
     pub const REDUCTION_LIMIT: i32 = 24;
     pub const REAL_COUNT_OF_PROCESSES: i32 = 32;
     pub const REDUCTION_COUNTER: i32 = 40;
+    pub const WAIT_ARR_FAT: i32 = 48;
+    pub const LAST_WAITED_PROCESS_INDEX: i32 = 56;
 
     pub const REDUCTION_LIMIT_VALUE: i64 = 1000;
 
@@ -69,6 +73,14 @@ impl ShedulerCtxLayout {
         builder.ins().call(
             store_ref,
             &[sh_ctx_ptr, process_arr_ptr, ptr_size, process_arr_offset],
+        );
+
+        let (_, wait_arr_ptr) = get_static_buffer(ctx, builder, ptr_ty, "wait_arr", 256 * 8)?;
+
+        let wait_arr_offset = builder.ins().iconst(ptr_ty, Self::WAIT_ARR_FAT as i64);
+        builder.ins().call(
+            store_ref,
+            &[sh_ctx_ptr, wait_arr_ptr, ptr_size, wait_arr_offset],
         );
 
         let reduction_limit = builder.ins().iconst(ptr_ty, Self::REDUCTION_LIMIT_VALUE);
@@ -239,6 +251,25 @@ impl ShedulerCtxLayout {
         Ok(real_count_of_processes)
     }
 
+    pub fn get_waited_processes(
+        sh_ctx_ptr: Variable,
+        ctx: &mut CompilerCtx,
+        builder: &mut FunctionBuilder,
+    ) -> Result<Value> {
+        let ptr_ty = ctx.module().target_config().pointer_type();
+        let rt_func = ctx.rt_funcs().clone();
+        let load_func_ref = rt_func.load_u64_ref(ctx.module_mut(), builder);
+        let sh_ctx_ptr = builder.use_var(sh_ctx_ptr);
+        let offset = builder
+            .ins()
+            .iconst(ptr_ty, ShedulerCtxLayout::LAST_WAITED_PROCESS_INDEX as i64);
+        let call_load_last_waited_process_index =
+            builder.ins().call(load_func_ref, &[sh_ctx_ptr, offset]);
+        let last_waited_process_index =
+            builder.inst_results(call_load_last_waited_process_index)[0];
+        let normalized = builder.ins().iadd_imm(last_waited_process_index, 1);
+        Ok(normalized)
+    }
     pub fn get_reduction_counter(
         sh_ctx_ptr: Variable,
         ctx: &mut CompilerCtx,
@@ -402,6 +433,43 @@ impl ShedulerCtxLayout {
         Ok(())
     }
 
+    pub fn wait_current_process(
+        sh_ptr_var: Variable,
+        process_ctx_ptr: Value,
+        ctx: &mut CompilerCtx,
+        builder: &mut FunctionBuilder,
+    ) -> Result<()> {
+        let ptr_ty = ctx.module().target_config().pointer_type();
+        let rt_funcs = ctx.rt_funcs().clone();
+        let load_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
+        let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
+        let ptr_size = builder.ins().iconst(ptr_ty, ptr_ty.bytes() as i64);
+        let sh_ctx_ptr = builder.use_var(sh_ptr_var);
+
+        let offset = builder.ins().iconst(ptr_ty, Self::WAIT_ARR_FAT as i64);
+        let call_wait_arr = builder.ins().call(load_ref, &[sh_ctx_ptr, offset]);
+        let wait_arr = builder.inst_results(call_wait_arr)[0];
+
+        let offset_last_i = builder
+            .ins()
+            .iconst(ptr_ty, Self::LAST_WAITED_PROCESS_INDEX as i64);
+        let call_last_index = builder.ins().call(load_ref, &[sh_ctx_ptr, offset_last_i]);
+        let last_process_index = builder.inst_results(call_last_index)[0];
+        let next_process_index = builder.ins().iadd_imm(last_process_index, 1);
+        let aligned_index = builder.ins().imul_imm(next_process_index, 8);
+
+        builder.ins().call(
+            store_ref,
+            &[wait_arr, process_ctx_ptr, ptr_size, aligned_index],
+        );
+
+        builder.ins().call(
+            store_ref,
+            &[sh_ctx_ptr, next_process_index, ptr_size, offset_last_i],
+        );
+
+        Ok(())
+    }
     pub fn new_process(
         sh_ctx_ptr: Value,
         process_ctx_ptr: Value,

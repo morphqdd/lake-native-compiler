@@ -15,6 +15,7 @@ use crate::compiler::{
 /// Stop codes returned by a compiled machine function to the scheduler.
 pub const STOP_DONE: i64 = -1; // process finished (no matching branch or explicit -1)
 pub const STOP_LIMIT: i64 = -2; // quantum exhausted; BLOCK_ID already stored in exec_ctx
+pub const STOP_WAIT: i64 = -3;
 
 /// Compile a single Lake machine to a Cranelift function.
 ///
@@ -42,7 +43,6 @@ pub fn compile_machine(ctx: &mut CompilerCtx, machine: &Machine<'_>, quantum: i6
     builder.func.signature.params.push(AbiParam::new(ptr_ty));
     builder.func.signature.returns.push(AbiParam::new(ptr_ty));
 
-    // ── Create all blocks up front ────────────────────────────────────────────
     let entry = builder.create_block();
     let machine_switch_block = builder.create_block();
     let default_block = builder.create_block();
@@ -53,12 +53,14 @@ pub fn compile_machine(ctx: &mut CompilerCtx, machine: &Machine<'_>, quantum: i6
     let quantum_loop_block = builder.create_block();
     let quantum_stop_done_block = builder.create_block();
     let quantum_stop_limit_block = builder.create_block();
+    let quantum_stop_wait_block = builder.create_block();
+    let quantum_check_wait_block = builder.create_block();
 
     builder.append_block_param(entry, ptr_ty);
     builder.append_block_param(quantum_continue_block, ptr_ty); // next_block_id
+    builder.append_block_param(quantum_check_wait_block, ptr_ty); // next_block_id
     builder.append_block_param(quantum_loop_block, ptr_ty); // next_block_id
 
-    // ── Entry block ───────────────────────────────────────────────────────────
     builder.switch_to_block(entry);
     builder.seal_block(entry);
     let ctx_fat_ptr = builder.block_params(entry)[0];
@@ -72,10 +74,8 @@ pub fn compile_machine(ctx: &mut CompilerCtx, machine: &Machine<'_>, quantum: i6
 
     builder.ins().jump(machine_switch_block, &[]);
 
-    // ── Register quantum_continue_block so CPS compilers can jump to it ───────
     ctx.set_quantum_block(quantum_continue_block);
 
-    // ── Compile branches ──────────────────────────────────────────────────────
     let mut machine_switch = Switch::new();
     for (branch_id, item) in machine.items.iter().enumerate() {
         let MachineItem::Branch(ref branch) = item.inner else {
@@ -93,11 +93,9 @@ pub fn compile_machine(ctx: &mut CompilerCtx, machine: &Machine<'_>, quantum: i6
         )?;
     }
 
-    // ── machine_switch_block: dispatch on BRANCH_ID ───────────────────────────
     builder.switch_to_block(machine_switch_block);
     let ctx_fat_ptr = builder.use_var(machine_ctx_var);
 
-    // INLINED: was rt_load_u64(ctx_fat_ptr, BRANCH_ID)
     let exec_start = builder
         .ins()
         .load(ptr_ty, MemFlags::trusted(), ctx_fat_ptr, 0);
@@ -109,24 +107,33 @@ pub fn compile_machine(ctx: &mut CompilerCtx, machine: &Machine<'_>, quantum: i6
     );
     machine_switch.emit(&mut builder, branch_id, default_block);
 
-    // ── default_block: no matching branch → STOP_DONE ────────────────────────
     builder.switch_to_block(default_block);
     let v = builder.ins().iconst(ptr_ty, STOP_DONE);
     builder.ins().return_(&[v]);
 
-    // ── quantum_continue_block: first check — is the branch done? ─────────────
     builder.switch_to_block(quantum_continue_block);
     let next_id = builder.block_params(quantum_continue_block)[0];
-    let is_done = builder.ins().icmp_imm(IntCC::Equal, next_id, -1);
+    let is_done = builder.ins().icmp_imm(IntCC::Equal, next_id, STOP_DONE);
     builder.ins().brif(
         is_done,
         quantum_stop_done_block,
+        &[],
+        quantum_check_wait_block,
+        &[BlockArg::Value(next_id)],
+    );
+
+    builder.switch_to_block(quantum_check_wait_block);
+    let next_id = builder.block_params(quantum_check_wait_block)[0];
+    let is_wait = builder.ins().icmp_imm(IntCC::Equal, next_id, STOP_WAIT);
+
+    builder.ins().brif(
+        is_wait,
+        quantum_stop_wait_block,
         &[],
         quantum_loop_block,
         &[BlockArg::Value(next_id)],
     );
 
-    // ── quantum_loop_block: store BLOCK_ID, decrement, re-dispatch or yield ───
     builder.switch_to_block(quantum_loop_block);
     let next_id = builder.block_params(quantum_loop_block)[0];
 
@@ -153,21 +160,22 @@ pub fn compile_machine(ctx: &mut CompilerCtx, machine: &Machine<'_>, quantum: i6
         &[],
     );
 
-    // ── quantum_stop_done_block: STOP_DONE ────────────────────────────────────
     builder.switch_to_block(quantum_stop_done_block);
     let v = builder.ins().iconst(ptr_ty, STOP_DONE);
     builder.ins().return_(&[v]);
 
-    // ── quantum_stop_limit_block: STOP_LIMIT ──────────────────────────────────
     builder.switch_to_block(quantum_stop_limit_block);
     let v = builder.ins().iconst(ptr_ty, STOP_LIMIT);
+    builder.ins().return_(&[v]);
+
+    builder.switch_to_block(quantum_stop_wait_block);
+    let v = builder.ins().iconst(ptr_ty, STOP_WAIT);
     builder.ins().return_(&[v]);
 
     builder.seal_all_blocks();
 
     trace!("CLIF [{}]:\n{}", machine_ident, builder.func);
 
-    // ── Emit the function ─────────────────────────────────────────────────────
     let machine_sig = builder.func.signature.clone();
     let id = ctx
         .module_mut()
