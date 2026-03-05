@@ -1,0 +1,15 @@
+main is {
+  _ i64.0 -> {
+    let id pid = counter()
+  }
+}
+
+counter is {
+  _ i64.0 -> {
+    wait {
+      _ i64.0 -> {
+        self()
+      }
+    }
+  }
+}
