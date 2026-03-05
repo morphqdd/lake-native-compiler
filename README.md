@@ -79,15 +79,25 @@ main is {
 
 ## Performance
 
-Benchmark: 10 concurrent tasks writing to stdout.
+### I/O benchmark (10 concurrent tasks, write to stdout)
 
 | Runtime         | Time      | vs Lake |
 |-----------------|-----------|---------|
-| **Lake**        | 288.4 µs  | 1.0×    |
-| Rust (Tokio)    | 1086.6 µs | 3.8×    |
-| C++ coroutines  | 1769.3 µs | 6.1×    |
+| **Lake**        | 288 µs    | 1.0×    |
+| Rust (Tokio)    | 1087 µs   | 3.8×    |
+| C++ coroutines  | 1769 µs   | 6.1×    |
 
-Lake's scheduler operates on atomic blocks — unlike Tokio, it can preempt a process without requiring explicit `await` points.
+### CPU benchmark (8 workers, fib(100k), single-threaded)
+
+| Runtime                    | Time      | vs C   |
+|----------------------------|-----------|--------|
+| C sequential (baseline)    | 729 µs    | 1.0×   |
+| Go (GOMAXPROCS=1)          | 2136 µs   | 2.9×   |
+| C++ coroutines             | 2282 µs   | 3.1×   |
+| Rust (Tokio current_thread)| 3356 µs   | 4.6×   |
+| **Lake** (quantum=256)     | 26654 µs  | 36.6×  |
+
+Lake's I/O performance leads because the scheduler operates on atomic blocks — it can preempt a process without explicit `await` points. The CPU gap is architectural: CPS dispatch per iteration provides reduction counting (like BEAM), trading raw throughput for fairness. Optimization trend: 640ms → 260ms → 28ms across iterations.
 
 ---
 
@@ -160,9 +170,14 @@ Each block is a Cranelift function that returns the next `block_id`. The schedul
 
 ## Roadmap
 
-- [ ] Arithmetic operators (`+`, `-`, `*`, `/`)
-- [ ] Value pattern matching (branch on values, not just types)
+- [x] Arithmetic operators (`+`, `-`, `*`, `/`)
+- [x] `when` expressions (conditional branching)
+- [x] `self()` state transitions
+- [x] Process spawning and cooperative scheduling
+- [x] Quantum batch scheduling (configurable reduction limit)
+- [ ] Comparison operators (full set)
 - [ ] Process IDs and message passing (`send` / `receive`)
+- [ ] `wait` — blocking receive
 - [ ] User-defined structs
 - [ ] Arena allocator per process
 - [ ] `io_uring` integration for async I/O
