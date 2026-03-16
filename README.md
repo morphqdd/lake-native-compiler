@@ -41,16 +41,38 @@ Dispatch is O(1): argument types are hashed at compile time to a 64-bit key, res
 
 ### Every Call is a Spawn
 
-Calling a machine does not transfer control — it spawns a new process and returns immediately. The scheduler runs all live processes cooperatively, interleaving them at block boundaries.
+Calling a machine does not transfer control — it spawns a new process and returns a `pid` (process identifier). The scheduler runs all live processes cooperatively, interleaving them at block boundaries.
 
 ```lake
 main is {
   n i64.0 -> {
-    worker("task 0\n")   -- spawns process 1
-    worker("task 1\n")   -- spawns process 2, main continues
+    let p1 pid = worker("task 0\n")   -- spawns process 1, returns pid
+    let p2 pid = worker("task 1\n")   -- spawns process 2, returns pid
+    p1(42)                            -- send message to p1
   }
 }
 ```
+
+### Message Passing
+
+Processes communicate via message passing. Each process has a mailbox (ring buffer of 256 slots). Calling a `pid` variable sends a message:
+
+```lake
+receiver is {
+  _ i64.0 -> {
+    wait { n i64 -> { rt_write(1 "got message\n" 12) } }
+  }
+}
+
+main is {
+  _ i64.0 -> {
+    let p pid = receiver()
+    p(42)                 -- send 42 to receiver's mailbox
+  }
+}
+```
+
+The `wait` expression suspends the process until a message arrives. If the mailbox is empty, the process moves to the scheduler's wait array and is awakened when another process sends a message.
 
 ### Runtime Functions (`@rt`)
 
@@ -79,25 +101,37 @@ main is {
 
 ## Performance
 
-### I/O benchmark (10 concurrent tasks, write to stdout)
+Benchmarks run on x86-64 with full CPU frequency (single-threaded, `GOMAXPROCS=1` for Go).
 
-| Runtime         | Time      | vs Lake |
-|-----------------|-----------|---------|
-| **Lake**        | 288 µs    | 1.0×    |
-| Rust (Tokio)    | 1087 µs   | 3.8×    |
-| C++ coroutines  | 1769 µs   | 6.1×    |
+### I/O benchmark (10 workers × 10k writes)
 
-### CPU benchmark (8 workers, fib(100k), single-threaded)
+| Runtime         | Time      | Relative |
+|-----------------|-----------|----------|
+| C++ coroutines  | 21.3 ms   | 1.0×     |
+| **Lake**        | **22.7 ms** | **1.07×** |
+| Rust (Tokio)    | 35.1 ms   | 1.65×    |
+| Go              | 43.7 ms   | 2.05×    |
+
+### Message passing (ping-pong 100k round-trips)
+
+| Runtime         | Time      | Relative |
+|-----------------|-----------|----------|
+| C++ coroutines  | 2.4 ms    | 1.0×     |
+| **Lake** (mailbox) | **21.7 ms** | **9.2×** |
+| Rust (tokio mpsc) | 24.9 ms  | 10.5×    |
+| Go (channels)   | 35.5 ms   | 15.0×    |
+
+### CPU benchmark (8 workers, fib(100k))
 
 | Runtime                    | Time      | vs C   |
 |----------------------------|-----------|--------|
-| C sequential (baseline)    | 729 µs    | 1.0×   |
-| Go (GOMAXPROCS=1)          | 2136 µs   | 2.9×   |
-| C++ coroutines             | 2282 µs   | 3.1×   |
-| Rust (Tokio current_thread)| 3356 µs   | 4.6×   |
-| **Lake** (quantum=256)     | 26654 µs  | 36.6×  |
+| C sequential (baseline)    | 772 µs    | 1.0×   |
+| Go (GOMAXPROCS=1)          | 1.8 ms    | 2.4×   |
+| C++ coroutines             | 2.1 ms    | 2.7×   |
+| Rust (Tokio current_thread)| 3.3 ms    | 4.3×   |
+| **Lake** (fused self-call) | **7.0 ms** | **9.1×** |
 
-Lake's I/O performance leads because the scheduler operates on atomic blocks — it can preempt a process without explicit `await` points. The CPU gap is architectural: CPS dispatch per iteration provides reduction counting (like BEAM), trading raw throughput for fairness. Optimization trend: 640ms → 260ms → 28ms across iterations.
+Lake's I/O performance is competitive because the scheduler operates on atomic blocks — it can preempt a process without explicit `await` points. Message passing beats both Rust and Go thanks to inline mailbox operations and direct process wake-up. The CPU gap is architectural: CPS dispatch + reduction counting (like BEAM) trades raw throughput for fairness and cooperative scheduling guarantees.
 
 ---
 
@@ -154,7 +188,7 @@ lake-frontend          →   AST
   mold                 →   native ELF binary
 ```
 
-**ExecCtx** (40 bytes per process):
+**ExecCtx** (64 bytes per process):
 
 | Field       | Offset | Description                         |
 |-------------|--------|-------------------------------------|
@@ -163,21 +197,25 @@ lake-frontend          →   AST
 | `TEMP_VAL`  | 16     | Scratch register for rt return values |
 | `VARIABLES` | 24     | Fat pointer to process-local variables |
 | `JUMP_ARGS` | 32     | Fat pointer to call argument staging buffer |
+| `MAILBOX_FAT` | 40   | Fat pointer to ring buffer (256 × 8 bytes) |
+| `MAILBOX_HEAD` | 48  | Read index (consumer)               |
+| `MAILBOX_TAIL` | 56  | Write index (producer)              |
 
-Each block is a Cranelift function that returns the next `block_id`. The scheduler dispatches blocks via a `Switch` table — O(1) per step.
+Each block is a Cranelift function that returns the next `block_id`. The scheduler dispatches blocks via a `Switch` table — O(1) per step. Messages are enqueued/dequeued from the per-process mailbox with mod-256 wrapping.
 
 ---
 
 ## Roadmap
 
 - [x] Arithmetic operators (`+`, `-`, `*`, `/`)
+- [x] Comparison operators (`<=`, `>=`, `==`, `<`, `>`)
 - [x] `when` expressions (conditional branching)
 - [x] `self()` state transitions
 - [x] Process spawning and cooperative scheduling
 - [x] Quantum batch scheduling (configurable reduction limit)
-- [ ] Comparison operators (full set)
-- [ ] Process IDs and message passing (`send` / `receive`)
-- [ ] `wait` — blocking receive
+- [x] Process IDs (`pid` type) and message passing
+- [x] `wait` expression — blocking receive with mailbox
+- [x] Fused self-call optimization (pure args bypass staging)
 - [ ] User-defined structs
 - [ ] Arena allocator per process
 - [ ] `io_uring` integration for async I/O
