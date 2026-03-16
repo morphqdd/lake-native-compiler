@@ -47,6 +47,7 @@ pub mod jump_expr;
 pub mod let_expr;
 pub mod num_expr;
 pub mod pure_expr;
+pub mod send_expr;
 pub mod spawn_expr;
 pub mod string_expr;
 pub mod var_expr;

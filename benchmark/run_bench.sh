@@ -12,12 +12,13 @@ lake_build() { (cd "$REPO_ROOT" && "$LAKEC" -r "$1"); }
 
 # ── flags ──────────────────────────────────────────────────────────────────────
 TELEGRAM=0
-BENCH="all"   # all | io | cpu
+BENCH="all"   # all | io | cpu | msg
 for arg in "$@"; do
     case $arg in
         --telegram)  TELEGRAM=1 ;;
         --io)        BENCH="io" ;;
         --cpu)       BENCH="cpu" ;;
+        --msg)       BENCH="msg" ;;
     esac
 done
 
@@ -52,7 +53,7 @@ bar() {
 }
 
 # ── build: I/O bench ───────────────────────────────────────────────────────────
-if [ "$BENCH" != "cpu" ]; then
+if [ "$BENCH" = "all" ] || [ "$BENCH" = "io" ]; then
     header "Building  ${DIM}[I/O async — 10 workers, write]${RESET}"
 
     info "lake  --release"
@@ -69,7 +70,7 @@ if [ "$BENCH" != "cpu" ]; then
 fi
 
 # ── build: CPU bench ───────────────────────────────────────────────────────────
-if [ "$BENCH" != "io" ]; then
+if [ "$BENCH" = "all" ] || [ "$BENCH" = "cpu" ]; then
     header "Building  ${DIM}[CPU async — 8 workers, fib(100k)]${RESET}"
 
     info "lake  --release"
@@ -94,7 +95,7 @@ if [ "$BENCH" != "io" ]; then
 fi
 
 # ── binary sizes ───────────────────────────────────────────────────────────────
-if [ "$BENCH" != "cpu" ]; then
+if [ "$BENCH" = "all" ] || [ "$BENCH" = "io" ]; then
     header "Binary sizes  ${DIM}[I/O bench]${RESET}"
 
     LAKE_BIN="$BUILD/bench"
@@ -121,7 +122,7 @@ if [ "$BENCH" != "cpu" ]; then
 fi
 
 # ── benchmark: I/O ────────────────────────────────────────────────────────────
-if [ "$BENCH" != "cpu" ]; then
+if [ "$BENCH" = "all" ] || [ "$BENCH" = "io" ]; then
     header "Benchmark  ${DIM}[I/O async — hyperfine --warmup 10]${RESET}"
 
     hyperfine \
@@ -137,7 +138,7 @@ if [ "$BENCH" != "cpu" ]; then
 fi
 
 # ── benchmark: CPU ────────────────────────────────────────────────────────────
-if [ "$BENCH" != "io" ]; then
+if [ "$BENCH" = "all" ] || [ "$BENCH" = "cpu" ]; then
     header "Benchmark  ${DIM}[CPU async — 8 workers fib(100k) — hyperfine --warmup 5]${RESET}"
 
     LAKE_CPU="$BUILD/cpu_bench"
@@ -160,6 +161,50 @@ if [ "$BENCH" != "io" ]; then
             "$RUST_CPU" \
         --command-name "go (goroutines, GOMAXPROCS=1)" \
             "$GO_CPU"
+fi
+
+# ── build: MSG bench ──────────────────────────────────────────────────────────
+if [ "$BENCH" = "all" ] || [ "$BENCH" = "msg" ]; then
+    header "Building  ${DIM}[Message passing — ping-pong, 100k round-trips]${RESET}"
+
+    info "lake  --release"
+    lake_build "$SCRIPT_DIR/msg_bench.lake" 2>/dev/null
+    ok "lake"
+
+    info "c++   clang++ -O2 -std=c++20"
+    clang++ -O2 -std=c++20 "$SCRIPT_DIR/msg_bench_cpp.cpp" -o "$BUILD/msg_bench_cpp"
+    ok "c++"
+
+    info "go    build (GOMAXPROCS=1)"
+    go build -o "$BUILD/msg_bench_go" "$SCRIPT_DIR/msg_bench_go.go"
+    ok "go"
+
+    info "rust  cargo build --release (tokio mpsc)"
+    (cd "$SCRIPT_DIR/msg_bench_rust" && cargo build --release -q 2>/dev/null)
+    ok "rust"
+fi
+
+# ── benchmark: MSG ───────────────────────────────────────────────────────────
+if [ "$BENCH" = "all" ] || [ "$BENCH" = "msg" ]; then
+    header "Benchmark  ${DIM}[Message passing — ping-pong 100k — hyperfine --warmup 10]${RESET}"
+
+    LAKE_MSG="$BUILD/msg_bench"
+    CPP_MSG="$BUILD/msg_bench_cpp"
+    GO_MSG="$BUILD/msg_bench_go"
+    RUST_MSG="$SCRIPT_DIR/msg_bench_rust/target/release/msg_bench"
+
+    hyperfine \
+        --warmup 10 \
+        --shell none \
+        --export-markdown "$SCRIPT_DIR/results_msg.md" \
+        --command-name "lake (cooperative, mailbox)" \
+            "$LAKE_MSG" \
+        --command-name "c++ (coroutines, manual scheduler)" \
+            "$CPP_MSG" \
+        --command-name "rust (tokio mpsc)" \
+            "$RUST_MSG" \
+        --command-name "go (goroutines, channels, GOMAXPROCS=1)" \
+            "$GO_MSG"
 fi
 
 echo -e "\n  ${DIM}done${RESET}\n"

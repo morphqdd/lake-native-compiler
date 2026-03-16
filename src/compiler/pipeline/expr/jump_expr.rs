@@ -1,16 +1,19 @@
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use cranelift::{
     codegen::ir::BlockArg,
     frontend::Switch,
     module::Module,
-    prelude::{FunctionBuilder, InstBuilder, Variable},
+    prelude::{FunctionBuilder, InstBuilder, MemFlags, Variable},
 };
 use lake_frontend::api::expr::Expr;
 
 use crate::compiler::{
     ctx::CompilerCtx,
     hash_call_args,
-    pipeline::expr::{BranchState, StmtOutcome, change_state_expr, compile_expr, spawn_expr},
+    pipeline::expr::{
+        BranchState, StmtOutcome, change_state_expr, compile_expr, pure_expr, send_expr,
+        spawn_expr,
+    },
     rt::layout::ExecCtxLayout,
 };
 
@@ -38,6 +41,26 @@ pub fn compile(
     let Expr::Var(callee_name, _ty) = ident else {
         bail!("Jump target must be a variable/identifier");
     };
+
+    // ── Fused self-call: if callee is "self" and all args are pure,
+    //    emit a single block that computes args inline and writes directly
+    //    to VARIABLES, bypassing TEMP_VAL / JUMP_ARGS staging entirely.
+    if *callee_name == "self" && args.iter().all(|a| pure_expr::is_pure(a)) {
+        if let Some(machine_name) = ctx.get_current_machine() {
+            let call_hash = hash_call_args(args, state.lake_types());
+            return compile_fused_self_call(
+                ctx,
+                builder,
+                machine_ctx_var,
+                block_id,
+                branch_switch,
+                state,
+                &machine_name,
+                call_hash,
+                args,
+            );
+        }
+    }
 
     let call_base = state.jump_args_base;
 
@@ -147,6 +170,36 @@ pub fn compile(
         branch_switch.set_entry(next_id as u128, b);
         Ok(StmtOutcome::Continue(next_id + 1))
     } else {
+        // ── Check if callee is a pid-typed variable → message send ──────
+        let callee_lake_type = {
+            let raw = _ty.to_string();
+            if raw == "{}" {
+                state
+                    .lake_type_of(callee_name)
+                    .unwrap_or("{}")
+                    .to_string()
+            } else {
+                raw
+            }
+        };
+
+        // FIXME(lake_frontend): the parser incorrectly resolves types for machine
+        // names (e.g. `worker` gets raw_ty="pid"). We work around this by checking
+        // state.get() to distinguish variables from machine names. Fix in lake_frontend parser.
+        if callee_lake_type == "pid" && state.get(callee_name).is_some() {
+            return send_expr::compile_send(
+                ctx,
+                builder,
+                machine_ctx_var,
+                next_id,
+                branch_switch,
+                state,
+                callee_name,
+                args.len(),
+                call_base,
+            );
+        }
+
         let call_hash = hash_call_args(args, state.lake_types());
         if let Some(name) = ctx.get_current_machine()
             && *callee_name == "self"
@@ -174,4 +227,86 @@ pub fn compile(
             )
         }
     }
+}
+
+/// Emit a single fused block for `self(arg0, arg1, ...)` when all args are pure.
+///
+/// Instead of the normal ~10-block staging pipeline (eval → TEMP_VAL → JUMP_ARGS
+/// → copy to VARIABLES → set BRANCH_ID), this emits one block:
+///   1. Load exec_start and vars_start once (inline, trusted)
+///   2. Compute all args via `pure_expr::fold` (inline arithmetic + variable loads)
+///   3. Write results directly to VARIABLES (bypassing TEMP_VAL and JUMP_ARGS)
+///   4. Set BRANCH_ID
+///   5. Jump to quantum_continue(0)
+fn compile_fused_self_call(
+    ctx: &mut CompilerCtx,
+    builder: &mut FunctionBuilder,
+    machine_ctx_var: Variable,
+    block_id: i64,
+    branch_switch: &mut Switch,
+    state: &BranchState,
+    machine_name: &str,
+    call_hash: u64,
+    args: &[Expr<'_>],
+) -> Result<StmtOutcome> {
+    let ptr_ty = ctx.module().target_config().pointer_type();
+
+    let (target_branch_id, _var_count, _arg_count) = ctx
+        .lookup_branch_by_hash(machine_name, call_hash)
+        .ok_or_else(|| {
+            anyhow!(
+                "No branch matching call hash {:#018x} in '{}'",
+                call_hash,
+                machine_name
+            )
+        })?;
+
+    let b = builder.create_block();
+    builder.switch_to_block(b);
+
+    // 1. Load exec_start and vars_start once
+    let ctx_ptr = builder.use_var(machine_ctx_var);
+    let exec_start = builder
+        .ins()
+        .load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
+    let vars_fp = builder
+        .ins()
+        .load(ptr_ty, MemFlags::trusted(), exec_start, ExecCtxLayout::VARIABLES);
+    let vars_start = builder
+        .ins()
+        .load(ptr_ty, MemFlags::trusted(), vars_fp, 0);
+
+    // 2. Compute ALL values first (before any stores).
+    //    This is critical: self(acc2, acc1+acc2) must read the original acc2
+    //    before overwriting vars[0].
+    let values: Vec<_> = args
+        .iter()
+        .map(|arg| pure_expr::fold(arg, builder, ptr_ty, Some(vars_start), state))
+        .collect();
+
+    // 3. Write all values directly to VARIABLES
+    for (i, val) in values.iter().enumerate() {
+        builder
+            .ins()
+            .store(MemFlags::trusted(), *val, vars_start, i as i32 * 8);
+    }
+
+    // 4. Set BRANCH_ID
+    let branch_id_val = builder.ins().iconst(ptr_ty, target_branch_id as i64);
+    builder.ins().store(
+        MemFlags::trusted(),
+        branch_id_val,
+        exec_start,
+        ExecCtxLayout::BRANCH_ID,
+    );
+
+    // 5. Jump to quantum_continue with block_id = 0
+    let next_id = builder.ins().iconst(ptr_ty, 0);
+    let qb = ctx.quantum_block();
+    builder.ins().jump(qb, &[BlockArg::Value(next_id)]);
+
+    branch_switch.set_entry(block_id as u128, b);
+    Ok(StmtOutcome::StateChange {
+        next_available: block_id + 1,
+    })
 }

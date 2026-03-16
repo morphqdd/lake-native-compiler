@@ -38,7 +38,7 @@ impl ShedulerCtxLayout {
         Ok(())
     }
 
-    pub const SIZE: i32 = 64;
+    pub const SIZE: i32 = 72;
     pub const PROCESS_ARR_FAT: i32 = 0;
     pub const CURRENT_PROCESS: i32 = 8;
     pub const LAST_PROCESS_INDEX: i32 = 16;
@@ -47,6 +47,7 @@ impl ShedulerCtxLayout {
     pub const REDUCTION_COUNTER: i32 = 40;
     pub const WAIT_ARR_FAT: i32 = 48;
     pub const LAST_WAITED_PROCESS_INDEX: i32 = 56;
+    pub const WAITED_PROCESS_COUNT: i32 = 64;
 
     pub const REDUCTION_LIMIT_VALUE: i64 = 1000;
 
@@ -173,6 +174,18 @@ impl ShedulerCtxLayout {
             ExecCtxLayout::JUMP_ARGS,
         );
 
+        // ── Allocate mailbox for main process ───────────────────────────────
+        let (_main_mb_ptr, main_mb_fat_ptr) =
+            alloc_static_buffer(ctx, builder, ptr_ty, "main_mailbox", 256 * 8)?;
+        ExecCtxLayout::store(
+            builder,
+            main_mb_fat_ptr,
+            main_ctx_ptr,
+            ExecCtxLayout::MAILBOX_FAT,
+        );
+        ExecCtxLayout::store(builder, zero, main_ctx_ptr, ExecCtxLayout::MAILBOX_HEAD);
+        ExecCtxLayout::store(builder, zero, main_ctx_ptr, ExecCtxLayout::MAILBOX_TAIL);
+
         let ctx_end = builder
             .ins()
             .iadd_imm(main_ctx_ptr, ExecCtxLayout::SIZE as i64);
@@ -262,13 +275,10 @@ impl ShedulerCtxLayout {
         let sh_ctx_ptr = builder.use_var(sh_ctx_ptr);
         let offset = builder
             .ins()
-            .iconst(ptr_ty, ShedulerCtxLayout::LAST_WAITED_PROCESS_INDEX as i64);
-        let call_load_last_waited_process_index =
-            builder.ins().call(load_func_ref, &[sh_ctx_ptr, offset]);
-        let last_waited_process_index =
-            builder.inst_results(call_load_last_waited_process_index)[0];
-        let normalized = builder.ins().iadd_imm(last_waited_process_index, 1);
-        Ok(normalized)
+            .iconst(ptr_ty, ShedulerCtxLayout::WAITED_PROCESS_COUNT as i64);
+        let call = builder.ins().call(load_func_ref, &[sh_ctx_ptr, offset]);
+        let count = builder.inst_results(call)[0];
+        Ok(count)
     }
     pub fn get_reduction_counter(
         sh_ctx_ptr: Variable,
@@ -468,6 +478,20 @@ impl ShedulerCtxLayout {
             &[sh_ctx_ptr, next_process_index, ptr_size, offset_last_i],
         );
 
+        // Increment WAITED_PROCESS_COUNT
+        let count_offset = builder
+            .ins()
+            .iconst(ptr_ty, Self::WAITED_PROCESS_COUNT as i64);
+        let call_count = builder
+            .ins()
+            .call(load_ref, &[sh_ctx_ptr, count_offset]);
+        let waited_count = builder.inst_results(call_count)[0];
+        let new_count = builder.ins().iadd_imm(waited_count, 1);
+        builder.ins().call(
+            store_ref,
+            &[sh_ctx_ptr, new_count, ptr_size, count_offset],
+        );
+
         Ok(())
     }
     pub fn new_process(
@@ -596,5 +620,180 @@ impl ShedulerCtxLayout {
             .ins()
             .call(store_ref, &[sh_ctx_ptr, next_proccess, ptr_size, offset]);
         builder.ins().jump(after_block, &[]);
+    }
+
+    /// Wake a process: scan `wait_arr` for `pid_val`, swap-remove it, and add
+    /// it back to the active `process_arr` via `new_process`.
+    ///
+    /// If the PID is not found in `wait_arr` (process already active or not
+    /// waiting), this is a no-op — the message is already in the mailbox and
+    /// will be consumed when the receiver next checks.
+    ///
+    /// Emits a Cranelift loop that scans wait_arr[0..LAST_WAITED_PROCESS_INDEX].
+    pub fn wake_process(
+        sh_ptr_var: Variable,
+        pid_val: Value,
+        ctx: &mut CompilerCtx,
+        builder: &mut FunctionBuilder,
+        after_block: Block,
+    ) -> Result<()> {
+        let ptr_ty = ctx.module().target_config().pointer_type();
+        let rt_funcs = ctx.rt_funcs().clone();
+        let load_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
+        let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
+        let ptr_size = builder.ins().iconst(ptr_ty, ptr_ty.bytes() as i64);
+
+        let sh_ctx_ptr = builder.use_var(sh_ptr_var);
+
+        // Load wait_arr pointer and LAST_WAITED_PROCESS_INDEX
+        let wait_arr_offset = builder.ins().iconst(ptr_ty, Self::WAIT_ARR_FAT as i64);
+        let call_wait_arr = builder.ins().call(load_ref, &[sh_ctx_ptr, wait_arr_offset]);
+        let wait_arr = builder.inst_results(call_wait_arr)[0];
+
+        let last_idx_offset = builder
+            .ins()
+            .iconst(ptr_ty, Self::LAST_WAITED_PROCESS_INDEX as i64);
+        let call_last_idx = builder.ins().call(load_ref, &[sh_ctx_ptr, last_idx_offset]);
+        let last_waited_idx = builder.inst_results(call_last_idx)[0];
+
+        // Check if wait_arr is empty (last_waited < 0 means no entries).
+        // LAST_WAITED_PROCESS_INDEX starts at 0 and increments per entry,
+        // but after all removed it wraps to -1 (unsigned large).
+        // Use: if last_waited_idx + 1 == 0 → no waited processes → skip.
+        let waited_count = builder.ins().iadd_imm(last_waited_idx, 1);
+        let no_waited = builder.ins().icmp_imm(IntCC::Equal, waited_count, 0);
+
+        let scan_block = builder.create_block();
+        builder.append_block_param(scan_block, ptr_ty); // i (scan index)
+
+        let found_block = builder.create_block();
+        builder.append_block_param(found_block, ptr_ty); // found index
+
+        let not_found_block = builder.create_block();
+
+        // If no waited processes, skip directly
+        let zero = builder.ins().iconst(ptr_ty, 0);
+        builder.ins().brif(
+            no_waited,
+            after_block,
+            &[],
+            scan_block,
+            &[BlockArg::Value(zero)],
+        );
+
+        // ── scan_block(i): compare wait_arr[i] with pid ────────────────
+        builder.switch_to_block(scan_block);
+        let i = builder.block_params(scan_block)[0];
+        let sh_ctx_ptr = builder.use_var(sh_ptr_var);
+
+        // Reload wait_arr (need fresh refs after block switch)
+        let wait_arr_offset = builder.ins().iconst(ptr_ty, Self::WAIT_ARR_FAT as i64);
+        let call_wait_arr = builder.ins().call(load_ref, &[sh_ctx_ptr, wait_arr_offset]);
+        let wait_arr = builder.inst_results(call_wait_arr)[0];
+
+        let aligned_i = builder.ins().imul_imm(i, 8);
+        let call_entry = builder.ins().call(load_ref, &[wait_arr, aligned_i]);
+        let entry = builder.inst_results(call_entry)[0];
+
+        let is_match = builder.ins().icmp(IntCC::Equal, entry, pid_val);
+
+        let next_scan_block = builder.create_block();
+        builder.ins().brif(
+            is_match,
+            found_block,
+            &[BlockArg::Value(i)],
+            next_scan_block,
+            &[],
+        );
+
+        // ── next_scan_block: increment i, check bounds ─────────────────
+        builder.switch_to_block(next_scan_block);
+        let next_i = builder.ins().iadd_imm(i, 1);
+
+        // Reload last_waited_idx
+        let sh_ctx_ptr = builder.use_var(sh_ptr_var);
+        let last_idx_offset = builder
+            .ins()
+            .iconst(ptr_ty, Self::LAST_WAITED_PROCESS_INDEX as i64);
+        let call_last = builder.ins().call(load_ref, &[sh_ctx_ptr, last_idx_offset]);
+        let last_idx = builder.inst_results(call_last)[0];
+
+        let past_end = builder.ins().icmp(IntCC::SignedGreaterThan, next_i, last_idx);
+        builder.ins().brif(
+            past_end,
+            not_found_block,
+            &[],
+            scan_block,
+            &[BlockArg::Value(next_i)],
+        );
+
+        // ── found_block(found_i): swap-remove and add to process_arr ───
+        builder.switch_to_block(found_block);
+        let found_i = builder.block_params(found_block)[0];
+        let sh_ctx_ptr = builder.use_var(sh_ptr_var);
+
+        // Reload wait_arr and last_waited_idx
+        let wait_arr_offset = builder.ins().iconst(ptr_ty, Self::WAIT_ARR_FAT as i64);
+        let call_wa = builder.ins().call(load_ref, &[sh_ctx_ptr, wait_arr_offset]);
+        let wait_arr = builder.inst_results(call_wa)[0];
+
+        let last_idx_offset = builder
+            .ins()
+            .iconst(ptr_ty, Self::LAST_WAITED_PROCESS_INDEX as i64);
+        let call_li = builder.ins().call(load_ref, &[sh_ctx_ptr, last_idx_offset]);
+        let last_idx = builder.inst_results(call_li)[0];
+
+        let found_aligned = builder.ins().imul_imm(found_i, 8);
+        let last_aligned = builder.ins().imul_imm(last_idx, 8);
+        let ptr_size = builder.ins().iconst(ptr_ty, ptr_ty.bytes() as i64);
+
+        // Copy last → found
+        let call_last_entry = builder.ins().call(load_ref, &[wait_arr, last_aligned]);
+        let last_entry = builder.inst_results(call_last_entry)[0];
+        builder.ins().call(
+            store_ref,
+            &[wait_arr, last_entry, ptr_size, found_aligned],
+        );
+
+        // Zero last slot
+        let zero = builder.ins().iconst(ptr_ty, 0);
+        builder
+            .ins()
+            .call(store_ref, &[wait_arr, zero, ptr_size, last_aligned]);
+
+        // Decrement LAST_WAITED_PROCESS_INDEX
+        let new_last = builder.ins().iadd_imm(last_idx, -1);
+        let last_idx_offset = builder
+            .ins()
+            .iconst(ptr_ty, Self::LAST_WAITED_PROCESS_INDEX as i64);
+        builder.ins().call(
+            store_ref,
+            &[sh_ctx_ptr, new_last, ptr_size, last_idx_offset],
+        );
+
+        // Decrement WAITED_PROCESS_COUNT
+        let count_offset = builder
+            .ins()
+            .iconst(ptr_ty, Self::WAITED_PROCESS_COUNT as i64);
+        let call_wc = builder
+            .ins()
+            .call(load_ref, &[sh_ctx_ptr, count_offset]);
+        let waited_count = builder.inst_results(call_wc)[0];
+        let new_wc = builder.ins().iadd_imm(waited_count, -1);
+        builder.ins().call(
+            store_ref,
+            &[sh_ctx_ptr, new_wc, ptr_size, count_offset],
+        );
+
+        // Add process back to active queue
+        Self::new_process(sh_ctx_ptr, pid_val, ctx, builder)?;
+
+        builder.ins().jump(after_block, &[]);
+
+        // ── not_found_block: no-op, message is in mailbox ──────────────
+        builder.switch_to_block(not_found_block);
+        builder.ins().jump(after_block, &[]);
+
+        Ok(())
     }
 }

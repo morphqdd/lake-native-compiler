@@ -45,7 +45,7 @@ fn has_var(expr: &Expr) -> bool {
     }
 }
 
-fn fold(
+pub fn fold(
     expr: &Expr,
     builder: &mut FunctionBuilder,
     ptr_ty: Type,

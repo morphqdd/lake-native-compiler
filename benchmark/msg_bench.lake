@@ -1,0 +1,34 @@
+@rt(rt_write)
+
+ponger is {
+  _ i64.0 -> {
+    wait { partner pid -> { self(partner 100000) } }
+  }
+  partner pid remaining i64 -> {
+    when 1 <= remaining {
+      true -> {
+        wait { n i64 -> { partner(1) self(partner remaining-1) } }
+      }
+    }
+  }
+}
+
+pinger is {
+  partner pid remaining i64 -> {
+    when 1 <= remaining {
+      true -> {
+        partner(1)
+        wait { n i64 -> { self(partner remaining-1) } }
+      }
+    }
+  }
+}
+
+main is {
+  _ i64.0 -> {
+    let po pid = ponger()
+    let pi pid = pinger(po 100000)
+    po(pi)
+    rt_write(1 ".\n" 2)
+  }
+}

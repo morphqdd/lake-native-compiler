@@ -8,21 +8,27 @@ use crate::compiler::ctx::CompilerCtx;
 /// Runtime execution context layout.
 /// Single source of truth for all field offsets.
 ///
-/// Memory layout (40 bytes):
-/// +0  branch_id : i64  — which branch of the machine is active
-/// +8  block_id  : i64  — which block inside the branch to execute next
-/// +16 temp_val  : i64  — scratch register for passing values between blocks
-/// +24 variables : i64  — fat ptr (start addr) to the variables array
-/// +32 jump_args : i64  — fat ptr (start addr) to the jump-arguments array
+/// Memory layout (64 bytes):
+/// +0  branch_id    : i64  — which branch of the machine is active
+/// +8  block_id     : i64  — which block inside the branch to execute next
+/// +16 temp_val     : i64  — scratch register for passing values between blocks
+/// +24 variables    : i64  — fat ptr (start addr) to the variables array
+/// +32 jump_args    : i64  — fat ptr (start addr) to the jump-arguments array
+/// +40 mailbox_fat  : i64  — fat ptr to ring-buffer mailbox (256 × 8 bytes)
+/// +48 mailbox_head : i64  — read index (consumer)
+/// +56 mailbox_tail : i64  — write index (producer)
 pub struct ExecCtxLayout;
 
 impl ExecCtxLayout {
-    pub const SIZE: i32 = 40;
+    pub const SIZE: i32 = 64;
     pub const BRANCH_ID: i32 = 0;
     pub const BLOCK_ID: i32 = 8;
     pub const TEMP_VAL: i32 = 16;
     pub const VARIABLES: i32 = 24;
     pub const JUMP_ARGS: i32 = 32;
+    pub const MAILBOX_FAT: i32 = 40;
+    pub const MAILBOX_HEAD: i32 = 48;
+    pub const MAILBOX_TAIL: i32 = 56;
 
     /// Emit a direct load of a field from a raw ctx pointer.
     /// `ctx_ptr` must point to the start of the ExecCtx data (not the fat ptr).
@@ -55,8 +61,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn layout_size_is_40() {
-        assert_eq!(ExecCtxLayout::SIZE, 40);
+    fn layout_size_is_64() {
+        assert_eq!(ExecCtxLayout::SIZE, 64);
     }
 
     #[test]
@@ -66,11 +72,14 @@ mod tests {
         assert_eq!(ExecCtxLayout::TEMP_VAL, 16);
         assert_eq!(ExecCtxLayout::VARIABLES, 24);
         assert_eq!(ExecCtxLayout::JUMP_ARGS, 32);
+        assert_eq!(ExecCtxLayout::MAILBOX_FAT, 40);
+        assert_eq!(ExecCtxLayout::MAILBOX_HEAD, 48);
+        assert_eq!(ExecCtxLayout::MAILBOX_TAIL, 56);
     }
 
     #[test]
     fn last_field_fits_within_size() {
-        // JUMP_ARGS field is i64 (8 bytes), must fit in SIZE
-        assert!(ExecCtxLayout::JUMP_ARGS + 8 <= ExecCtxLayout::SIZE);
+        // MAILBOX_TAIL field is i64 (8 bytes), must fit in SIZE
+        assert!(ExecCtxLayout::MAILBOX_TAIL + 8 <= ExecCtxLayout::SIZE);
     }
 }

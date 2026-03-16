@@ -471,4 +471,45 @@ mod tests {
         assert_eq!(stdout, b"xx");
         Ok(())
     }
+
+    #[test]
+    fn wait_and_send_single_message() -> Result<()> {
+        // main spawns receiver, sends one message via pid, receiver wakes and prints.
+        let src = r#"@rt(rt_write) receiver is { _ i64.0 -> { wait { n i64 -> { rt_write(1 "ok" 2) } } } } main is { _ i64.0 -> { let p pid = receiver() p(42) } }"#;
+        let (code, stdout) = compile_and_run_output(src)?;
+        assert_eq!(code, 0);
+        assert_eq!(stdout, b"ok");
+        Ok(())
+    }
+
+    #[test]
+    fn wait_loop_multiple_messages() -> Result<()> {
+        // receiver loops via self() to wait for 3 messages, prints "." for each.
+        let src = r#"@rt(rt_write) receiver is { remaining i64 -> { when 1 <= remaining { true -> { wait { n i64 -> { rt_write(1 "." 1) self(remaining-1) } } } } } } sender is { target pid count i64 -> { when 1 <= count { true -> { target(1) self(target count-1) } } } } main is { _ i64.0 -> { let r pid = receiver(3) sender(r 3) } }"#;
+        let (code, stdout) = compile_and_run_output(src)?;
+        assert_eq!(code, 0);
+        assert_eq!(stdout, b"...");
+        Ok(())
+    }
+
+    #[test]
+    fn ping_pong_via_pid_in_mailbox() -> Result<()> {
+        // ponger waits for partner PID, sends back a message.
+        // pinger sends to ponger, then waits for reply.
+        let src = r#"@rt(rt_write) ponger is { _ i64.0 -> { wait { partner pid -> { rt_write(1 "A" 1) partner(1) } } } } pinger is { partner pid -> { partner(1) wait { n i64 -> { rt_write(1 "B" 1) } } } } main is { _ i64.0 -> { let po pid = ponger() let pi pid = pinger(po) po(pi) } }"#;
+        let (code, stdout) = compile_and_run_output(src)?;
+        assert_eq!(code, 0);
+        assert_eq!(stdout, b"AB");
+        Ok(())
+    }
+
+    #[test]
+    fn ping_pong_multi_round() -> Result<()> {
+        // 3 round-trips between ponger and pinger using self-loop + wait.
+        let src = r#"@rt(rt_write) ponger is { _ i64.0 -> { wait { partner pid -> { self(partner 3) } } } partner pid remaining i64 -> { when 1 <= remaining { true -> { wait { n i64 -> { partner(1) self(partner remaining-1) } } } false -> { rt_write(1 "X" 1) } } } } pinger is { partner pid remaining i64 -> { when 1 <= remaining { true -> { partner(1) wait { n i64 -> { self(partner remaining-1) } } } false -> { rt_write(1 "Y" 1) } } } } main is { _ i64.0 -> { let po pid = ponger() let pi pid = pinger(po 3) po(pi) } }"#;
+        let (code, stdout) = compile_and_run_output(src)?;
+        assert_eq!(code, 0);
+        assert_eq!(stdout, b"XY");
+        Ok(())
+    }
 }

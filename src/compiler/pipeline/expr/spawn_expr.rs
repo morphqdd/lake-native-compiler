@@ -121,6 +121,19 @@ pub fn compile_spawn(
         ExecCtxLayout::JUMP_ARGS,
     );
 
+    // ── Allocate mailbox ring buffer (256 slots × 8 bytes) ──────────────
+    let mailbox_size = builder.ins().iconst(ptr_ty, 256 * 8i64);
+    let call_mailbox = builder.ins().call(allocate_ref, &[mailbox_size]);
+    let mailbox_fat_ptr = builder.inst_results(call_mailbox)[0];
+    ExecCtxLayout::store(
+        builder,
+        mailbox_fat_ptr,
+        exec_ctx_ptr,
+        ExecCtxLayout::MAILBOX_FAT,
+    );
+    ExecCtxLayout::store(builder, zero, exec_ctx_ptr, ExecCtxLayout::MAILBOX_HEAD);
+    ExecCtxLayout::store(builder, zero, exec_ctx_ptr, ExecCtxLayout::MAILBOX_TAIL);
+
     let proc_ctx_fat_ptr =
         ProcessCtxLayout::init_ctx(ctx, builder, machine_name, exec_ctx_fat_ptr)?;
 
@@ -134,6 +147,19 @@ pub fn compile_spawn(
     let sh_ctx_ptr = builder.ins().global_value(ptr_ty, sched_gv);
 
     ShedulerCtxLayout::new_process(sh_ctx_ptr, proc_ctx_fat_ptr, ctx, builder)?;
+
+    // ── Store PID (proc_ctx_fat_ptr) in spawning process's TEMP_VAL ─────
+    // Allows `let p pid = machine()` to capture the spawned process's PID.
+    let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
+    let spawning_ctx = builder.use_var(machine_ctx_var);
+    let temp_offset = builder
+        .ins()
+        .iconst(ptr_ty, ExecCtxLayout::TEMP_VAL as i64);
+    let size = builder.ins().iconst(ptr_ty, 8);
+    builder.ins().call(
+        store_ref,
+        &[spawning_ctx, proc_ctx_fat_ptr, size, temp_offset],
+    );
 
     let next_id = block_id + 1;
     let next_id_val = builder.ins().iconst(ptr_ty, next_id);
