@@ -512,6 +512,20 @@ mod tests {
     }
 
     #[test]
+    fn wait_literal_guard_dispatch() -> Result<()> {
+        // Two handlers with i64 literal guards + wildcard fallback.
+        // Sends 0, 1, 2 — expects "zero", "one", "other".
+        let src = r#"@rt(rt_write) receiver is { _ -> { wait { 0 i64 -> { rt_write(1 "zero" 4) } 1 i64 -> { rt_write(1 "one" 3) } n i64 -> { rt_write(1 "other" 5) } } } } sender is { target pid val i64 -> { target(val) } } main is { _ -> { let r0 pid = receiver() let r1 pid = receiver() let r2 pid = receiver() sender(r0 0) sender(r1 1) sender(r2 2) } }"#;
+        let (code, stdout) = compile_and_run_output(src)?;
+        assert_eq!(code, 0);
+        let s = std::str::from_utf8(&stdout).unwrap_or("");
+        assert!(s.contains("zero"), "missing 'zero': {s:?}");
+        assert!(s.contains("one"), "missing 'one': {s:?}");
+        assert!(s.contains("other"), "missing 'other': {s:?}");
+        Ok(())
+    }
+
+    #[test]
     fn ping_pong_multi_round() -> Result<()> {
         // 3 round-trips between ponger and pinger using self-loop + wait.
         let src = r#"@rt(rt_write) ponger is { _ -> { wait { partner pid -> { self(partner 3) } } } partner pid remaining i64 -> { when 1 <= remaining { true -> { wait { n i64 -> { partner(1) self(partner remaining-1) } } } false -> { rt_write(1 "X" 1) } } } } pinger is { partner pid remaining i64 -> { when 1 <= remaining { true -> { partner(1) wait { n i64 -> { self(partner remaining-1) } } } false -> { rt_write(1 "Y" 1) } } } } main is { _ -> { let po pid = ponger() let pi pid = pinger(po 3) po(pi) } }"#;
