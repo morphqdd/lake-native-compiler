@@ -9,7 +9,7 @@ worker is {
 }
 
 main is {
-  _ i64.0 -> {
+  _ -> {
     worker(10000)
     worker(10000)
     worker(10000)

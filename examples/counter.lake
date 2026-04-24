@@ -10,7 +10,7 @@ counter is {
 }
 
 main is {
-  _ i64.0 -> {
+  _ -> {
     counter(5)
     counter(3)
     counter(7)

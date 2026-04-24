@@ -119,9 +119,10 @@ impl CompilerCtx {
         param_count: usize,
         branch_id: u128,
         var_count: usize,
+        guards: Vec<Option<registry::GuardValue>>,
     ) -> Result<()> {
         self.registry
-            .insert_branch(machine, hash, param_count, branch_id, var_count)
+            .insert_branch(machine, hash, param_count, branch_id, var_count, guards)
     }
 
     /// Return the `branch_id` for the branch of `machine` that takes `param_count` parameters.
@@ -132,6 +133,11 @@ impl CompilerCtx {
     /// O(1) dispatch lookup: hash(arg_types) → (branch_id, var_count, param_count).
     pub fn lookup_branch_by_hash(&self, machine: &str, hash: u64) -> Option<(u128, usize, usize)> {
         self.registry.branch_by_hash(machine, hash)
+    }
+
+    /// Return all branches matching a type hash (for literal-guard dispatch).
+    pub fn branches_for_hash(&self, machine: &str, hash: u64) -> Vec<registry::BranchInfo> {
+        self.registry.branches_for_type_hash(machine, hash)
     }
 
     /// Return the variable count for the branch identified by `branch_id` within `machine`.

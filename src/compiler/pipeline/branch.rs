@@ -67,39 +67,20 @@ pub fn compile_branch(
         .ins()
         .jump(branch_switch_block, &[BlockArg::Value(block_id)]);
 
-    // ── Compile pattern defaults then body expressions ─────────────────────
+    // ── Pre-allocate variable slots then compile body ─────────────────────
     let mut state = BranchState::default();
     let mut branch_switch = Switch::new();
     let mut block_id: i64 = 0;
 
-    // Pre-allocate slots for non-default params so they occupy indices 0..N-1.
-    // These are the "input parameters" of the branch, filled by the spawner.
+    // Allocate slots for non-wildcard, non-guard params (0..N-1).
+    // These are input parameters filled by the spawner/caller from JUMP_ARGS.
     for pattern in &patterns {
-        if pattern.default.is_none() {
-            let ident_str = Clean::<Ident<'_>>::clean(pattern).to_string();
-            let lake_ty = Clean::<Type<'_>>::clean(pattern).to_string();
-            state.insert_with_lake_type(ident_str, ptr_ty, lake_ty);
+        if pattern.is_wildcard() || pattern.is_literal_guard() {
+            continue;
         }
-    }
-
-    for pattern in &patterns {
-        if pattern.default.is_some() {
-            match compile_expr(
-                ctx,
-                builder,
-                machine_ctx_var,
-                block_id,
-                &mut branch_switch,
-                &mut state,
-                &Expr::from(pattern),
-            )? {
-                StmtOutcome::Continue(id) => block_id = id,
-                outcome => {
-                    block_id = outcome.next_available();
-                    break;
-                }
-            }
-        }
+        let ident_str = Clean::<Ident<'_>>::clean(pattern).to_string();
+        let lake_ty = Clean::<Type<'_>>::clean(pattern).to_string();
+        state.insert_with_lake_type(ident_str, ptr_ty, lake_ty);
     }
 
     for expr in branch.body.iter() {

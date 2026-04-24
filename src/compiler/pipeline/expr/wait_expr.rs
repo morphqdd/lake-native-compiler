@@ -56,19 +56,23 @@ pub(crate) fn compile(
 
     let patterns = Clean::<Vec<Pattern<'_>>>::clean(handler);
 
-    // Handler arg count = non-default patterns
-    let handler_arg_count = patterns.iter().filter(|p| p.default.is_none()).count();
+    // Handler arg count = non-wildcard, non-guard patterns
+    let handler_arg_count = patterns
+        .iter()
+        .filter(|p| !p.is_wildcard() && !p.is_literal_guard())
+        .count();
 
     // Handler variables start at the current state offset
     let handler_var_base = state.len();
 
     // Register handler pattern variables in state
     for pattern in &patterns {
-        if pattern.default.is_none() {
-            let ident_str = Clean::<Ident<'_>>::clean(pattern).to_string();
-            let lake_ty = Clean::<Type<'_>>::clean(pattern).to_string();
-            state.insert_with_lake_type(ident_str, ptr_ty, lake_ty);
+        if pattern.is_wildcard() || pattern.is_literal_guard() {
+            continue;
         }
+        let ident_str = Clean::<Ident<'_>>::clean(pattern).to_string();
+        let lake_ty = Clean::<Type<'_>>::clean(pattern).to_string();
+        state.insert_with_lake_type(ident_str, ptr_ty, lake_ty);
     }
 
     // Handler body starts at block_id + 1

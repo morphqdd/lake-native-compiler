@@ -1,15 +1,22 @@
+@rt(rt_write)
+
 main is {
-  _ i64.0 -> {
+  _ -> {
     let id pid = counter()
   }
 }
 
 counter is {
-  _ i64.0 -> {
+  _ -> {
     wait {
-      _ i64.0 -> {
+      _ -> {
         self()
       }
     }
+  }
+}
+
+worker is {
+  msg str -> {
   }
 }
