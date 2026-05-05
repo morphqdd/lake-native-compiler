@@ -93,6 +93,13 @@ pub fn compile<SP: AsRef<Path>>(
     Ok(obj.emit()?)
 }
 
+/// Embedded syscall runtime object. Baked into the lakec binary at build time
+/// so the compiler does not depend on CWD or external file layout.
+const SYSCALL_OBJ: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/external/build/syscall.o"
+));
+
 pub fn link<BP: AsRef<Path>>(
     build_path: BP,
     name: &str,
@@ -102,12 +109,14 @@ pub fn link<BP: AsRef<Path>>(
 ) -> Result<()> {
     fs::create_dir_all(&build_path)?;
     let obj_path = build_path.as_ref().join(format!("{name}.o"));
+    let syscall_path = build_path.as_ref().join("syscall.o");
     let out_path = build_path.as_ref().join(name);
     fs::write(&obj_path, bytes)?;
+    fs::write(&syscall_path, SYSCALL_OBJ)?;
 
     let mut args = vec![
         "-static".to_string(),
-        "external/build/syscall.o".to_string(),
+        syscall_path.to_string_lossy().into_owned(),
         obj_path.to_string_lossy().into_owned(),
         "-o".to_string(),
         out_path.to_string_lossy().into_owned(),
