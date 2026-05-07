@@ -41,12 +41,11 @@
   `benchmark/semantic/mailbox_isolation/lake.lake`.
 
 ## 4. Compiler hot path
-- [ ] **String literal guards in branch dispatch.**
-  `dispatch.rs::emit_int_guard_select` only handles `GuardValue::Int`; `Str`
-  falls to wildcard default. Symptom: playground `greeting("Hello, world!")`
-  + `greeting("Some other")` both print "Not hello".
-  Repro: `tests/integration/regression.rs::str_guard_branch_dispatch_playground_repro`.
-  Plan: mirror `when_expr.rs` MPHF + hash-verify pattern.
+- [x] **String literal guards in branch dispatch.** Implemented as
+  `dispatch::emit_str_guard_select` (MPHF + hash-verify + memcmp).
+  `emit_guard_select` dispatches between int/str variants by guard kind.
+  Wired into spawn_expr.rs, jump_expr.rs, change_state_expr.rs.
+  Verified by `tests/integration/regression.rs::str_guard_branch_dispatch_playground_repro`.
 - [ ] **Reduction counter in register (Cranelift Variable).**
   Currently quantum lives in `ProcessCtx`; every CPS block does load/sub/cmp/store.
   Hoist to `Variable`, spill only at yield boundaries.

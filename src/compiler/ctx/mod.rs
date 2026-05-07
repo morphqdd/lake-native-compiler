@@ -33,6 +33,10 @@ pub struct CompilerCtx {
     /// instead of returning directly.  Set by `compile_machine` before branch
     /// compilation; cleared by `begin_function`.
     quantum_block: Option<Block>,
+    /// Monotonic counter handed out to `dispatch::emit_str_guard_select`
+    /// callers so that each call site gets unique data-section names
+    /// (`guard_disp_<n>`, `guard_keys_<n>`, …).
+    next_dispatch_id: i64,
 }
 
 /// Cranelift optimisation level.
@@ -87,7 +91,17 @@ impl CompilerCtx {
             declared_in_prog_rt_func: BTreeSet::new(),
             current_machine: None,
             quantum_block: None,
+            next_dispatch_id: 0,
         }
+    }
+
+    /// Hand out a fresh id for a guard-dispatch call site.  Used to namespace
+    /// the data sections (mphf displacements, keys, lit_blob, lit_meta, bid)
+    /// emitted by `dispatch::emit_str_guard_select`.
+    pub fn next_dispatch_id(&mut self) -> i64 {
+        let id = self.next_dispatch_id;
+        self.next_dispatch_id += 1;
+        id
     }
 }
 

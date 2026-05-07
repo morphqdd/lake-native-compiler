@@ -43,6 +43,7 @@ impl StmtOutcome {
 
 pub mod arith_expr;
 pub mod change_state_expr;
+pub mod dispatch;
 pub mod jump_expr;
 pub mod let_expr;
 pub mod num_expr;

@@ -13,7 +13,7 @@ use crate::compiler::{ctx::CompilerCtx, pipeline::expr::StmtOutcome, rt::layout:
 
 /// Process escape sequences in a Lake string literal.
 /// `\n` → 0x0A, `\t` → 0x09, `\r` → 0x0D, `\\` → 0x5C, `\"` → 0x22.
-fn unescape(s: &str) -> Vec<u8> {
+pub fn unescape(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {

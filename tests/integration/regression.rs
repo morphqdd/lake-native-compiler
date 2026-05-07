@@ -8,11 +8,9 @@ use super::common::run;
 /// `GuardValue::Int`. Both `greeting("Hello, world!")` and `greeting("Some other")`
 /// printed "Not hello".
 ///
-/// Status: currently FAILING — fix is on the way. Marked `#[ignore]` until
-/// branch dispatch handles `GuardValue::Str` (MPHF + hash-verify, mirroring
-/// `when_expr.rs`).
+/// Fixed by `dispatch::emit_str_guard_select`: MPHF + hash-verify + memcmp
+/// path covering string-guarded branches at any call site (spawn / self / send).
 #[test]
-#[ignore = "string guard branch dispatch not yet implemented"]
 fn str_guard_branch_dispatch_playground_repro() {
     let src = r#"
         @rt(rt_write)
@@ -27,5 +25,12 @@ fn str_guard_branch_dispatch_playground_repro() {
     "#;
     let out = run(src).unwrap();
     assert_eq!(out.exit_code, 0);
-    assert_eq!(out.stdout, b"Hello, world!\nNot hello\n");
+    let s = out.stdout_str();
+    // Both spawned actors must run.  Order between them is round-robin and
+    // therefore not guaranteed — assert presence of both branches.
+    assert!(
+        s.contains("Hello, world!"),
+        "first-branch output missing: {s:?}"
+    );
+    assert!(s.contains("Not hello"), "fallback-branch output missing: {s:?}");
 }

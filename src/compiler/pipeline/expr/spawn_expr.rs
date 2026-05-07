@@ -1,5 +1,5 @@
-use anyhow::{Result, anyhow, bail};
-use crate::compiler::pipeline::expr::StmtOutcome;
+use anyhow::{Result, bail};
+use crate::compiler::pipeline::expr::{StmtOutcome, dispatch};
 use cranelift::{
     codegen::ir::BlockArg,
     frontend::Switch,
@@ -36,15 +36,16 @@ pub fn compile_spawn(
     let ptr_ty = ctx.module().target_config().pointer_type();
     let rt_funcs = ctx.rt_funcs().clone();
 
-    let (branch_id, _var_count, arg_count) = ctx
-        .lookup_branch_by_hash(machine_name, call_hash)
-        .ok_or_else(|| {
-            anyhow!(
-                "No branch matching call hash {:#018x} in '{}'",
-                call_hash,
-                machine_name
-            )
-        })?;
+    let candidates = ctx.branches_for_hash(machine_name, call_hash);
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "No branch matching call hash {:#018x} in '{}'",
+        call_hash,
+        machine_name
+    );
+
+    let arg_count = candidates.iter().map(|c| c.param_count).max().unwrap_or(0);
+    let needs_guard_dispatch = candidates.len() > 1;
 
     // Size the VARIABLES buffer by the maximum var_count across all branches of
     // the target machine so that any future state transition (`self(...)`) is
@@ -73,33 +74,46 @@ pub fn compile_spawn(
     let call_args = builder.ins().call(allocate_ref, &[jump_args_size]);
     let jump_args_fat_ptr = builder.inst_results(call_args)[0];
 
-    if arg_count > 0 {
+    // Load spawning JUMP_ARGS when we have args to copy or need the discriminant.
+    let spawning_ja_start = if arg_count > 0 || needs_guard_dispatch {
         let spawning_ctx_ptr = builder.use_var(machine_ctx_var);
-        let jump_args_offset = builder
-            .ins()
-            .iconst(ptr_ty, ExecCtxLayout::JUMP_ARGS as i64);
-        let call_ja = builder
-            .ins()
-            .call(load_ref, &[spawning_ctx_ptr, jump_args_offset]);
+        let jump_args_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::JUMP_ARGS as i64);
+        let call_ja = builder.ins().call(load_ref, &[spawning_ctx_ptr, jump_args_offset]);
         let spawning_jump_args = builder.inst_results(call_ja)[0];
-        let spawning_ja_start = FatPtrLayout::load_start(builder, ptr_ty, spawning_jump_args);
+        Some(FatPtrLayout::load_start(builder, ptr_ty, spawning_jump_args))
+    } else {
+        None
+    };
 
+    if arg_count > 0 {
+        let ja_start = spawning_ja_start.unwrap();
         let vars_start = FatPtrLayout::load_start(builder, ptr_ty, vars_fat_ptr);
-
         for i in 0..arg_count {
             let val = builder.ins().load(
                 ptr_ty,
                 MemFlags::new(),
-                spawning_ja_start,
+                ja_start,
                 (jump_args_base + i) as i32 * 8,
             );
-            builder
-                .ins()
-                .store(MemFlags::new(), val, vars_start, i as i32 * 8);
+            builder.ins().store(MemFlags::new(), val, vars_start, i as i32 * 8);
         }
     }
 
-    let branch_id_val = builder.ins().iconst(ptr_ty, branch_id as i64);
+    let branch_id_val = if needs_guard_dispatch {
+        let disc_pos = dispatch::find_first_guard_pos(&candidates);
+        let disc = builder.ins().load(
+            ptr_ty,
+            MemFlags::new(),
+            spawning_ja_start.unwrap(),
+            (jump_args_base + disc_pos) as i32 * 8,
+        );
+        // namespace for any data sections the str-dispatch path emits — must
+        // be unique per call site within the module.
+        let namespace = ctx.next_dispatch_id();
+        dispatch::emit_guard_select(ctx, builder, ptr_ty, &candidates, disc, namespace)?
+    } else {
+        builder.ins().iconst(ptr_ty, candidates[0].branch_id as i64)
+    };
     let zero = builder.ins().iconst(ptr_ty, 0);
     ExecCtxLayout::store(
         builder,

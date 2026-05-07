@@ -11,7 +11,7 @@ use crate::compiler::{
     ctx::CompilerCtx,
     hash_call_args,
     pipeline::expr::{
-        BranchState, StmtOutcome, change_state_expr, compile_expr, pure_expr, send_expr,
+        BranchState, StmtOutcome, change_state_expr, compile_expr, dispatch, pure_expr, send_expr,
         spawn_expr,
     },
     rt::layout::ExecCtxLayout,
@@ -251,30 +251,22 @@ fn compile_fused_self_call(
 ) -> Result<StmtOutcome> {
     let ptr_ty = ctx.module().target_config().pointer_type();
 
-    let (target_branch_id, _var_count, _arg_count) = ctx
-        .lookup_branch_by_hash(machine_name, call_hash)
-        .ok_or_else(|| {
-            anyhow!(
-                "No branch matching call hash {:#018x} in '{}'",
-                call_hash,
-                machine_name
-            )
-        })?;
+    let candidates = ctx.branches_for_hash(machine_name, call_hash);
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "No branch matching call hash {:#018x} in '{}'",
+        call_hash,
+        machine_name
+    );
 
     let b = builder.create_block();
     builder.switch_to_block(b);
 
     // 1. Load exec_start and vars_start once
     let ctx_ptr = builder.use_var(machine_ctx_var);
-    let exec_start = builder
-        .ins()
-        .load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
-    let vars_fp = builder
-        .ins()
-        .load(ptr_ty, MemFlags::trusted(), exec_start, ExecCtxLayout::VARIABLES);
-    let vars_start = builder
-        .ins()
-        .load(ptr_ty, MemFlags::trusted(), vars_fp, 0);
+    let exec_start = builder.ins().load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
+    let vars_fp = builder.ins().load(ptr_ty, MemFlags::trusted(), exec_start, ExecCtxLayout::VARIABLES);
+    let vars_start = builder.ins().load(ptr_ty, MemFlags::trusted(), vars_fp, 0);
 
     // 2. Compute ALL values first (before any stores).
     //    This is critical: self(acc2, acc1+acc2) must read the original acc2
@@ -286,19 +278,29 @@ fn compile_fused_self_call(
 
     // 3. Write all values directly to VARIABLES
     for (i, val) in values.iter().enumerate() {
-        builder
-            .ins()
-            .store(MemFlags::trusted(), *val, vars_start, i as i32 * 8);
+        builder.ins().store(MemFlags::trusted(), *val, vars_start, i as i32 * 8);
     }
 
-    // 4. Set BRANCH_ID
-    let branch_id_val = builder.ins().iconst(ptr_ty, target_branch_id as i64);
-    builder.ins().store(
-        MemFlags::trusted(),
-        branch_id_val,
-        exec_start,
-        ExecCtxLayout::BRANCH_ID,
-    );
+    // 4. Set BRANCH_ID — with guard dispatch if multiple branches share this hash
+    let branch_id_val = if candidates.len() > 1 {
+        let disc_pos = dispatch::find_first_guard_pos(&candidates);
+        // Discriminant is the already-computed arg value at disc_pos.
+        // We read it back from VARIABLES (which we just wrote) — safe because
+        // writes happened before this load in program order.
+        let disc = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            vars_start,
+            disc_pos as i32 * 8,
+        );
+        let namespace = ctx.next_dispatch_id();
+        dispatch::emit_guard_select(ctx, builder, ptr_ty, &candidates, disc, namespace)?
+    } else {
+        builder.ins().iconst(ptr_ty, candidates[0].branch_id as i64)
+    };
+
+    // exec_start was computed in block b; b_merge is dominated by b, so this is valid.
+    builder.ins().store(MemFlags::trusted(), branch_id_val, exec_start, ExecCtxLayout::BRANCH_ID);
 
     // 5. Jump to quantum_continue with block_id = 0
     let next_id = builder.ins().iconst(ptr_ty, 0);

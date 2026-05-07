@@ -12,6 +12,7 @@ use crate::compiler::{
             alloc::{define_allocate, define_loads, define_store},
             exit::define_exit,
             mmap::{define_init_heap, define_mmap},
+            read::define_read,
             strings::{define_len, define_to_string, define_to_string_with_ln},
             syscall::declare_syscall_wrapper,
             write::{define_write, define_write_static},
@@ -51,6 +52,8 @@ impl RuntimeBuilder {
         let ctx = define_loads(ctx)?;
         debug!("rt: rt_write");
         let ctx = define_write(ctx)?;
+        debug!("rt: rt_read");
+        let ctx = define_read(ctx)?;
         debug!("rt: rt_write_static");
         let ctx = define_write_static(ctx)?;
         debug!("rt: len");
@@ -266,7 +269,7 @@ pub(crate) fn get_static_buffer(
 /// Allocate a zero-initialised static buffer and return
 /// `(data_ptr, fat_ptr_global_value)` where both are Cranelift `Value`s
 /// ready for use in the current function.
-fn alloc_static_buffer(
+pub fn alloc_static_buffer(
     ctx: &mut CompilerCtx,
     builder: &mut FunctionBuilder,
     ptr_ty: cranelift::prelude::Type,

@@ -13,6 +13,7 @@ pub struct RtFuncs {
     pub load_u64: FuncId,
     pub store: FuncId,
     pub write: FuncId,
+    pub read: FuncId,
     pub write_static: FuncId,
     pub exit: FuncId,
     pub mmap: FuncId,
@@ -26,6 +27,7 @@ impl RtFuncs {
             load_u64: resolve_func(module, "rt_load_u64")?,
             store: resolve_func(module, "rt_store")?,
             write: resolve_func(module, "rt_write")?,
+            read: resolve_func(module, "rt_read")?,
             write_static: resolve_func(module, "rt_write_static")?,
             exit: resolve_func(module, "rt_exit")?,
             mmap: resolve_func(module, "rt_mmap")?,
@@ -50,6 +52,11 @@ impl RtFuncs {
     /// Declare `write` for use in the function currently being built.
     pub fn write_ref(&self, module: &mut ObjectModule, builder: &mut FunctionBuilder) -> FuncRef {
         module.declare_func_in_func(self.write, builder.func)
+    }
+
+    /// Declare `read` for use in the function currently being built.
+    pub fn read_ref(&self, module: &mut ObjectModule, builder: &mut FunctionBuilder) -> FuncRef {
+        module.declare_func_in_func(self.read, builder.func)
     }
 
     /// Declare `exit` for use in the function currently being built.

@@ -2,14 +2,25 @@ use anyhow::{Result, bail};
 use cranelift::{
     codegen::ir::BlockArg,
     frontend::Switch,
-    module::Module,
-    prelude::{FunctionBuilder, InstBuilder, Variable},
+    module::{DataDescription, Linkage, Module},
+    prelude::{FunctionBuilder, InstBuilder, IntCC, MemFlags, Variable},
 };
 use lake_frontend::api::expr::Expr;
+use log::debug;
 
-use crate::compiler::{ctx::CompilerCtx, pipeline::expr::StmtOutcome, rt::layout::ExecCtxLayout};
+use crate::compiler::{
+    ctx::CompilerCtx,
+    mphf::{self, MphfBuilder, emit_fxhash, emit_hash_function, emit_mphf_lookup, fxhash},
+    pipeline::expr::StmtOutcome,
+    rt::{alloc_static_buffer, layout::ExecCtxLayout},
+};
 
 use super::{BranchState, compile_expr};
+
+enum WhenBranchType {
+    Simple,
+    Ptr,
+}
 
 pub fn compile<'a>(
     ctx: &mut CompilerCtx,
@@ -103,20 +114,109 @@ pub fn compile<'a>(
     }
 
     builder.switch_to_block(b_check);
-    {
-        let rt_funcs = ctx.rt_funcs().clone();
-        let load_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
-        let ctx_ptr = builder.use_var(machine_ctx_var);
-        let temp_off = builder.ins().iconst(ptr_ty, ExecCtxLayout::TEMP_VAL as i64);
-        let call = builder.ins().call(load_ref, &[ctx_ptr, temp_off]);
-        let discrim = builder.inst_results(call)[0];
 
+    {
+        let mut keys = vec![];
         let mut when_switch = Switch::new();
-        for (i, (cond_span, _)) in branches.iter().enumerate() {
-            let key = literal_value(cond_span)?;
-            when_switch.set_entry(key, b_ret[i]);
-        }
-        when_switch.emit(builder, discrim, b_no_match);
+        let when_branch_type = get_ty(&branches.iter().nth(0).unwrap().0)?;
+
+        let ctx_ptr = builder.use_var(machine_ctx_var);
+        let raw_ctx_ptr = builder.ins().load(ptr_ty, MemFlags::new(), ctx_ptr, 0);
+        let temp_off = ExecCtxLayout::load(builder, ptr_ty, raw_ctx_ptr, ExecCtxLayout::TEMP_VAL);
+
+        let index_ext = match when_branch_type {
+            WhenBranchType::Simple => {
+                for (i, (cond_span, _)) in branches.iter().enumerate() {
+                    when_switch.set_entry(literal_value(cond_span)?, b_ret[i]);
+                }
+                temp_off
+            }
+            WhenBranchType::Ptr => {
+                for (cond_span, _) in branches.iter() {
+                    let key = hash_lit(cond_span)?;
+                    keys.push(key);
+                }
+                let mphf = MphfBuilder::build(&keys);
+
+                let disp_data_id = ctx.module_mut().declare_data(
+                    &format!("mphf_disp_{disc_done_id}"),
+                    Linkage::Export,
+                    false,
+                    false,
+                )?;
+                let mut disp_data_desc = DataDescription::new();
+                let mut disp_bytes = vec![];
+                mphf.displacements.iter().for_each(|disp| {
+                    disp.to_le_bytes()
+                        .iter()
+                        .for_each(|&byte| disp_bytes.push(byte))
+                });
+                debug!("MPHF: {mphf:?}");
+                debug!(
+                    "MPHF displacements: {:?} {:?}",
+                    mphf.displacements, disp_bytes
+                );
+                disp_data_desc.define(disp_bytes.into());
+                ctx.module_mut()
+                    .define_data(disp_data_id, &disp_data_desc)?;
+
+                let keys_data_id = ctx.module_mut().declare_data(
+                    &format!("mphf_keys_{disc_done_id}"),
+                    Linkage::Export,
+                    false,
+                    false,
+                )?;
+                let mut keys_data_desc = DataDescription::new();
+                let mut keys_bytes = vec![];
+                keys.iter().for_each(|key| {
+                    key.to_le_bytes()
+                        .iter()
+                        .for_each(|&byte| keys_bytes.push(byte))
+                });
+
+                debug!("MPHF keys: {:?} {:?}", keys, keys_bytes);
+                keys_data_desc.define(keys_bytes.into());
+                ctx.module_mut()
+                    .define_data(keys_data_id, &keys_data_desc)?;
+                for (i, &key) in keys.iter().enumerate() {
+                    let index = mphf.lookup(key);
+                    when_switch.set_entry(index as u128, b_ret[i]);
+                }
+                let start = builder.ins().load(ptr_ty, MemFlags::trusted(), temp_off, 0);
+                let end = builder.ins().load(ptr_ty, MemFlags::trusted(), temp_off, 8);
+
+                let len = builder.ins().isub(end, start);
+
+                let fxhash_result = emit_fxhash(builder, start, len);
+
+                let mphf_hash = emit_hash_function(builder, fxhash_result, mphf.seed);
+                let disp_gv = ctx
+                    .module_mut()
+                    .declare_data_in_func(disp_data_id, builder.func);
+                let disp_ptr = builder.ins().global_value(ptr_ty, disp_gv);
+                let index = emit_mphf_lookup(builder, &mphf, mphf_hash, disp_ptr);
+
+                let keys_gv = ctx
+                    .module_mut()
+                    .declare_data_in_func(keys_data_id, builder.func);
+                let keys_ptr = builder.ins().global_value(ptr_ty, keys_gv);
+                let index_ext = builder.ins().uextend(ptr_ty, index);
+                let key_offset = builder.ins().imul_imm(index_ext, 8);
+                let key_addr = builder.ins().iadd(keys_ptr, key_offset);
+                let stored_key = builder.ins().load(ptr_ty, MemFlags::trusted(), key_addr, 0);
+                let matches = builder.ins().icmp(IntCC::Equal, stored_key, fxhash_result);
+
+                let verified_block = builder.create_block();
+                builder
+                    .ins()
+                    .brif(matches, verified_block, &[], b_no_match, &[]);
+
+                builder.switch_to_block(verified_block);
+                builder.seal_block(verified_block);
+                index_ext
+            }
+        };
+        when_switch.emit(builder, index_ext, b_no_match);
     }
     outer_switch.set_entry(disc_done_id as u128, b_check);
 
@@ -128,6 +228,23 @@ fn literal_value(expr: &Expr<'_>) -> Result<u128> {
         Expr::Bool(false) => Ok(0),
         Expr::Bool(true) => Ok(1),
         Expr::Num(s, _) => Ok(s.parse::<i64>()? as u64 as u128),
+        other => bail!("unsupported when condition: {:?}", other),
+    }
+}
+
+fn hash_lit(expr: &Expr<'_>) -> Result<u64> {
+    match expr {
+        Expr::String(s, _) => Ok(fxhash(s.as_bytes())),
+        other => bail!("unsupported when condition: {:?}", other),
+    }
+}
+
+fn get_ty(expr: &Expr<'_>) -> Result<WhenBranchType> {
+    match expr {
+        Expr::Bool(false) => Ok(WhenBranchType::Simple),
+        Expr::Bool(true) => Ok(WhenBranchType::Simple),
+        Expr::Num(s, _) => Ok(WhenBranchType::Simple),
+        Expr::String(s, _) => Ok(WhenBranchType::Ptr),
         other => bail!("unsupported when condition: {:?}", other),
     }
 }

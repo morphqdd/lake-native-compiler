@@ -54,9 +54,6 @@ pub fn build_scheduler(ctx: &mut CompilerCtx, builder: &mut FunctionBuilder) -> 
         .ins()
         .brif(has_active, exec_block, &[], check_waited_block, &[]);
 
-    // Нет активных процессов — проверяем, есть ли ждущие.
-    // Если есть — крутим loop (пока нет механизма пробуждения).
-    // Если нет — выходим.
     builder.switch_to_block(check_waited_block);
     let waited = ShedulerCtxLayout::get_waited_processes(sh_ptr_var, ctx, builder)?;
     let has_waited = builder.ins().icmp_imm(IntCC::NotEqual, waited, 0);
