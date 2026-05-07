@@ -1,0 +1,10 @@
+@rt(rt_write)
+
+main is {
+  n i64.0 -> {
+    when n {
+      0 -> { rt_write(1 "zero\n" 5) }
+      1 -> { rt_write(1 "one\n" 4) }
+    } 
+  }
+}

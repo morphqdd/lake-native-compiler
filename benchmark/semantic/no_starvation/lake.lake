@@ -1,0 +1,16 @@
+@rt(rt_write)
+
+spinner is {
+  _ -> { self() }
+}
+
+printer is {
+  _ -> { rt_write(1 "B\n" 2) }
+}
+
+main is {
+  _ -> {
+    spinner()
+    printer()
+  }
+}

@@ -1,0 +1,23 @@
+@rt(rt_write)
+@rt(rt_read)
+@rt(rt_allocate)
+
+main is {
+  _ -> {
+    let buf str = "lake"
+    when buf {
+      "hello" -> {
+        rt_write(1 "world\n" 6)
+      }
+      "world" -> {
+        rt_write(1 "hello\n" 6)
+      }
+      "lake" -> {
+        rt_write(1 "is awesome\n" 11)
+      }
+      "lang" -> {
+        rt_write(1 "is lake\n" 8)
+      }
+    }
+  }
+}

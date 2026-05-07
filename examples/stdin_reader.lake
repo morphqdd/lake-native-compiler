@@ -1,0 +1,46 @@
+@rt(rt_read)
+@rt(rt_write)
+@rt(rt_allocate)
+
+stdreader is {
+  id pid buf i64 size i64 -> {
+        rt_write(1 "Before read\n" 12)
+        rt_read(0 buf size)
+        rt_write(1 "After read\n" 11)
+        id(0)
+        rt_write(1 "End of stdreader\n" 17)
+      }
+}
+
+stdwriter is {
+  buf i64 size i64 -> {
+    rt_write(1 buf size)
+  }
+  buf str size i64 -> {
+    rt_write(1 buf size)
+  }
+}
+
+process is {
+  _ -> {
+    wait {
+      self_id pid -> { self(self_id) }
+    }
+  }
+  self_id pid -> {
+    let buf i64 = rt_allocate(32)
+    stdreader(self_id buf 32)
+    wait {
+      _ -> {
+        stdwriter(buf 32)
+      }
+    }
+  }
+}
+
+main is {
+  _ -> {
+    let proc pid = process()
+    proc(proc)
+  }
+}

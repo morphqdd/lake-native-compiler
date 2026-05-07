@@ -1,0 +1,24 @@
+@rt(rt_write)
+
+// Each spawned actor exits immediately — measures pure spawn + scheduler insert.
+nop is { _ -> { } }
+
+// Driver: spawns N actors, then exits.  Counts down via self() to keep
+// the loop in CPS form.
+driver is {
+  n i64 -> {
+    when 0 == n {
+      true  -> { rt_write(1 "done\n" 5) }
+      false -> { nop() self(n-1) }
+    }
+  }
+}
+
+// NOTE: scheduler `process_arr` is a static 256-slot queue
+// (src/compiler/rt/layout/sheduler_ctx.rs:28). Driver burst-spawning N nops
+// in one quantum overflows the queue once N > 256 instantly-pending processes.
+// 2000 works empirically because round-robin drains the queue between bursts;
+// raising the cap is TODO #1 (allocator) + queue → growable structure.
+main is {
+  _ -> { driver(2000) }
+}

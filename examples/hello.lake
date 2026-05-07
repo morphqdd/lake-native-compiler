@@ -1,0 +1,7 @@
+@rt(rt_write)
+
+main is {
+  _ -> {
+    rt_write(1 "Hello, Lake!\n" 13)
+  }
+}
