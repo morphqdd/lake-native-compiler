@@ -69,6 +69,39 @@ run_axis footprint
 run_axis semantic
 run_axis canonical
 
+# ── final summary ─────────────────────────────────────────────────────────────
+
+if [ "$BUILD_ONLY" != "1" ]; then
+    echo
+    echo -e "${BOLD}${MAGENTA}── summary ${RESET}${MAGENTA}─────────────────────────────────────────────────────────────${RESET}"
+    echo
+
+    if [ -z "$AXIS_FILTER" ] || [ "$AXIS_FILTER" = "perf" ]; then
+        echo -e "  ${BOLD}performance${RESET}"
+        for d in "$SCRIPT_DIR"/perf/*/; do
+            [ -f "$d/manifest.sh" ] || continue
+            bench_name=$(basename "$d")
+            f="$RESULTS/$bench_name.md"
+            [ -f "$f" ] || continue
+            # Pull out command rows from hyperfine markdown:
+            #   | `cmd` | mean ± σ | min | max | rel |
+            printf "    ${CYAN}%-12s${RESET}\n" "$bench_name"
+            grep -E "^\| ?\`" "$f" 2>/dev/null | while IFS='|' read -r _ name mean _min _max rel; do
+                name=$(echo "$name" | sed -E 's/^[[:space:]`]+//; s/[[:space:]`]+$//')
+                mean=$(echo "$mean" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+                rel=$(echo "$rel"   | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+                printf "      %-50s ${DIM}%-22s${RESET} ${DIM}%s${RESET}\n" "$name" "$mean" "$rel"
+            done
+        done
+        echo
+    fi
+
+    if [ -z "$AXIS_FILTER" ] || [ "$AXIS_FILTER" = "semantic" ]; then
+        echo -e "  ${BOLD}semantic${RESET}  ${DIM}(see axis output above for per-test verdicts)${RESET}"
+        echo
+    fi
+fi
+
 echo
 echo -e "  ${DIM}done — results in $RESULTS/${RESET}"
 echo

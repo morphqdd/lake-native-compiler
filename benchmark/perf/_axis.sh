@@ -30,7 +30,7 @@ run_one() {
     [ "$BUILD_ONLY" = "1" ] && { echo; return 0; }
 
     step "run  ${DIM}hyperfine --warmup $WARMUP${RESET}"
-    run_hyperfine "$dir" "$WARMUP" "$RESULTS/perf-$bench.md" "${LABELS[@]}"
+    run_hyperfine "$dir" "$WARMUP" "$RESULTS/$bench.md" "${LABELS[@]}"
     echo
 }
 

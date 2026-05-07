@@ -1,0 +1,23 @@
+@rt(rt_write)
+
+// Each worker counts down M iterations via self-loop, then prints "done\n".
+// Spawning 4 of them means all 4 must get scheduler time before the program
+// exits — this verifies cooperative round-robin gives each actor progress,
+// no actor starves the others by hogging the runtime.
+worker is {
+  n i64 -> {
+    when 0 == n {
+      true  -> { rt_write(1 "done\n" 5) }
+      false -> { self(n-1) }
+    }
+  }
+}
+
+main is {
+  _ -> {
+    worker(2000)
+    worker(2000)
+    worker(2000)
+    worker(2000)
+  }
+}

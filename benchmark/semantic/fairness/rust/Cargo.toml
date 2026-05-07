@@ -1,0 +1,12 @@
+[package]
+name = "fairness"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

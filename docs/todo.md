@@ -35,6 +35,10 @@
   `let buf str = "lake"; when buf { "lake" -> ... }` — match arm never fires.
   Distinct from the `examples/when_string.lake` path (needs investigation).
   Repro: `tests/integration/when_expr.rs::when_string_match`.
+- [ ] **`//` comments break the parser inside machine bodies.**
+  `CLAUDE.md` claims `//` is supported but P001 fires when used inside a
+  `main is { _ -> { ... } }` block.  Caught while writing
+  `benchmark/semantic/mailbox_isolation/lake.lake`.
 
 ## 4. Compiler hot path
 - [ ] **String literal guards in branch dispatch.**
