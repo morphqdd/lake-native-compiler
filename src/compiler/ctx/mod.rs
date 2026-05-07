@@ -6,7 +6,10 @@ use cranelift::{
     module::{FuncId, FuncOrDataId, Linkage, Module, default_libcall_names},
     native,
     object::{ObjectBuilder, ObjectModule, ObjectProduct},
-    prelude::{AbiParam, Block, Configurable, FunctionBuilder, Type, settings},
+    prelude::{
+        AbiParam, Block, Configurable, FunctionBuilder, InstBuilder, MemFlags, Type, Value,
+        Variable, settings,
+    },
 };
 
 pub mod compiler_type;
@@ -33,6 +36,17 @@ pub struct CompilerCtx {
     /// instead of returning directly.  Set by `compile_machine` before branch
     /// compilation; cleared by `begin_function`.
     quantum_block: Option<Block>,
+    /// `exec_start = *machine_ctx_var` cached as a Cranelift Variable.
+    /// `machine_ctx_var` holds the address of a fat-ptr; `[machine_ctx_var]`
+    /// dereferences that fat-ptr to give the actual ExecCtx pointer.  This
+    /// pointer is **stable for the duration of one machine function call**
+    /// (scheduler doesn't move it between dispatches), so Cranelift can keep
+    /// it in a register if we expose the value via a Variable instead of
+    /// re-emitting the load in every CPS block.
+    ///
+    /// Set by `compile_machine` after the entry block initializes the var;
+    /// cleared by `begin_function`.  Use `Self::exec_start` for read access.
+    current_exec_start_var: Option<Variable>,
     /// Monotonic counter handed out to `dispatch::emit_str_guard_select`
     /// callers so that each call site gets unique data-section names
     /// (`guard_disp_<n>`, `guard_keys_<n>`, …).
@@ -91,6 +105,7 @@ impl CompilerCtx {
             declared_in_prog_rt_func: BTreeSet::new(),
             current_machine: None,
             quantum_block: None,
+            current_exec_start_var: None,
             next_dispatch_id: 0,
         }
     }
@@ -208,6 +223,7 @@ impl CompilerCtx {
     pub fn begin_function(&mut self) {
         self.func_ref_cache.clear();
         self.quantum_block = None;
+        self.current_exec_start_var = None;
     }
 
     /// Set the quantum continuation block for the current machine function.
@@ -221,6 +237,34 @@ impl CompilerCtx {
     pub fn quantum_block(&self) -> Block {
         self.quantum_block
             .expect("quantum_block not set — call set_quantum_block before compiling branches")
+    }
+
+    /// Register the Cranelift Variable that caches `*machine_ctx_var`
+    /// (i.e. the ExecCtx pointer dereferenced once from the fat-ptr address).
+    /// `compile_machine` must call this from the entry block before any branch
+    /// compilation.
+    pub fn set_exec_start_var(&mut self, var: Variable) {
+        self.current_exec_start_var = Some(var);
+    }
+
+    /// Read the cached `exec_start` value via the registered Variable.
+    /// Falls back to a fresh `load(machine_ctx_var, 0)` if no cache is set —
+    /// safe but slower (used by code paths compiled outside a machine context).
+    ///
+    /// `machine_ctx_var` is passed for the fallback path.  When the cache is
+    /// hot, this argument is unused.
+    pub fn exec_start(
+        &self,
+        builder: &mut FunctionBuilder,
+        machine_ctx_var: Variable,
+    ) -> Value {
+        if let Some(var) = self.current_exec_start_var {
+            builder.use_var(var)
+        } else {
+            let ptr_ty = self.module.target_config().pointer_type();
+            let ctx_ptr = builder.use_var(machine_ctx_var);
+            builder.ins().load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0)
+        }
     }
 
     /// Get a `FuncRef` for `callee` usable inside the function currently being

@@ -57,9 +57,8 @@ pub fn compile_branch(
 
     // ── Branch entry: read BLOCK_ID and jump to the block switch ─────────────
     builder.switch_to_block(branch_entry_block);
-    let ctx_ptr = builder.use_var(machine_ctx_var);
-    // INLINED: was rt_load_u64(ctx_ptr, BLOCK_ID)
-    let exec_start = builder.ins().load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
+    // Use cached exec_start (compile_machine init'ed it) instead of re-loading.
+    let exec_start = ctx.exec_start(builder, machine_ctx_var);
     let block_id = builder
         .ins()
         .load(ptr_ty, MemFlags::trusted(), exec_start, ExecCtxLayout::BLOCK_ID);

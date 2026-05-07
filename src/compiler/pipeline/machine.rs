@@ -67,14 +67,24 @@ pub fn compile_machine(ctx: &mut CompilerCtx, machine: &Machine<'_>, quantum: i6
 
     let machine_ctx_var = builder.declare_var(ptr_ty);
     let quantum_var = builder.declare_var(ptr_ty);
+    // Cache `*machine_ctx_var` (ExecCtx pointer dereferenced once from the
+    // fat-ptr address) in a Variable so all CPS blocks can read it from a
+    // register instead of re-emitting the load each dispatch round-trip.
+    // Stable for the duration of one machine function call.
+    let exec_start_var = builder.declare_var(ptr_ty);
 
     builder.def_var(machine_ctx_var, ctx_fat_ptr);
     let quantum_init = builder.ins().iconst(ptr_ty, quantum);
     builder.def_var(quantum_var, quantum_init);
+    let exec_start_init = builder
+        .ins()
+        .load(ptr_ty, MemFlags::trusted(), ctx_fat_ptr, 0);
+    builder.def_var(exec_start_var, exec_start_init);
 
     builder.ins().jump(machine_switch_block, &[]);
 
     ctx.set_quantum_block(quantum_continue_block);
+    ctx.set_exec_start_var(exec_start_var);
 
     let mut machine_switch = Switch::new();
     for (branch_id, item) in machine.items.iter().enumerate() {
@@ -94,11 +104,8 @@ pub fn compile_machine(ctx: &mut CompilerCtx, machine: &Machine<'_>, quantum: i6
     }
 
     builder.switch_to_block(machine_switch_block);
-    let ctx_fat_ptr = builder.use_var(machine_ctx_var);
-
-    let exec_start = builder
-        .ins()
-        .load(ptr_ty, MemFlags::trusted(), ctx_fat_ptr, 0);
+    // Use cached exec_start instead of re-loading from machine_ctx_var.
+    let exec_start = ctx.exec_start(&mut builder, machine_ctx_var);
     let branch_id = builder.ins().load(
         ptr_ty,
         MemFlags::trusted(),
@@ -138,8 +145,7 @@ pub fn compile_machine(ctx: &mut CompilerCtx, machine: &Machine<'_>, quantum: i6
     let next_id = builder.block_params(quantum_loop_block)[0];
 
     // Write next_block_id into exec_ctx.BLOCK_ID (machine reads it on next loop).
-    let ctx_ptr = builder.use_var(machine_ctx_var);
-    let exec_start = builder.ins().load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
+    let exec_start = ctx.exec_start(&mut builder, machine_ctx_var);
     builder.ins().store(
         MemFlags::trusted(),
         next_id,
