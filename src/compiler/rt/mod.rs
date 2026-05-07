@@ -9,7 +9,7 @@ use crate::compiler::{
     ctx::{CompilerCtx, rt_funcs::RtFuncs},
     rt::{
         funcs::{
-            alloc::{define_allocate, define_loads, define_store},
+            alloc::{define_allocate, define_free, define_loads, define_store},
             exit::define_exit,
             mmap::{define_init_heap, define_mmap},
             read::define_read,
@@ -46,6 +46,8 @@ impl RuntimeBuilder {
         let ctx = define_init_heap(ctx)?;
         debug!("rt: rt_allocate");
         let ctx = define_allocate(ctx)?;
+        debug!("rt: rt_free");
+        let ctx = define_free(ctx)?;
         debug!("rt: rt_store");
         let ctx = define_store(ctx)?;
         debug!("rt: rt_load_u{{8,16,32,64}}");

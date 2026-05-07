@@ -84,6 +84,10 @@ pub fn build_scheduler(ctx: &mut CompilerCtx, builder: &mut FunctionBuilder) -> 
     );
 
     builder.switch_to_block(end_of_process_block);
+    // Reclaim the heap memory owned by the process before unlinking from
+    // the queue (so we don't lose the fat-ptr handles).
+    let dead_process = ShedulerCtxLayout::get_current_process(sh_ptr_var, ctx, builder)?;
+    ShedulerCtxLayout::free_process_resources(dead_process, ctx, builder);
     ShedulerCtxLayout::remove_current_process(sh_ptr_var, ctx, builder, loop_block)?;
 
     builder.switch_to_block(is_wait_block);

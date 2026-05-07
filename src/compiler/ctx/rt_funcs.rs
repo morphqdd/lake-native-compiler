@@ -18,6 +18,7 @@ pub struct RtFuncs {
     pub exit: FuncId,
     pub mmap: FuncId,
     pub allocate: FuncId,
+    pub free: FuncId,
 }
 
 impl RtFuncs {
@@ -32,6 +33,7 @@ impl RtFuncs {
             exit: resolve_func(module, "rt_exit")?,
             mmap: resolve_func(module, "rt_mmap")?,
             allocate: resolve_func(module, "rt_allocate")?,
+            free: resolve_func(module, "rt_free")?,
         })
     }
 
@@ -70,6 +72,14 @@ impl RtFuncs {
         builder: &mut FunctionBuilder,
     ) -> FuncRef {
         module.declare_func_in_func(self.allocate, builder.func)
+    }
+
+    pub fn free_ref(
+        &self,
+        module: &mut ObjectModule,
+        builder: &mut FunctionBuilder,
+    ) -> FuncRef {
+        module.declare_func_in_func(self.free, builder.func)
     }
 }
 

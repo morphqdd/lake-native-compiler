@@ -4,7 +4,7 @@ use tokio::sync::Notify;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-const N: usize = 2_000;
+const N: usize = 100_000;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {

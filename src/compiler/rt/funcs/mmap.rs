@@ -28,6 +28,22 @@ pub fn define_mmap(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         ctx.module_mut().define_data(id, &desc)?;
     }
 
+    // ── Free-list heads ──────────────────────────────────────────────────────
+    // 9 buckets indexed by `ceil(log2(max(size, 16))) - 4`, covering payload
+    // sizes 16..=4096 in powers of two.  Each entry is a fat-pointer address
+    // (or 0 = empty) — pop/push at the head of an intrusive linked list whose
+    // `next` link is stored at offset 0 of the freed block's payload.
+    // Larger allocations (> 4096) bypass the free list (current TODO: leak).
+    let free_list_id = ctx.module_mut().declare_data(
+        "free_list_heads",
+        Linkage::Export,
+        true,
+        false,
+    )?;
+    let mut free_list_desc = DataDescription::new();
+    free_list_desc.define_zeroinit(9 * 8);
+    ctx.module_mut().define_data(free_list_id, &free_list_desc)?;
+
     // ── rt_mmap function ──────────────────────────────────────────────────────
     let syscall_id = match ctx.module().get_name("rt_syscall") {
         Some(FuncOrDataId::Func(id)) => id,

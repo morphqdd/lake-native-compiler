@@ -1,5 +1,5 @@
 NAME="spawn"
-DESC="2k actor spawn — process creation cost (Lake static queue caps burst at 256 slots)"
+DESC="100k actor spawn — process creation cost (free-list allocator + death cleanup)"
 WARMUP=3
 LANGS="lake go rust"
 LABELS=(

@@ -14,11 +14,9 @@ driver is {
   }
 }
 
-// NOTE: scheduler `process_arr` is a static 256-slot queue
-// (src/compiler/rt/layout/sheduler_ctx.rs:28). Driver burst-spawning N nops
-// in one quantum overflows the queue once N > 256 instantly-pending processes.
-// 2000 works empirically because round-robin drains the queue between bursts;
-// raising the cap is TODO #1 (allocator) + queue → growable structure.
+// Free-list allocator + per-process death cleanup unblocks much higher N:
+// spawned nops are reaped immediately so concurrent live count stays well
+// under the 256-slot scheduler queue.  Tested up to 500_000 ok.
 main is {
-  _ -> { driver(2000) }
+  _ -> { driver(100000) }
 }

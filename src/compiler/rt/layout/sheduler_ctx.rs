@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use cranelift::{
     codegen::ir::BlockArg,
     module::{DataDescription, Linkage, Module},
-    prelude::{Block, FunctionBuilder, InstBuilder, IntCC, Type, Value, Variable},
+    prelude::{Block, FunctionBuilder, InstBuilder, IntCC, MemFlags, Type, Value, Variable},
 };
 
 use crate::compiler::{
@@ -119,38 +119,33 @@ impl ShedulerCtxLayout {
             .ok_or_else(|| anyhow!("No branches found in 'main'"))?
             .max(1);
 
-        // ── Allocate the variables buffer ─────────────────────────────────────
-        let (_main_vars_ptr, main_vars_fat_ptr) =
-            alloc_static_buffer(ctx, builder, ptr_ty, "main_vars", max_vars * 8)?;
+        // All main-process resources are heap-allocated (rt_allocate) — uniform
+        // with spawned processes.  This makes process-death cleanup trivial:
+        // call rt_free on every fat-ptr regardless of who owns the process.
+        // Future opt-in `@static main` will trade reclamation for zero alloc.
+        let rt_funcs = ctx.rt_funcs().clone();
+        let allocate_ref = rt_funcs.allocate_ref(ctx.module_mut(), builder);
 
-        // ── Allocate the jump-arguments buffer (256 slots) ────────────────────
-        let (_main_args_ptr, main_args_fat_ptr) =
-            alloc_static_buffer(ctx, builder, ptr_ty, "main_args", 256 * 8)?;
+        let vars_size = builder.ins().iconst(ptr_ty, (max_vars * 8) as i64);
+        let call_vars = builder.ins().call(allocate_ref, &[vars_size]);
+        let main_vars_fat_ptr = builder.inst_results(call_vars)[0];
 
-        let main_ctx_id =
-            ctx.module_mut()
-                .declare_data("main_ctx", Linkage::Export, true, false)?;
-        let mut main_ctx_data = DataDescription::new();
-        main_ctx_data.define_zeroinit(ExecCtxLayout::SIZE as usize);
-        ctx.module_mut().define_data(main_ctx_id, &main_ctx_data)?;
+        let args_size = builder.ins().iconst(ptr_ty, 256 * 8);
+        let call_args = builder.ins().call(allocate_ref, &[args_size]);
+        let main_args_fat_ptr = builder.inst_results(call_args)[0];
 
-        let main_ctx_fat_ptr_id =
-            ctx.module_mut()
-                .declare_data("main_ctx_fat_ptr", Linkage::Export, true, false)?;
-        let mut fat_ptr_data = DataDescription::new();
-        fat_ptr_data.define_zeroinit(FatPtrLayout::SIZE);
-        ctx.module_mut()
-            .define_data(main_ctx_fat_ptr_id, &fat_ptr_data)?;
+        let mb_size = builder.ins().iconst(ptr_ty, 256 * 8);
+        let call_mb = builder.ins().call(allocate_ref, &[mb_size]);
+        let main_mb_fat_ptr = builder.inst_results(call_mb)[0];
 
-        let main_ctx_gv = ctx
-            .module_mut()
-            .declare_data_in_func(main_ctx_id, &mut builder.func);
-        let main_ctx_fat_ptr_gv = ctx
-            .module_mut()
-            .declare_data_in_func(main_ctx_fat_ptr_id, &mut builder.func);
+        let exec_ctx_size = builder.ins().iconst(ptr_ty, ExecCtxLayout::SIZE as i64);
+        let call_ctx = builder.ins().call(allocate_ref, &[exec_ctx_size]);
+        let main_ctx_fat_ptr = builder.inst_results(call_ctx)[0];
 
-        let main_ctx_ptr = builder.ins().global_value(ptr_ty, main_ctx_gv);
-        let main_ctx_fat_ptr = builder.ins().global_value(ptr_ty, main_ctx_fat_ptr_gv);
+        // Dereference the fat-ptr once to get the raw ExecCtx address; init fields.
+        let main_ctx_ptr = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), main_ctx_fat_ptr, 0);
 
         let branch_id_val = builder.ins().iconst(ptr_ty, branch_id as i64);
         let zero = builder.ins().iconst(ptr_ty, 0);
@@ -173,10 +168,6 @@ impl ShedulerCtxLayout {
             main_ctx_ptr,
             ExecCtxLayout::JUMP_ARGS,
         );
-
-        // ── Allocate mailbox for main process ───────────────────────────────
-        let (_main_mb_ptr, main_mb_fat_ptr) =
-            alloc_static_buffer(ctx, builder, ptr_ty, "main_mailbox", 256 * 8)?;
         ExecCtxLayout::store(
             builder,
             main_mb_fat_ptr,
@@ -185,12 +176,6 @@ impl ShedulerCtxLayout {
         );
         ExecCtxLayout::store(builder, zero, main_ctx_ptr, ExecCtxLayout::MAILBOX_HEAD);
         ExecCtxLayout::store(builder, zero, main_ctx_ptr, ExecCtxLayout::MAILBOX_TAIL);
-
-        let ctx_end = builder
-            .ins()
-            .iadd_imm(main_ctx_ptr, ExecCtxLayout::SIZE as i64);
-        FatPtrLayout::store_start(builder, main_ctx_fat_ptr, main_ctx_ptr);
-        FatPtrLayout::store_end(builder, main_ctx_fat_ptr, ctx_end);
 
         let process_ctx = ProcessCtxLayout::init_ctx(ctx, builder, "main", main_ctx_fat_ptr)?;
 
@@ -262,6 +247,62 @@ impl ShedulerCtxLayout {
             builder.ins().call(load_func_ref, &[sh_ctx_ptr, offset]);
         let real_count_of_processes = builder.inst_results(call_load_real_count_of_processes)[0];
         Ok(real_count_of_processes)
+    }
+
+    /// Return all heap allocations associated with a dead process to the
+    /// allocator's free list.
+    ///
+    /// Layout assumed:
+    ///   ProcessCtx fat-ptr → {FUNC_PTR @0, EXEC_CTX @8}
+    ///   ExecCtx fat-ptr    → {…, VARIABLES @24, JUMP_ARGS @32, MAILBOX @40, …}
+    ///
+    /// Reads every nested fat-ptr **before** freeing the parent — once a
+    /// fat-ptr is on the free list its payload's first 8 bytes are clobbered
+    /// with the chain pointer, so any fields we needed must already be in
+    /// registers.
+    pub fn free_process_resources(
+        process_ctx_fat_ptr: Value,
+        ctx: &mut CompilerCtx,
+        builder: &mut FunctionBuilder,
+    ) {
+        let ptr_ty = ctx.module().target_config().pointer_type();
+        let rt_funcs = ctx.rt_funcs().clone();
+        let load_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
+        let free_ref = rt_funcs.free_ref(ctx.module_mut(), builder);
+
+        // Read EXEC_CTX (offset 8) from the ProcessCtx payload.
+        let exec_ctx_offset = builder.ins().iconst(ptr_ty, ProcessCtxLayout::EXEC_CTX as i64);
+        let call_exec = builder
+            .ins()
+            .call(load_ref, &[process_ctx_fat_ptr, exec_ctx_offset]);
+        let exec_ctx_fat_ptr = builder.inst_results(call_exec)[0];
+
+        // Read the three nested fat-ptrs from the ExecCtx payload before any
+        // free, since freeing them clobbers their start fields.
+        let vars_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::VARIABLES as i64);
+        let call_vars = builder
+            .ins()
+            .call(load_ref, &[exec_ctx_fat_ptr, vars_offset]);
+        let vars_fat_ptr = builder.inst_results(call_vars)[0];
+
+        let args_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::JUMP_ARGS as i64);
+        let call_args = builder
+            .ins()
+            .call(load_ref, &[exec_ctx_fat_ptr, args_offset]);
+        let args_fat_ptr = builder.inst_results(call_args)[0];
+
+        let mb_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::MAILBOX_FAT as i64);
+        let call_mb = builder
+            .ins()
+            .call(load_ref, &[exec_ctx_fat_ptr, mb_offset]);
+        let mailbox_fat_ptr = builder.inst_results(call_mb)[0];
+
+        // Free leaf allocations first, then the containers.
+        builder.ins().call(free_ref, &[vars_fat_ptr]);
+        builder.ins().call(free_ref, &[args_fat_ptr]);
+        builder.ins().call(free_ref, &[mailbox_fat_ptr]);
+        builder.ins().call(free_ref, &[exec_ctx_fat_ptr]);
+        builder.ins().call(free_ref, &[process_ctx_fat_ptr]);
     }
 
     pub fn get_waited_processes(
