@@ -32,6 +32,13 @@ pub fn build_scheduler(ctx: &mut CompilerCtx, builder: &mut FunctionBuilder) -> 
     builder.ins().call(init_heap_ref, &[]);
 
     let sh_ptr_var = ShedulerCtxLayout::init(ctx, builder)?;
+
+    // Set up io_uring rings BEFORE main process spawns — gives the scheduler
+    // a working SQ/CQ before any actor can issue async I/O.
+    let sh_ctx_fat = builder.use_var(sh_ptr_var);
+    let io_setup_ref = ctx.get_func(builder, "rt_io_uring_setup")?;
+    builder.ins().call(io_setup_ref, &[sh_ctx_fat]);
+
     ShedulerCtxLayout::init_main_process(sh_ptr_var, ctx, builder)?;
 
     let loop_block = builder.create_block();

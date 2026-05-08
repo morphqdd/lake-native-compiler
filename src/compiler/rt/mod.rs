@@ -47,8 +47,6 @@ impl RuntimeBuilder {
         let ctx = define_munmap(ctx)?;
         debug!("rt: rt_init_heap");
         let ctx = define_init_heap(ctx)?;
-        debug!("rt: rt_io_uring_setup (stub)");
-        let ctx = define_io_uring_setup(ctx)?;
         debug!("rt: rt_allocate");
         let ctx = define_allocate(ctx)?;
         debug!("rt: rt_free");
@@ -57,6 +55,8 @@ impl RuntimeBuilder {
         let ctx = define_store(ctx)?;
         debug!("rt: rt_load_u{{8,16,32,64}}");
         let ctx = define_loads(ctx)?;
+        debug!("rt: rt_io_uring_setup");
+        let ctx = define_io_uring_setup(ctx)?;
         debug!("rt: rt_write");
         let ctx = define_write(ctx)?;
         debug!("rt: rt_read");
