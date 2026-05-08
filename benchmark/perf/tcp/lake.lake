@@ -1,0 +1,40 @@
+@rt(rt_listen_tcp)
+@rt(rt_accept_async)
+@rt(rt_send_async)
+@rt(rt_close)
+@rt(rt_write)
+
+// Pure-loop work: spends ~N CPS-block ticks burning scheduler quantum.
+// No spawns, no allocations — just self-transitions.
+work is {
+  n i64 -> {
+    when 0 == n {
+      true  -> { }
+      false -> { self(n-1) }
+    }
+  }
+}
+
+handle is {
+  conn i64 -> {
+    work(500)
+    rt_send_async(conn "hi from lake\n" 13)
+    rt_close(conn)
+  }
+}
+
+accept_loop is {
+  srv i64 -> {
+    let conn i64 = rt_accept_async(srv)
+    handle(conn)
+    self(srv)
+  }
+}
+
+main is {
+  _ -> {
+    rt_write(1 "listening on :8080\n" 19)
+    let server i64 = rt_listen_tcp(8080)
+    accept_loop(server)
+  }
+}
