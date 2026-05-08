@@ -113,6 +113,11 @@ pub fn build_scheduler(ctx: &mut CompilerCtx, builder: &mut FunctionBuilder) -> 
     ShedulerCtxLayout::next_process(sh_ptr_var, ctx, builder, loop_block);
 
     builder.switch_to_block(exit_block);
+    // Flush any residual SQEs queued by `rt_write_async` so a partial batch
+    // (count < SQE_BATCH_SIZE) doesn't get dropped when the kernel closes
+    // the ring fd at exit.
+    let flush_ref = ctx.get_func(builder, "rt_io_uring_flush")?;
+    builder.ins().call(flush_ref, &[]);
     let exit_ref = rt_funcs.exit_ref(ctx.module_mut(), builder);
     let zero = builder.ins().iconst(ptr_ty, 0);
     builder.ins().call(exit_ref, &[zero]);

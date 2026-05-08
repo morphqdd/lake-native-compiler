@@ -38,7 +38,7 @@ impl ShedulerCtxLayout {
         Ok(())
     }
 
-    pub const SIZE: i32 = 168;
+    pub const SIZE: i32 = 176;
     pub const PROCESS_ARR_FAT: i32 = 0;
     pub const CURRENT_PROCESS: i32 = 8;
     pub const LAST_PROCESS_INDEX: i32 = 16;
@@ -74,6 +74,12 @@ impl ShedulerCtxLayout {
     pub const IO_PARKED_FAT: i32 = 144;
     pub const IO_PARKED_COUNT: i32 = 152;
     pub const IO_PARKED_CAP: i32 = 160;
+    /// Pending SQEs not yet submitted via `io_uring_enter`.  rt_write_async
+    /// increments this on every submit; when it reaches `SQE_BATCH_SIZE`,
+    /// the helper calls `io_uring_enter(fd, count, …)` and resets to 0.
+    /// A scheduler-level flush will drain the residual on quantum boundaries
+    /// (stage 5).
+    pub const SQE_PENDING: i32 = 168;
 
     pub const INITIAL_QUEUE_CAP: i64 = 256;
     /// Initial parked-actor list capacity (pairs).  Grows with the same

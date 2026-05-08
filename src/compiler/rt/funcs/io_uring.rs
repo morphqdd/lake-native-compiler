@@ -66,6 +66,11 @@ const SQE_BYTES: i64 = 64;
 const CQE_BYTES: i64 = 16;
 
 const RING_ENTRIES: i64 = 256;
+/// Number of SQEs to accumulate before issuing a single `io_uring_enter`.
+/// Higher = better throughput, worse latency for the laggard submission.
+/// 16 keeps p99 latency well under a millisecond at sane CPU speeds while
+/// amortising the syscall cost across 16× more writes.
+const SQE_BATCH_SIZE: i64 = 16;
 
 /// Build `rt_io_uring_setup(sh_ctx_fat_ptr)` — performs the full
 /// setup-and-stash sequence.
@@ -280,6 +285,89 @@ pub fn define_io_uring_setup(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     Ok(ctx)
 }
 
+/// Build `rt_io_uring_flush()` — drain any pending SQEs through a single
+/// `io_uring_enter`.  Called from the scheduler exit path so the residual
+/// from a partial batch isn't lost when the ring fd is closed by the kernel.
+pub fn define_io_uring_flush(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
+    let ty = ctx.module().target_config().pointer_type();
+
+    let syscall_id = match ctx.module().get_name("rt_syscall") {
+        Some(FuncOrDataId::Func(id)) => id,
+        _ => return Err(anyhow!("rt_syscall must be declared before rt_io_uring_flush")),
+    };
+    let sched_fat_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
+        Some(FuncOrDataId::Data(id)) => id,
+        _ => return Err(anyhow!("sheduler_ctx_fat_ptr global not found")),
+    };
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut module_ctx = ctx.module().make_context();
+    let mut builder = FunctionBuilder::new(&mut module_ctx.func, &mut builder_ctx);
+
+    let entry = builder.create_block();
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+
+    let syscall_ref = ctx
+        .module_mut()
+        .declare_func_in_func(syscall_id, &mut builder.func);
+    let sched_gv = ctx
+        .module_mut()
+        .declare_data_in_func(sched_fat_id, &mut builder.func);
+    let sh_ctx_fat = builder.ins().global_value(ty, sched_gv);
+    let sh_ctx_start = builder
+        .ins()
+        .load(ty, MemFlags::trusted(), sh_ctx_fat, 0);
+
+    let pending = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::SQE_PENDING,
+    );
+
+    let has_pending = builder.ins().icmp_imm(IntCC::NotEqual, pending, 0);
+    let do_flush = builder.create_block();
+    let done = builder.create_block();
+    builder.ins().brif(has_pending, do_flush, &[], done, &[]);
+
+    builder.switch_to_block(do_flush);
+    builder.seal_block(do_flush);
+
+    let ring_fd = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::IO_URING_FD,
+    );
+    let nr_enter = builder.ins().iconst(ty, SYS_IO_URING_ENTER);
+    let zero64 = builder.ins().iconst(ty, 0);
+    let _ = builder.ins().call(
+        syscall_ref,
+        &[nr_enter, ring_fd, pending, zero64, zero64, zero64, zero64],
+    );
+    builder.ins().store(
+        MemFlags::trusted(),
+        zero64,
+        sh_ctx_start,
+        ShedulerCtxLayout::SQE_PENDING,
+    );
+    builder.ins().jump(done, &[]);
+
+    builder.switch_to_block(done);
+    builder.seal_block(done);
+    builder.ins().return_(&[]);
+
+    let sig = builder.func.signature.clone();
+    let id = ctx
+        .module_mut()
+        .declare_function("rt_io_uring_flush", Linkage::Export, &sig)?;
+    ctx.module_mut().define_function(id, &mut module_ctx)?;
+    ctx.module_mut().clear_context(&mut module_ctx);
+
+    Ok(ctx)
+}
+
 /// Build `rt_write_async(fd, fat_ptr, size)` — fire-and-forget write through
 /// io_uring.
 ///
@@ -410,20 +498,56 @@ pub fn define_write_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .ins()
         .store(MemFlags::trusted(), idx32, arr_slot, 0);
 
-    // Advance SQ.tail with a release store.  On x86-64 the syscall that
-    // follows acts as the full barrier, so a regular store suffices.
+    // Advance SQ.tail with a release store.  On x86-64 the syscall (when one
+    // fires below) acts as the full barrier; the userspace-only path leaves
+    // a regular store, which is fine because the kernel won't observe the
+    // new tail until io_uring_enter is eventually called.
     let new_tail = builder.ins().iadd_imm(tail, 1);
     builder
         .ins()
         .store(MemFlags::trusted(), new_tail, sq_tail_ptr, 0);
 
-    // ── io_uring_enter(fd, to_submit=1, min_complete=0, flags=0) ────────────
+    // ── Batch: increment SQE_PENDING; only enter the kernel every Nth call ──
+    let pending_off = ShedulerCtxLayout::SQE_PENDING;
+    let pending = builder
+        .ins()
+        .load(ty, MemFlags::trusted(), sh_ctx_start, pending_off);
+    let pending_next = builder.ins().iadd_imm(pending, 1);
+
+    let batch_full = builder
+        .ins()
+        .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, pending_next, SQE_BATCH_SIZE);
+
+    let flush_block = builder.create_block();
+    let no_flush_block = builder.create_block();
+    let merge_block = builder.create_block();
+    builder
+        .ins()
+        .brif(batch_full, flush_block, &[], no_flush_block, &[]);
+
+    // ── flush_block: io_uring_enter(fd, pending_next, 0, 0); pending = 0 ────
+    builder.switch_to_block(flush_block);
+    builder.seal_block(flush_block);
     let nr_enter = builder.ins().iconst(ty, SYS_IO_URING_ENTER);
-    let one = builder.ins().iconst(ty, 1);
     let _ = builder.ins().call(
         syscall_ref,
-        &[nr_enter, ring_fd, one, zero64, zero64, zero64, zero64],
+        &[nr_enter, ring_fd, pending_next, zero64, zero64, zero64, zero64],
     );
+    builder
+        .ins()
+        .store(MemFlags::trusted(), zero64, sh_ctx_start, pending_off);
+    builder.ins().jump(merge_block, &[]);
+
+    // ── no_flush_block: just stash the new pending count ───────────────────
+    builder.switch_to_block(no_flush_block);
+    builder.seal_block(no_flush_block);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), pending_next, sh_ctx_start, pending_off);
+    builder.ins().jump(merge_block, &[]);
+
+    builder.switch_to_block(merge_block);
+    builder.seal_block(merge_block);
 
     builder.ins().return_(&[]);
 
