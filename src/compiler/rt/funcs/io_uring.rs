@@ -22,11 +22,9 @@ use crate::compiler::{
     rt::layout::{FatPtrLayout, sheduler_ctx::ShedulerCtxLayout},
 };
 
-/// Stop code returned by an actor when it parks on an I/O submission.  The
-/// scheduler must NOT call `remove_current_process` for this code — the slot
-/// has already been vacated by `io_park_current_actor`.
-#[allow(dead_code)]
-pub const STOP_PARK: i64 = -3;
+// STOP_PARK lives in `pipeline::machine` (= -4) — see comment on STOP_PARK
+// constant there.  Scheduler treats it as "actor parked, slot vacated, just
+// continue the loop without remove or advance".
 
 // Kernel ABI constants.
 const SYS_MMAP: i64 = 9;
@@ -492,6 +490,29 @@ pub fn define_write_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .ins()
         .store(MemFlags::trusted(), len32, sqe_addr, 24);
 
+    // user_data @ 32 (u64) = current proc-ctx fat-ptr.  Echoed verbatim in
+    // the CQE, used by `emit_wake_by_user_data` to wake the right actor.
+    let cur_idx = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::CURRENT_PROCESS,
+    );
+    let proc_arr_fat_for_ud = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::PROCESS_ARR_FAT,
+    );
+    let proc_arr_start_for_ud =
+        builder.ins().load(ty, MemFlags::trusted(), proc_arr_fat_for_ud, 0);
+    let cur_off = builder.ins().ishl_imm(cur_idx, 3);
+    let cur_addr = builder.ins().iadd(proc_arr_start_for_ud, cur_off);
+    let cur_proc_ctx = builder.ins().load(ty, MemFlags::trusted(), cur_addr, 0);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), cur_proc_ctx, sqe_addr, 32);
+
     // SQ.array[idx] = idx — the indirect submission queue.
     let arr_offset = builder.ins().ishl_imm(idx, 2);
     let arr_slot = builder.ins().iadd(sq_array_ptr, arr_offset);
@@ -696,6 +717,207 @@ fn emit_wake_by_user_data(
 
     builder.switch_to_block(scan_done);
     builder.seal_block(scan_done);
+}
+
+/// Build `rt_io_uring_wait_cqe()` — blocking call to `io_uring_enter` that
+/// returns once **at least one** CQE has been posted by the kernel.  Used
+/// by the scheduler when it has no runnable processes but has actors parked
+/// on I/O — keeps the user-space loop off the CPU until something completes.
+pub fn define_io_uring_wait_cqe(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
+    let ty = ctx.module().target_config().pointer_type();
+
+    let syscall_id = match ctx.module().get_name("rt_syscall") {
+        Some(FuncOrDataId::Func(id)) => id,
+        _ => return Err(anyhow!("rt_syscall must be declared before rt_io_uring_wait_cqe")),
+    };
+    let sched_fat_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
+        Some(FuncOrDataId::Data(id)) => id,
+        _ => return Err(anyhow!("sheduler_ctx_fat_ptr global not found")),
+    };
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut module_ctx = ctx.module().make_context();
+    let mut builder = FunctionBuilder::new(&mut module_ctx.func, &mut builder_ctx);
+
+    let entry = builder.create_block();
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+
+    let syscall_ref = ctx
+        .module_mut()
+        .declare_func_in_func(syscall_id, &mut builder.func);
+    let sched_gv = ctx
+        .module_mut()
+        .declare_data_in_func(sched_fat_id, &mut builder.func);
+    let sh_ctx_fat = builder.ins().global_value(ty, sched_gv);
+    let sh_ctx_start = builder.ins().load(ty, MemFlags::trusted(), sh_ctx_fat, 0);
+
+    let ring_fd = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::IO_URING_FD,
+    );
+
+    // io_uring_enter(fd, to_submit=0, min_complete=1, flags=IORING_ENTER_GETEVENTS).
+    let nr = builder.ins().iconst(ty, SYS_IO_URING_ENTER);
+    let zero = builder.ins().iconst(ty, 0);
+    let one = builder.ins().iconst(ty, 1);
+    let flags = builder.ins().iconst(ty, 1); // IORING_ENTER_GETEVENTS = 1
+    let _ = builder.ins().call(
+        syscall_ref,
+        &[nr, ring_fd, zero, one, flags, zero, zero],
+    );
+
+    builder.ins().return_(&[]);
+
+    let sig = builder.func.signature.clone();
+    let id = ctx
+        .module_mut()
+        .declare_function("rt_io_uring_wait_cqe", Linkage::Export, &sig)?;
+    ctx.module_mut().define_function(id, &mut module_ctx)?;
+    ctx.module_mut().clear_context(&mut module_ctx);
+
+    Ok(ctx)
+}
+
+/// Build `rt_io_park_current()` — moves the currently-running actor from
+/// `process_arr` into `io_parked` so the scheduler skips it on the next
+/// round-robin tick.
+///
+/// Caller responsibilities (handled by the frontend's park-aware codegen):
+///   1. Submit an SQE whose `user_data` matches the current proc-ctx fat-ptr
+///      so the wake path can find it on completion.
+///   2. Store the resume `BLOCK_ID` into ExecCtx **before** calling this fn.
+///   3. After this returns, jump to `quantum_continue` with `STOP_PARK` so
+///      the machine returns -4 to the scheduler.
+pub fn define_io_park_current(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
+    let ty = ctx.module().target_config().pointer_type();
+
+    let sched_fat_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
+        Some(FuncOrDataId::Data(id)) => id,
+        _ => return Err(anyhow!("sheduler_ctx_fat_ptr global not found")),
+    };
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut module_ctx = ctx.module().make_context();
+    let mut builder = FunctionBuilder::new(&mut module_ctx.func, &mut builder_ctx);
+
+    let entry = builder.create_block();
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+
+    let sched_gv = ctx
+        .module_mut()
+        .declare_data_in_func(sched_fat_id, &mut builder.func);
+    let sh_ctx_fat = builder.ins().global_value(ty, sched_gv);
+    let sh_ctx_start = builder.ins().load(ty, MemFlags::trusted(), sh_ctx_fat, 0);
+
+    // Read CURRENT_PROCESS, LAST_PROCESS_INDEX, REAL_COUNT, PROCESS_ARR_FAT.
+    let current_idx = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::CURRENT_PROCESS,
+    );
+    let last_idx = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::LAST_PROCESS_INDEX,
+    );
+    let real_count = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::REAL_COUNT_OF_PROCESSES,
+    );
+    let proc_arr_fat = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::PROCESS_ARR_FAT,
+    );
+    let proc_arr_start = builder.ins().load(ty, MemFlags::trusted(), proc_arr_fat, 0);
+
+    // proc_ctx fat-ptr to park = process_arr[current * 8]
+    let cur_off = builder.ins().ishl_imm(current_idx, 3);
+    let cur_addr = builder.ins().iadd(proc_arr_start, cur_off);
+    let proc_ctx = builder.ins().load(ty, MemFlags::trusted(), cur_addr, 0);
+
+    // swap-and-pop: process_arr[current] = process_arr[last]; LAST -= 1
+    let last_off = builder.ins().ishl_imm(last_idx, 3);
+    let last_addr = builder.ins().iadd(proc_arr_start, last_off);
+    let last_val = builder.ins().load(ty, MemFlags::trusted(), last_addr, 0);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), last_val, cur_addr, 0);
+    let new_last = builder.ins().iadd_imm(last_idx, -1);
+    builder.ins().store(
+        MemFlags::trusted(),
+        new_last,
+        sh_ctx_start,
+        ShedulerCtxLayout::LAST_PROCESS_INDEX,
+    );
+
+    // Reset CURRENT_PROCESS to 0 — same convention as remove_current_process.
+    let zero = builder.ins().iconst(ty, 0);
+    builder.ins().store(
+        MemFlags::trusted(),
+        zero,
+        sh_ctx_start,
+        ShedulerCtxLayout::CURRENT_PROCESS,
+    );
+
+    let new_real = builder.ins().iadd_imm(real_count, -1);
+    builder.ins().store(
+        MemFlags::trusted(),
+        new_real,
+        sh_ctx_start,
+        ShedulerCtxLayout::REAL_COUNT_OF_PROCESSES,
+    );
+
+    // Append proc_ctx to io_parked.  No grow here — we trust the cap is
+    // sufficient since process_arr can never hold more entries than its
+    // own cap, which is at least as large as IO_PARKED_CAP from setup.
+    // TODO: replace with a proper grow path when bench scales beyond 64
+    // simultaneously-parked actors.
+    let parked_fat = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::IO_PARKED_FAT,
+    );
+    let parked_start = builder.ins().load(ty, MemFlags::trusted(), parked_fat, 0);
+    let parked_count = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::IO_PARKED_COUNT,
+    );
+    let parked_off = builder.ins().ishl_imm(parked_count, 3);
+    let parked_dst = builder.ins().iadd(parked_start, parked_off);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), proc_ctx, parked_dst, 0);
+    let new_parked = builder.ins().iadd_imm(parked_count, 1);
+    builder.ins().store(
+        MemFlags::trusted(),
+        new_parked,
+        sh_ctx_start,
+        ShedulerCtxLayout::IO_PARKED_COUNT,
+    );
+
+    builder.ins().return_(&[]);
+
+    let sig = builder.func.signature.clone();
+    let id = ctx
+        .module_mut()
+        .declare_function("rt_io_park_current", Linkage::Export, &sig)?;
+    ctx.module_mut().define_function(id, &mut module_ctx)?;
+    ctx.module_mut().clear_context(&mut module_ctx);
+
+    Ok(ctx)
 }
 
 /// Build `rt_io_uring_poll_cq()` — drains all pending CQEs.  For each, reads

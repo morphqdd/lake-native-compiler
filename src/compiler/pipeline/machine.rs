@@ -16,6 +16,7 @@ use crate::compiler::{
 pub const STOP_DONE: i64 = -1; // process finished (no matching branch or explicit -1)
 pub const STOP_LIMIT: i64 = -2; // quantum exhausted; BLOCK_ID already stored in exec_ctx
 pub const STOP_WAIT: i64 = -3;
+pub const STOP_PARK: i64 = -4; // actor parked on I/O; slot vacated, BLOCK_ID already set
 
 /// Compile a single Lake machine to a Cranelift function.
 ///
@@ -54,11 +55,14 @@ pub fn compile_machine(ctx: &mut CompilerCtx, machine: &Machine<'_>, quantum: i6
     let quantum_stop_done_block = builder.create_block();
     let quantum_stop_limit_block = builder.create_block();
     let quantum_stop_wait_block = builder.create_block();
+    let quantum_stop_park_block = builder.create_block();
     let quantum_check_wait_block = builder.create_block();
+    let quantum_check_park_block = builder.create_block();
 
     builder.append_block_param(entry, ptr_ty);
     builder.append_block_param(quantum_continue_block, ptr_ty); // next_block_id
     builder.append_block_param(quantum_check_wait_block, ptr_ty); // next_block_id
+    builder.append_block_param(quantum_check_park_block, ptr_ty); // next_block_id
     builder.append_block_param(quantum_loop_block, ptr_ty); // next_block_id
 
     builder.switch_to_block(entry);
@@ -137,6 +141,18 @@ pub fn compile_machine(ctx: &mut CompilerCtx, machine: &Machine<'_>, quantum: i6
         is_wait,
         quantum_stop_wait_block,
         &[],
+        quantum_check_park_block,
+        &[BlockArg::Value(next_id)],
+    );
+
+    builder.switch_to_block(quantum_check_park_block);
+    let next_id = builder.block_params(quantum_check_park_block)[0];
+    let is_park = builder.ins().icmp_imm(IntCC::Equal, next_id, STOP_PARK);
+
+    builder.ins().brif(
+        is_park,
+        quantum_stop_park_block,
+        &[],
         quantum_loop_block,
         &[BlockArg::Value(next_id)],
     );
@@ -176,6 +192,10 @@ pub fn compile_machine(ctx: &mut CompilerCtx, machine: &Machine<'_>, quantum: i6
 
     builder.switch_to_block(quantum_stop_wait_block);
     let v = builder.ins().iconst(ptr_ty, STOP_WAIT);
+    builder.ins().return_(&[v]);
+
+    builder.switch_to_block(quantum_stop_park_block);
+    let v = builder.ins().iconst(ptr_ty, STOP_PARK);
     builder.ins().return_(&[v]);
 
     builder.seal_all_blocks();

@@ -10,9 +10,12 @@ use lake_frontend::api::expr::Expr;
 use crate::compiler::{
     ctx::CompilerCtx,
     hash_call_args,
-    pipeline::expr::{
-        BranchState, StmtOutcome, change_state_expr, compile_expr, dispatch, pure_expr, send_expr,
-        spawn_expr,
+    pipeline::{
+        expr::{
+            BranchState, StmtOutcome, change_state_expr, compile_expr, dispatch, pure_expr,
+            send_expr, spawn_expr,
+        },
+        machine::STOP_PARK,
     },
     rt::layout::ExecCtxLayout,
 };
@@ -161,6 +164,32 @@ pub fn compile(
             builder
                 .ins()
                 .call(store_ref, &[ctx_ptr, val, size, temp_offset]);
+        }
+
+        // Park-aware special case: `rt_io_park_current()` swaps the running
+        // actor out of process_arr and into io_parked.  The call itself is
+        // emitted normally above; here we override the post-call jump:
+        //   1. Store the resume block id (next_id + 1) into ExecCtx.BLOCK_ID
+        //      so the woken actor picks up where it left off.
+        //   2. Jump to quantum_continue with STOP_PARK as the next-id
+        //      marker; the dispatch chain turns that into a `return
+        //      STOP_PARK` from the machine, which the scheduler interprets
+        //      as "slot already vacated, just continue the loop".
+        if *callee_name == "rt_io_park_current" {
+            let resume_id = builder.ins().iconst(ptr_ty, next_id + 1);
+            let exec_start = ctx.exec_start(builder, machine_ctx_var);
+            builder.ins().store(
+                MemFlags::trusted(),
+                resume_id,
+                exec_start,
+                ExecCtxLayout::BLOCK_ID,
+            );
+            let park_marker = builder.ins().iconst(ptr_ty, STOP_PARK);
+            let qb = ctx.quantum_block();
+            builder.ins().jump(qb, &[BlockArg::Value(park_marker)]);
+
+            branch_switch.set_entry(next_id as u128, b);
+            return Ok(StmtOutcome::Continue(next_id + 1));
         }
 
         let done = builder.ins().iconst(ptr_ty, next_id + 1);

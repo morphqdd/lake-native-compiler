@@ -11,12 +11,12 @@ use anyhow::Result;
 use cranelift::{
     codegen::ir::BlockArg,
     module::Module,
-    prelude::{AbiParam, FunctionBuilder, InstBuilder, IntCC, TrapCode},
+    prelude::{AbiParam, FunctionBuilder, InstBuilder, IntCC, MemFlags, TrapCode},
 };
 
 use crate::compiler::{
     ctx::CompilerCtx,
-    pipeline::machine::{STOP_DONE, STOP_WAIT},
+    pipeline::machine::{STOP_DONE, STOP_PARK, STOP_WAIT},
     rt::layout::{process_ctx::ProcessCtxLayout, sheduler_ctx::ShedulerCtxLayout},
 };
 
@@ -48,6 +48,8 @@ pub fn build_scheduler(ctx: &mut CompilerCtx, builder: &mut FunctionBuilder) -> 
     builder.append_block_param(is_wait_block, ptr_ty);
     let go_to_wait_block = builder.create_block();
     let next_process_block = builder.create_block();
+    let is_park_block = builder.create_block();
+    builder.append_block_param(is_park_block, ptr_ty);
     let exit_block = builder.create_block();
 
     builder.ins().jump(loop_block, &[]);
@@ -70,9 +72,40 @@ pub fn build_scheduler(ctx: &mut CompilerCtx, builder: &mut FunctionBuilder) -> 
     builder.switch_to_block(check_waited_block);
     let waited = ShedulerCtxLayout::get_waited_processes(sh_ptr_var, ctx, builder)?;
     let has_waited = builder.ins().icmp_imm(IntCC::NotEqual, waited, 0);
+    let check_io_parked_block = builder.create_block();
     builder
         .ins()
-        .brif(has_waited, loop_block, &[], exit_block, &[]);
+        .brif(has_waited, loop_block, &[], check_io_parked_block, &[]);
+
+    // No runnable processes and no message-waiters — but if anyone is parked
+    // on I/O, block on `io_uring_enter(min_complete=1)` until at least one
+    // CQE arrives, then loop back and let `poll_cq` wake the lucky actor(s).
+    builder.switch_to_block(check_io_parked_block);
+    builder.seal_block(check_io_parked_block);
+    let sh_use = builder.use_var(sh_ptr_var);
+    // sh_use is the fat-ptr address; deref to get raw sh_ctx data start.
+    let sh_data = builder.ins().load(ptr_ty, MemFlags::trusted(), sh_use, 0);
+    let parked_count = builder.ins().load(
+        ptr_ty,
+        MemFlags::trusted(),
+        sh_data,
+        ShedulerCtxLayout::IO_PARKED_COUNT,
+    );
+    let has_parked = builder.ins().icmp_imm(IntCC::NotEqual, parked_count, 0);
+    let wait_io_block = builder.create_block();
+    builder
+        .ins()
+        .brif(has_parked, wait_io_block, &[], exit_block, &[]);
+
+    builder.switch_to_block(wait_io_block);
+    builder.seal_block(wait_io_block);
+    // Flush any residual pending submissions first so the kernel actually
+    // has work to complete.
+    let flush_ref0 = ctx.get_func(builder, "rt_io_uring_flush")?;
+    builder.ins().call(flush_ref0, &[]);
+    let wait_ref = ctx.get_func(builder, "rt_io_uring_wait_cqe")?;
+    builder.ins().call(wait_ref, &[]);
+    builder.ins().jump(loop_block, &[]);
 
     builder.switch_to_block(exec_block);
     let current = ShedulerCtxLayout::get_current_process(sh_ptr_var, ctx, builder)?;
@@ -106,9 +139,24 @@ pub fn build_scheduler(ctx: &mut CompilerCtx, builder: &mut FunctionBuilder) -> 
     builder.switch_to_block(is_wait_block);
     let stop_code = builder.block_params(is_wait_block)[0];
     let is_wait = builder.ins().icmp_imm(IntCC::Equal, stop_code, STOP_WAIT);
+    builder.ins().brif(
+        is_wait,
+        go_to_wait_block,
+        &[],
+        is_park_block,
+        &[BlockArg::Value(stop_code)],
+    );
+
+    builder.switch_to_block(is_park_block);
+    let stop_code = builder.block_params(is_park_block)[0];
+    let is_park = builder.ins().icmp_imm(IntCC::Equal, stop_code, STOP_PARK);
+    // Parked: slot already vacated by rt_io_park_current, BLOCK_ID already
+    // points at the resume location.  Just loop — scheduler picks the next
+    // active actor.  Otherwise (none of the special codes), advance via
+    // next_process_block.
     builder
         .ins()
-        .brif(is_wait, go_to_wait_block, &[], next_process_block, &[]);
+        .brif(is_park, loop_block, &[], next_process_block, &[]);
 
     builder.switch_to_block(go_to_wait_block);
     let process = ShedulerCtxLayout::get_current_process(sh_ptr_var, ctx, builder)?;
