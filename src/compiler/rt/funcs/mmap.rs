@@ -7,11 +7,16 @@ use cranelift::{
 use crate::compiler::ctx::CompilerCtx;
 
 const SYS_MMAP: i64 = 9;
+const SYS_MUNMAP: i64 = 11;
 const PROT_READ: i64 = 0x1;
 const PROT_WRITE: i64 = 0x2;
 const MAP_PRIVATE: i64 = 0x02;
 const MAP_ANONYMOUS: i64 = 0x20;
-const HEAP_SIZE: i64 = 16 * 1024 * 1024; // 16 MiB
+const MAP_NORESERVE: i64 = 0x4000;
+// 4 GiB virtual reservation. Anonymous private + MAP_NORESERVE = lazy-commit:
+// kernel allocates page-table entries on first touch only, so RSS stays at 0
+// until actually used. Costs only address space (free on 64-bit).
+const HEAP_SIZE: i64 = 4i64 * 1024 * 1024 * 1024;
 
 /// Build `rt_mmap(size: i64) -> i64` and declare the three heap globals
 /// (`heap_base`, `heap_curr`, `heap_end`).
@@ -29,11 +34,13 @@ pub fn define_mmap(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     }
 
     // ── Free-list heads ──────────────────────────────────────────────────────
-    // 9 buckets indexed by `ceil(log2(max(size, 16))) - 4`, covering payload
-    // sizes 16..=4096 in powers of two.  Each entry is a fat-pointer address
-    // (or 0 = empty) — pop/push at the head of an intrusive linked list whose
-    // `next` link is stored at offset 0 of the freed block's payload.
-    // Larger allocations (> 4096) bypass the free list (current TODO: leak).
+    // 21 buckets indexed by `ceil(log2(max(size, 16))) - 4`, covering payload
+    // sizes 16 B..=16 MiB in powers of two.  Each entry is a fat-pointer
+    // address (or 0 = empty) — pop/push at the head of an intrusive linked
+    // list whose `next` link is stored at offset 0 of the freed block's
+    // payload.  Allocations larger than 16 MiB take the direct-mmap path:
+    // they bypass the bump heap entirely and are unmapped on free, so they
+    // never leak.
     let free_list_id = ctx.module_mut().declare_data(
         "free_list_heads",
         Linkage::Export,
@@ -41,7 +48,7 @@ pub fn define_mmap(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         false,
     )?;
     let mut free_list_desc = DataDescription::new();
-    free_list_desc.define_zeroinit(9 * 8);
+    free_list_desc.define_zeroinit(21 * 8);
     ctx.module_mut().define_data(free_list_id, &free_list_desc)?;
 
     // ── rt_mmap function ──────────────────────────────────────────────────────
@@ -70,7 +77,9 @@ pub fn define_mmap(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let sys_mmap = builder.ins().iconst(ty, SYS_MMAP);
     let addr = builder.ins().iconst(ty, 0);
     let prot = builder.ins().iconst(ty, PROT_READ | PROT_WRITE);
-    let flags = builder.ins().iconst(ty, MAP_ANONYMOUS | MAP_PRIVATE);
+    let flags = builder
+        .ins()
+        .iconst(ty, MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE);
     let fd = builder.ins().iconst(ty, -1i64);
     let offset = builder.ins().iconst(ty, 0);
 
@@ -84,6 +93,57 @@ pub fn define_mmap(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let id = ctx
         .module_mut()
         .declare_function("rt_mmap", Linkage::Export, &sig)?;
+    ctx.module_mut().define_function(id, &mut module_ctx)?;
+    ctx.module_mut().clear_context(&mut module_ctx);
+
+    Ok(ctx)
+}
+
+/// Build `rt_munmap(addr: i64, size: i64)` — releases an mmap'd region.
+///
+/// Used by the huge-allocation path in `rt_free` to return oversized
+/// (> MAX_BUCKET_SIZE) payloads to the kernel.  The fat-pointer header
+/// itself lives in the regular bump heap and is recycled separately.
+pub fn define_munmap(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
+    let ty = ctx.module().target_config().pointer_type();
+
+    let syscall_id = match ctx.module().get_name("rt_syscall") {
+        Some(FuncOrDataId::Func(id)) => id,
+        _ => return Err(anyhow!("rt_syscall must be declared before rt_munmap")),
+    };
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut module_ctx = ctx.module().make_context();
+    let mut builder = FunctionBuilder::new(&mut module_ctx.func, &mut builder_ctx);
+
+    builder.func.signature.params.push(AbiParam::new(ty));
+    builder.func.signature.params.push(AbiParam::new(ty));
+
+    let entry = builder.create_block();
+    builder.append_block_param(entry, ty);
+    builder.append_block_param(entry, ty);
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+
+    let syscall_ref = ctx
+        .module_mut()
+        .declare_func_in_func(syscall_id, &mut builder.func);
+
+    let addr = builder.block_params(entry)[0];
+    let length = builder.block_params(entry)[1];
+    let sys_munmap = builder.ins().iconst(ty, SYS_MUNMAP);
+    let zero = builder.ins().iconst(ty, 0);
+
+    // rt_syscall takes 7 fixed args; munmap uses only nr+addr+length.
+    let _ = builder
+        .ins()
+        .call(syscall_ref, &[sys_munmap, addr, length, zero, zero, zero, zero]);
+    builder.ins().return_(&[]);
+
+    let sig = builder.func.signature.clone();
+    let id = ctx
+        .module_mut()
+        .declare_function("rt_munmap", Linkage::Export, &sig)?;
     ctx.module_mut().define_function(id, &mut module_ctx)?;
     ctx.module_mut().clear_context(&mut module_ctx);
 

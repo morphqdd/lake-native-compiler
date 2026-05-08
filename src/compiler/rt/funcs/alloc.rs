@@ -15,11 +15,13 @@ use crate::compiler::{ctx::CompilerCtx, rt::layout::FatPtrLayout};
 /// Returns a **fat-pointer address** to the start of a header `{start, end}`
 /// where `[start..end)` is the usable payload region of length ≥ `size`.
 ///
-/// The allocator tries the free-list first (size-class bucket), falling back
-/// to bump allocation in the 16 MiB heap region.  Buckets are powers of two
-/// from 16 up to 4096 (9 buckets).  Allocations larger than 4096 bypass the
-/// free list and bump-allocate the requested size directly — they cannot be
-/// recycled (TODO).
+/// Three-tier strategy:
+///   * **Small (≤ 16 MiB):** size-class buckets (powers of two from 16 to
+///     16 MiB, 21 buckets).  Hot path is `freelist_pop` → O(1) recycling.
+///     If empty, bump-allocate from the heap.
+///   * **Huge (> 16 MiB):** call `rt_mmap` directly for the payload, then
+///     allocate a 16 B fat-pointer header from bucket 0.  Returned to the
+///     kernel via `rt_munmap` on free — cannot leak.
 pub fn define_allocate(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let ty = ctx.module().target_config().pointer_type();
 
@@ -36,6 +38,11 @@ pub fn define_allocate(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         _ => return Err(anyhow!(
             "Heap globals + free_list_heads must be declared before rt_allocate"
         )),
+    };
+
+    let mmap_id = match ctx.module().get_name("rt_mmap") {
+        Some(FuncOrDataId::Func(id)) => id,
+        _ => return Err(anyhow!("rt_mmap must be declared before rt_allocate")),
     };
 
     let mut builder_ctx = FunctionBuilderContext::new();
@@ -66,9 +73,13 @@ pub fn define_allocate(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let heap_end_ptr = builder.ins().global_value(ty, heap_end_gv);
     let free_list_ptr = builder.ins().global_value(ty, free_list_gv);
 
+    let mmap_ref = ctx
+        .module_mut()
+        .declare_func_in_func(mmap_id, &mut builder.func);
+
     // ── Compute bucket index = ceil(log2(max(size, 16))) - 4 ────────────────
-    // For sizes 16/32/64/128/256/512/1024/2048/4096 → buckets 0..8.
-    // For oversized > 4096 → bucket > 8 → bypass the free list.
+    // Sizes 16 / 32 / … / 16 MiB → buckets 0..20.
+    // For huge (> 16 MiB) → bucket > 20 → take the direct-mmap path.
     let sixteen = builder.ins().iconst(ty, 16);
     let lt_min = builder
         .ins()
@@ -86,8 +97,8 @@ pub fn define_allocate(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let one = builder.ins().iconst(ty, 1);
     let bucket_size = builder.ins().ishl(one, bucket_log);
 
-    // in_range = bucket_idx <= 8
-    let max_bucket = builder.ins().iconst(ty, 8);
+    // in_range = bucket_idx <= 20  (i.e. bucket_size <= 16 MiB)
+    let max_bucket = builder.ins().iconst(ty, 20);
     let in_range = builder
         .ins()
         .icmp(IntCC::UnsignedLessThanOrEqual, bucket_idx, max_bucket);
@@ -95,18 +106,20 @@ pub fn define_allocate(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     // ── Block layout ─────────────────────────────────────────────────────────
     // try_pop_block:    head = free_list[bucket]; if head != 0 jump pop_block
     // pop_block:        unlink head, jump merge_block(head)
-    // bump_block:       bump-allocate (size = bucket_size when in_range, else user_size)
+    // bump_block:       bump-allocate bucket_size from heap (in-range only)
+    // huge_block:       direct mmap path for size > MAX_BUCKET_SIZE
     // merge_block(fp):  return fp
     let try_pop_block = builder.create_block();
     let pop_block = builder.create_block();
     let bump_block = builder.create_block();
+    let huge_block = builder.create_block();
     let merge_block = builder.create_block();
     builder.append_block_param(merge_block, ty);
 
-    // Decide try-pop vs bump up front based on `in_range`.
+    // Decide in-range (try freelist → bump) vs huge (direct mmap) up front.
     builder
         .ins()
-        .brif(in_range, try_pop_block, &[], bump_block, &[]);
+        .brif(in_range, try_pop_block, &[], huge_block, &[]);
 
     // ── try_pop_block ────────────────────────────────────────────────────────
     builder.switch_to_block(try_pop_block);
@@ -136,12 +149,12 @@ pub fn define_allocate(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .ins()
         .jump(merge_block, &[BlockArg::Value(head)]);
 
-    // ── bump_block: classic bump allocation ─────────────────────────────────
+    // ── bump_block: classic bump allocation (in-range only) ─────────────────
     builder.switch_to_block(bump_block);
     builder.seal_block(bump_block);
 
-    // Use bucket_size when in_range, user_size when oversized.
-    let alloc_size = builder.ins().select(in_range, bucket_size, user_size);
+    // Always bucket_size — huge allocations took the mmap path before this.
+    let alloc_size = bucket_size;
 
     let heap_curr_addr = builder
         .ins()
@@ -187,6 +200,41 @@ pub fn define_allocate(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .ins()
         .jump(merge_block, &[BlockArg::Value(heap_curr_addr)]);
 
+    // ── huge_block: direct mmap for sizes > 16 MiB ──────────────────────────
+    // Layout of the mmap region:
+    //   [16 B fat-ptr {start, end}]  [16 B align pad]  [user payload]  [tail to page]
+    //                ▲                                ▲
+    //             fat_ptr_addr                    fat_ptr.start (= addr + 32)
+    // fat_ptr.end = mmap_addr + mmap_size — this lets `rt_free` recover the
+    // exact mmap_size as `end - fat_ptr_addr` to pass to `rt_munmap`.
+    builder.switch_to_block(huge_block);
+    builder.seal_block(huge_block);
+
+    // mmap_size = round_up(user_size + 32, 4096)
+    let pre_payload = builder.ins().iconst(ty, 32);
+    let total = builder.ins().iadd(user_size, pre_payload);
+    let page_minus_one = builder.ins().iconst(ty, 4095);
+    let page_mask = builder.ins().iconst(ty, !4095i64);
+    let total_round = builder.ins().iadd(total, page_minus_one);
+    let mmap_size = builder.ins().band(total_round, page_mask);
+
+    let call_mmap = builder.ins().call(mmap_ref, &[mmap_size]);
+    let mmap_addr = builder.inst_results(call_mmap)[0];
+
+    let payload_start = builder.ins().iadd(mmap_addr, pre_payload);
+    let payload_end = builder.ins().iadd(mmap_addr, mmap_size);
+
+    builder
+        .ins()
+        .store(MemFlags::trusted(), payload_start, mmap_addr, 0);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), payload_end, mmap_addr, 8);
+
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(mmap_addr)]);
+
     // ── merge_block: return the fat-pointer address ─────────────────────────
     builder.switch_to_block(merge_block);
     builder.seal_block(merge_block);
@@ -204,16 +252,14 @@ pub fn define_allocate(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
 /// Build `rt_free(fat_ptr_addr: i64)`.
 ///
-/// Reads the fat-pointer header to determine size, computes its bucket index,
-/// and prepends the block to the free-list at that bucket.  The intrusive
-/// next-pointer is stored at offset 0 of the payload.  Allocations whose
-/// payload size > 4096 (bucket > 8) are leaked — we have no fall-back unmap.
-///
-/// All fat-pointers in Lake's runtime are heap-allocated via `rt_allocate`
-/// (including the main process's resources after refactor); there are no
-/// statically-defined fat-pointers reaching this function.  Future opt-in
-/// `@static` machines will avoid `rt_allocate` entirely so they never reach
-/// `rt_free` either.
+/// Reads the fat-pointer header to determine size and dispatches:
+///   * **In-range (bucket ≤ 20, ≤ 16 MiB):** prepend to `free_list[bucket]`.
+///     The intrusive next-pointer is stored at offset 0 of the payload.
+///   * **Huge (bucket > 20):** call `rt_munmap` on the entire mmap region.
+///     `mmap_size = end - fat_ptr_addr` recovers the original mapping span
+///     (see `define_allocate` huge_block layout).  The fat-pointer struct
+///     itself lives at the start of the mapping, so it disappears with the
+///     unmap — no separate free-list push needed.
 pub fn define_free(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let ty = ctx.module().target_config().pointer_type();
 
@@ -224,6 +270,11 @@ pub fn define_free(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
                 "free_list_heads must be declared before rt_free"
             ));
         }
+    };
+
+    let munmap_id = match ctx.module().get_name("rt_munmap") {
+        Some(FuncOrDataId::Func(id)) => id,
+        _ => return Err(anyhow!("rt_munmap must be declared before rt_free")),
     };
 
     let mut builder_ctx = FunctionBuilderContext::new();
@@ -243,6 +294,10 @@ pub fn define_free(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .module_mut()
         .declare_data_in_func(free_list_id, &mut builder.func);
     let free_list_ptr = builder.ins().global_value(ty, free_list_gv);
+
+    let munmap_ref = ctx
+        .module_mut()
+        .declare_func_in_func(munmap_id, &mut builder.func);
 
     // Read fat_ptr.start and fat_ptr.end to compute payload size.
     let payload_start = builder
@@ -265,16 +320,16 @@ pub fn define_free(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let log2_ceil = builder.ins().isub(total_bits, lz);
     let bucket_idx = builder.ins().iadd_imm(log2_ceil, -4);
 
-    let max_bucket = builder.ins().iconst(ty, 8);
+    let max_bucket = builder.ins().iconst(ty, 20);
     let in_range = builder
         .ins()
         .icmp(IntCC::UnsignedLessThanOrEqual, bucket_idx, max_bucket);
 
     let push_block = builder.create_block();
-    let leak_block = builder.create_block();
+    let huge_free_block = builder.create_block();
     builder
         .ins()
-        .brif(in_range, push_block, &[], leak_block, &[]);
+        .brif(in_range, push_block, &[], huge_free_block, &[]);
 
     // ── push_block: prepend fat_ptr_addr to free_list[bucket] ────────────────
     builder.switch_to_block(push_block);
@@ -292,9 +347,16 @@ pub fn define_free(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .store(MemFlags::trusted(), fat_ptr_addr, head_addr, 0);
     builder.ins().return_(&[]);
 
-    // ── leak_block: oversized — drop on the floor (TODO) ─────────────────────
-    builder.switch_to_block(leak_block);
-    builder.seal_block(leak_block);
+    // ── huge_free_block: munmap the whole region ────────────────────────────
+    // mmap_size = end - fat_ptr_addr (see allocate huge_block layout).  The
+    // fat-pointer struct lives at the start of the mapping, so a single
+    // munmap releases header + payload together.
+    builder.switch_to_block(huge_free_block);
+    builder.seal_block(huge_free_block);
+    let mmap_size = builder.ins().isub(payload_end, fat_ptr_addr);
+    builder
+        .ins()
+        .call(munmap_ref, &[fat_ptr_addr, mmap_size]);
     builder.ins().return_(&[]);
 
     let sig = builder.func.signature.clone();
