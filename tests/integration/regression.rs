@@ -69,15 +69,11 @@ fn allocator_recycles_via_freelist() {
     );
 }
 
-/// Dynamic queue regression: spawn more actors than the static 256-slot
-/// process_arr cap to confirm the scheduler's queue grows on demand.
-///
-/// Currently ignored — the queue is statically sized at 256 slots and writing
-/// past the end silently corrupts memory.  Will be un-ignored once tasks
-/// #38-#41 land (PROCESS_ARR_CAP field + grow on append).
+/// Dynamic queue: spawn more actors than the initial 256-slot process_arr
+/// capacity to confirm the scheduler's queue grows on demand (doubles each
+/// time, copying the old payload via inline loop, freeing the old buffer).
 #[test]
-#[ignore = "needs dynamic queue grow (#38-#41)"]
-fn scheduler_queue_grows_past_static_cap() {
+fn scheduler_queue_grows_past_initial_cap() {
     let src = r#"
         @rt(rt_write)
         worker is { _ -> { rt_write(1 "y" 1) } }

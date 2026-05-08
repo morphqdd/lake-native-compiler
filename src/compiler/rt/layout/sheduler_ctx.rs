@@ -22,13 +22,13 @@ impl ShedulerCtxLayout {
     pub fn declare_globals(ctx: &mut CompilerCtx) -> Result<()> {
         let module = ctx.module_mut();
 
+        // process_arr / wait_arr now live on the heap (allocated via
+        // rt_allocate in `init`) so they can grow on demand — no static
+        // backing buffers here.  The scheduler context itself remains a
+        // single static struct to avoid a chicken-and-egg with the heap.
         for (name, size) in [
             ("sheduler_ctx", Self::SIZE as usize),
             ("sheduler_ctx_fat_ptr", FatPtrLayout::SIZE),
-            ("process_arr", 256 * 8),
-            ("process_arr_fat_ptr", FatPtrLayout::SIZE),
-            ("wait_arr", 256 * 8),
-            ("wait_arr_fat_ptr", FatPtrLayout::SIZE),
         ] {
             let id = module.declare_data(name, Linkage::Export, true, false)?;
             let mut desc = DataDescription::new();
@@ -38,7 +38,7 @@ impl ShedulerCtxLayout {
         Ok(())
     }
 
-    pub const SIZE: i32 = 72;
+    pub const SIZE: i32 = 88;
     pub const PROCESS_ARR_FAT: i32 = 0;
     pub const CURRENT_PROCESS: i32 = 8;
     pub const LAST_PROCESS_INDEX: i32 = 16;
@@ -48,8 +48,14 @@ impl ShedulerCtxLayout {
     pub const WAIT_ARR_FAT: i32 = 48;
     pub const LAST_WAITED_PROCESS_INDEX: i32 = 56;
     pub const WAITED_PROCESS_COUNT: i32 = 64;
+    /// Current capacity (in slots) of `process_arr`.  Doubles when the queue
+    /// reaches the cap; the old buffer is freed back to the allocator.
+    pub const PROCESS_ARR_CAP: i32 = 72;
+    /// Current capacity (in slots) of `wait_arr`.  Same growth strategy.
+    pub const WAIT_ARR_CAP: i32 = 80;
 
     pub const REDUCTION_LIMIT_VALUE: i64 = 1000;
+    pub const INITIAL_QUEUE_CAP: i64 = 256;
 
     pub fn init(
         ctx: &mut crate::compiler::ctx::CompilerCtx,
@@ -59,6 +65,7 @@ impl ShedulerCtxLayout {
         let ptr_size = builder.ins().iconst(ptr_ty, ptr_ty.bytes() as i64);
         let rt_funcs = ctx.rt_funcs().clone();
         let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
+        let allocate_ref = rt_funcs.allocate_ref(ctx.module_mut(), builder);
 
         let (_, sh_ctx_ptr) = get_static_buffer(
             ctx,
@@ -68,20 +75,38 @@ impl ShedulerCtxLayout {
             ShedulerCtxLayout::SIZE as usize,
         )?;
 
-        let (_, process_arr_ptr) = get_static_buffer(ctx, builder, ptr_ty, "process_arr", 256 * 8)?;
-
+        // process_arr — heap-allocated fat-ptr that grows on demand.
+        let init_bytes = builder.ins().iconst(ptr_ty, Self::INITIAL_QUEUE_CAP * 8);
+        let call_pa = builder.ins().call(allocate_ref, &[init_bytes]);
+        let process_arr_ptr = builder.inst_results(call_pa)[0];
         let process_arr_offset = builder.ins().iconst(ptr_ty, Self::PROCESS_ARR_FAT as i64);
         builder.ins().call(
             store_ref,
             &[sh_ctx_ptr, process_arr_ptr, ptr_size, process_arr_offset],
         );
 
-        let (_, wait_arr_ptr) = get_static_buffer(ctx, builder, ptr_ty, "wait_arr", 256 * 8)?;
+        let init_cap = builder.ins().iconst(ptr_ty, Self::INITIAL_QUEUE_CAP);
+        let process_cap_offset = builder.ins().iconst(ptr_ty, Self::PROCESS_ARR_CAP as i64);
+        builder.ins().call(
+            store_ref,
+            &[sh_ctx_ptr, init_cap, ptr_size, process_cap_offset],
+        );
 
+        // wait_arr — same growth strategy as process_arr.
+        let init_bytes = builder.ins().iconst(ptr_ty, Self::INITIAL_QUEUE_CAP * 8);
+        let call_wa = builder.ins().call(allocate_ref, &[init_bytes]);
+        let wait_arr_ptr = builder.inst_results(call_wa)[0];
         let wait_arr_offset = builder.ins().iconst(ptr_ty, Self::WAIT_ARR_FAT as i64);
         builder.ins().call(
             store_ref,
             &[sh_ctx_ptr, wait_arr_ptr, ptr_size, wait_arr_offset],
+        );
+
+        let init_cap = builder.ins().iconst(ptr_ty, Self::INITIAL_QUEUE_CAP);
+        let wait_cap_offset = builder.ins().iconst(ptr_ty, Self::WAIT_ARR_CAP as i64);
+        builder.ins().call(
+            store_ref,
+            &[sh_ctx_ptr, init_cap, ptr_size, wait_cap_offset],
         );
 
         let reduction_limit = builder.ins().iconst(ptr_ty, Self::REDUCTION_LIMIT_VALUE);
@@ -497,10 +522,6 @@ impl ShedulerCtxLayout {
         let ptr_size = builder.ins().iconst(ptr_ty, ptr_ty.bytes() as i64);
         let sh_ctx_ptr = builder.use_var(sh_ptr_var);
 
-        let offset = builder.ins().iconst(ptr_ty, Self::WAIT_ARR_FAT as i64);
-        let call_wait_arr = builder.ins().call(load_ref, &[sh_ctx_ptr, offset]);
-        let wait_arr = builder.inst_results(call_wait_arr)[0];
-
         let offset_last_i = builder
             .ins()
             .iconst(ptr_ty, Self::LAST_WAITED_PROCESS_INDEX as i64);
@@ -508,6 +529,17 @@ impl ShedulerCtxLayout {
         let last_process_index = builder.inst_results(call_last_index)[0];
         let next_process_index = builder.ins().iadd_imm(last_process_index, 1);
         let aligned_index = builder.ins().imul_imm(next_process_index, 8);
+
+        // Grow wait_arr if next_index would exceed cap; use the (possibly
+        // new) fat-ptr returned for the store below.
+        let wait_arr = Self::emit_grow_array_if_full(
+            sh_ctx_ptr,
+            Self::WAIT_ARR_FAT,
+            Self::WAIT_ARR_CAP,
+            next_process_index,
+            ctx,
+            builder,
+        );
 
         builder.ins().call(
             store_ref,
@@ -535,6 +567,119 @@ impl ShedulerCtxLayout {
 
         Ok(())
     }
+    /// If the array referenced by `(fat_offset, cap_offset)` in the scheduler
+    /// context cannot fit a slot at `next_index`, grow it to 2× capacity:
+    /// allocate a new buffer via `rt_allocate`, copy the first `next_index`
+    /// slots (8 bytes each) from old to new, free the old fat-ptr, and update
+    /// both the FAT and CAP fields in `sh_ctx`.
+    ///
+    /// Returns the array fat-ptr to use for the subsequent store — this is
+    /// either the original (no grow) or the freshly-allocated one.  Callers
+    /// **must** use the returned value; any previously-loaded fat-ptr may
+    /// dangle once `rt_free(old)` runs.
+    fn emit_grow_array_if_full(
+        sh_ctx_ptr: Value,
+        fat_offset: i32,
+        cap_offset: i32,
+        next_index: Value,
+        ctx: &mut CompilerCtx,
+        builder: &mut FunctionBuilder,
+    ) -> Value {
+        let ptr_ty = ctx.module().target_config().pointer_type();
+        let rt_funcs = ctx.rt_funcs().clone();
+        let load_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
+        let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
+        let allocate_ref = rt_funcs.allocate_ref(ctx.module_mut(), builder);
+        let free_ref = rt_funcs.free_ref(ctx.module_mut(), builder);
+        let ptr_size = builder.ins().iconst(ptr_ty, ptr_ty.bytes() as i64);
+
+        let cap_off_v = builder.ins().iconst(ptr_ty, cap_offset as i64);
+        let call_cap = builder.ins().call(load_ref, &[sh_ctx_ptr, cap_off_v]);
+        let cap = builder.inst_results(call_cap)[0];
+
+        let fat_off_v = builder.ins().iconst(ptr_ty, fat_offset as i64);
+        let call_fat = builder.ins().call(load_ref, &[sh_ctx_ptr, fat_off_v]);
+        let old_fat = builder.inst_results(call_fat)[0];
+
+        let need_grow = builder
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, next_index, cap);
+
+        let grow_block = builder.create_block();
+        let no_grow_block = builder.create_block();
+        let merge_block = builder.create_block();
+        builder.append_block_param(merge_block, ptr_ty);
+
+        builder
+            .ins()
+            .brif(need_grow, grow_block, &[], no_grow_block, &[]);
+
+        // ── no_grow_block: pass old_fat through ─────────────────────────────
+        builder.switch_to_block(no_grow_block);
+        builder.seal_block(no_grow_block);
+        builder
+            .ins()
+            .jump(merge_block, &[BlockArg::Value(old_fat)]);
+
+        // ── grow_block: alloc 2× → copy → free → update fields ──────────────
+        builder.switch_to_block(grow_block);
+        builder.seal_block(grow_block);
+
+        let new_cap = builder.ins().ishl_imm(cap, 1);
+        let alloc_bytes = builder.ins().ishl_imm(new_cap, 3);
+        let call_alloc = builder.ins().call(allocate_ref, &[alloc_bytes]);
+        let new_fat = builder.inst_results(call_alloc)[0];
+
+        // Copy first `next_index` slots (8 bytes each) old → new via inline loop.
+        let old_start = builder.ins().load(ptr_ty, MemFlags::trusted(), old_fat, 0);
+        let new_start = builder.ins().load(ptr_ty, MemFlags::trusted(), new_fat, 0);
+
+        let copy_header = builder.create_block();
+        let copy_body = builder.create_block();
+        let copy_done = builder.create_block();
+        builder.append_block_param(copy_header, ptr_ty);
+
+        let zero = builder.ins().iconst(ptr_ty, 0);
+        builder.ins().jump(copy_header, &[BlockArg::Value(zero)]);
+
+        builder.switch_to_block(copy_header);
+        let i = builder.block_params(copy_header)[0];
+        let cmp = builder.ins().icmp(IntCC::UnsignedLessThan, i, next_index);
+        builder.ins().brif(cmp, copy_body, &[], copy_done, &[]);
+
+        builder.switch_to_block(copy_body);
+        builder.seal_block(copy_body);
+        let off = builder.ins().ishl_imm(i, 3);
+        let src_addr = builder.ins().iadd(old_start, off);
+        let dst_addr = builder.ins().iadd(new_start, off);
+        let val = builder.ins().load(ptr_ty, MemFlags::trusted(), src_addr, 0);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), val, dst_addr, 0);
+        let i_next = builder.ins().iadd_imm(i, 1);
+        builder.ins().jump(copy_header, &[BlockArg::Value(i_next)]);
+
+        builder.switch_to_block(copy_done);
+        builder.seal_block(copy_done);
+        builder.seal_block(copy_header);
+
+        builder.ins().call(free_ref, &[old_fat]);
+        builder
+            .ins()
+            .call(store_ref, &[sh_ctx_ptr, new_fat, ptr_size, fat_off_v]);
+        builder
+            .ins()
+            .call(store_ref, &[sh_ctx_ptr, new_cap, ptr_size, cap_off_v]);
+
+        builder
+            .ins()
+            .jump(merge_block, &[BlockArg::Value(new_fat)]);
+
+        builder.switch_to_block(merge_block);
+        builder.seal_block(merge_block);
+        builder.block_params(merge_block)[0]
+    }
+
     pub fn new_process(
         sh_ctx_ptr: Value,
         process_ctx_ptr: Value,
@@ -547,10 +692,6 @@ impl ShedulerCtxLayout {
         let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
         let ptr_size = builder.ins().iconst(ptr_ty, ptr_ty.bytes() as i64);
 
-        let offset = builder.ins().iconst(ptr_ty, Self::PROCESS_ARR_FAT as i64);
-        let call_process_arr = builder.ins().call(load_ref, &[sh_ctx_ptr, offset]);
-        let process_arr = builder.inst_results(call_process_arr)[0];
-
         let offset_last_i = builder
             .ins()
             .iconst(ptr_ty, Self::LAST_PROCESS_INDEX as i64);
@@ -558,6 +699,17 @@ impl ShedulerCtxLayout {
         let last_process_index = builder.inst_results(call_last_index)[0];
         let next_process_index = builder.ins().iadd_imm(last_process_index, 1);
         let aligned_index = builder.ins().imul_imm(next_process_index, 8);
+
+        // Grow process_arr if next_index would exceed cap; use the (possibly
+        // new) fat-ptr returned from the helper for the store below.
+        let process_arr = Self::emit_grow_array_if_full(
+            sh_ctx_ptr,
+            Self::PROCESS_ARR_FAT,
+            Self::PROCESS_ARR_CAP,
+            next_process_index,
+            ctx,
+            builder,
+        );
 
         builder.ins().call(
             store_ref,
