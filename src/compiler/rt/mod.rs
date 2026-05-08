@@ -11,6 +11,7 @@ use crate::compiler::{
         funcs::{
             alloc::{define_allocate, define_free, define_loads, define_store},
             exit::define_exit,
+            io_uring::define_io_uring_setup,
             mmap::{define_init_heap, define_mmap, define_munmap},
             read::define_read,
             strings::{define_len, define_to_string, define_to_string_with_ln},
@@ -46,6 +47,8 @@ impl RuntimeBuilder {
         let ctx = define_munmap(ctx)?;
         debug!("rt: rt_init_heap");
         let ctx = define_init_heap(ctx)?;
+        debug!("rt: rt_io_uring_setup (stub)");
+        let ctx = define_io_uring_setup(ctx)?;
         debug!("rt: rt_allocate");
         let ctx = define_allocate(ctx)?;
         debug!("rt: rt_free");
