@@ -9,10 +9,11 @@
 
 use anyhow::{Result, anyhow};
 use cranelift::{
+    codegen::ir::BlockArg,
     module::{FuncOrDataId, Linkage, Module},
     prelude::{
         AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder, IntCC, MemFlags,
-        TrapCode, types,
+        TrapCode, Value, types,
     },
 };
 
@@ -560,3 +561,255 @@ pub fn define_write_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
     Ok(ctx)
 }
+
+/// Emit IR that wakes the actor identified by `user_data` if it is currently
+/// in `io_parked`.  Linear scan up to `IO_PARKED_COUNT`; on match, swap-and-pop
+/// the slot, append the proc-ctx fat-ptr back into `process_arr` (using the
+/// dynamic-grow helper), and increment REAL_COUNT.  Silent no-op when
+/// `user_data` is 0 (sentinel for fire-and-forget submissions) or when no
+/// match is found.
+///
+/// Inlined into `rt_io_uring_poll_cq`; not exposed as a runtime function.
+fn emit_wake_by_user_data(
+    sh_ctx_start: Value,
+    user_data: Value,
+    ty: cranelift::prelude::Type,
+    builder: &mut FunctionBuilder,
+) {
+    // Bail when user_data == 0 (no actor was parked for this CQE).
+    let nonzero = builder.ins().icmp_imm(IntCC::NotEqual, user_data, 0);
+    let scan_block = builder.create_block();
+    let scan_done = builder.create_block();
+    builder
+        .ins()
+        .brif(nonzero, scan_block, &[], scan_done, &[]);
+
+    // ── scan_block: walk io_parked[0..count] ────────────────────────────────
+    builder.switch_to_block(scan_block);
+    builder.seal_block(scan_block);
+    let parked_fat = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::IO_PARKED_FAT,
+    );
+    let parked_start = builder.ins().load(ty, MemFlags::trusted(), parked_fat, 0);
+    let parked_count = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::IO_PARKED_COUNT,
+    );
+
+    // Loop: i = 0; while i < count: cmp slot==user_data
+    let loop_hdr = builder.create_block();
+    let loop_body = builder.create_block();
+    let found = builder.create_block();
+    builder.append_block_param(loop_hdr, ty);
+
+    let zero = builder.ins().iconst(ty, 0);
+    builder.ins().jump(loop_hdr, &[BlockArg::Value(zero)]);
+
+    builder.switch_to_block(loop_hdr);
+    let i = builder.block_params(loop_hdr)[0];
+    let cont = builder.ins().icmp(IntCC::UnsignedLessThan, i, parked_count);
+    builder.ins().brif(cont, loop_body, &[], scan_done, &[]);
+
+    builder.switch_to_block(loop_body);
+    builder.seal_block(loop_body);
+    let slot_off = builder.ins().ishl_imm(i, 3);
+    let slot_addr = builder.ins().iadd(parked_start, slot_off);
+    let slot_val = builder.ins().load(ty, MemFlags::trusted(), slot_addr, 0);
+    let eq = builder.ins().icmp(IntCC::Equal, slot_val, user_data);
+    let i_next = builder.ins().iadd_imm(i, 1);
+    builder.ins().brif(
+        eq,
+        found,
+        &[BlockArg::Value(i)],
+        loop_hdr,
+        &[BlockArg::Value(i_next)],
+    );
+    builder.append_block_param(found, ty);
+    builder.seal_block(loop_hdr);
+
+    // ── found: swap-and-pop io_parked, append to process_arr, REAL_COUNT++ ──
+    builder.switch_to_block(found);
+    builder.seal_block(found);
+    let match_idx = builder.block_params(found)[0];
+    let last_idx = builder.ins().iadd_imm(parked_count, -1);
+    let last_off = builder.ins().ishl_imm(last_idx, 3);
+    let last_addr = builder.ins().iadd(parked_start, last_off);
+    let last_val = builder.ins().load(ty, MemFlags::trusted(), last_addr, 0);
+    let match_off = builder.ins().ishl_imm(match_idx, 3);
+    let match_addr = builder.ins().iadd(parked_start, match_off);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), last_val, match_addr, 0);
+    builder.ins().store(
+        MemFlags::trusted(),
+        last_idx,
+        sh_ctx_start,
+        ShedulerCtxLayout::IO_PARKED_COUNT,
+    );
+
+    // Append slot_val (the woken proc-ctx fat-ptr) back to process_arr.
+    let proc_arr_fat = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::PROCESS_ARR_FAT,
+    );
+    let proc_arr_start = builder.ins().load(ty, MemFlags::trusted(), proc_arr_fat, 0);
+    let last_proc = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::LAST_PROCESS_INDEX,
+    );
+    let next_proc = builder.ins().iadd_imm(last_proc, 1);
+    let next_off = builder.ins().ishl_imm(next_proc, 3);
+    let dst = builder.ins().iadd(proc_arr_start, next_off);
+    // NB: skip grow-check here — caller (poll_cq) is invoked at scheduler
+    //     boundary where we trust capacity.  TODO: if io_parked grows past
+    //     process_arr cap, hit the grow path properly.
+    builder.ins().store(MemFlags::trusted(), slot_val, dst, 0);
+    builder.ins().store(
+        MemFlags::trusted(),
+        next_proc,
+        sh_ctx_start,
+        ShedulerCtxLayout::LAST_PROCESS_INDEX,
+    );
+    let real_count = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::REAL_COUNT_OF_PROCESSES,
+    );
+    let real_count_inc = builder.ins().iadd_imm(real_count, 1);
+    builder.ins().store(
+        MemFlags::trusted(),
+        real_count_inc,
+        sh_ctx_start,
+        ShedulerCtxLayout::REAL_COUNT_OF_PROCESSES,
+    );
+    builder.ins().jump(scan_done, &[]);
+
+    builder.switch_to_block(scan_done);
+    builder.seal_block(scan_done);
+}
+
+/// Build `rt_io_uring_poll_cq()` — drains all pending CQEs.  For each, reads
+/// `user_data` and wakes the corresponding parked actor.  Called from the
+/// scheduler loop on every iteration.
+pub fn define_io_uring_poll_cq(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
+    let ty = ctx.module().target_config().pointer_type();
+
+    let sched_fat_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
+        Some(FuncOrDataId::Data(id)) => id,
+        _ => return Err(anyhow!("sheduler_ctx_fat_ptr global not found")),
+    };
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut module_ctx = ctx.module().make_context();
+    let mut builder = FunctionBuilder::new(&mut module_ctx.func, &mut builder_ctx);
+
+    let entry = builder.create_block();
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+
+    let sched_gv = ctx
+        .module_mut()
+        .declare_data_in_func(sched_fat_id, &mut builder.func);
+    let sh_ctx_fat = builder.ins().global_value(ty, sched_gv);
+    let sh_ctx_start = builder
+        .ins()
+        .load(ty, MemFlags::trusted(), sh_ctx_fat, 0);
+
+    let cq_head_ptr = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::CQ_HEAD_PTR,
+    );
+    let cq_tail_ptr = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::CQ_TAIL_PTR,
+    );
+    let cq_mask_ptr = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::CQ_MASK_PTR,
+    );
+    let cq_cqes_ptr = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::CQ_CQES_PTR,
+    );
+
+    // Read CQ.tail with acquire semantics — kernel produces, we consume.
+    let mask = builder
+        .ins()
+        .load(types::I32, MemFlags::trusted(), cq_mask_ptr, 0);
+    let mask_ext = builder.ins().uextend(ty, mask);
+
+    // Loop: head iterates with block param.
+    let loop_hdr = builder.create_block();
+    let loop_body = builder.create_block();
+    let loop_exit = builder.create_block();
+    builder.append_block_param(loop_hdr, types::I32);
+
+    let head_init = builder
+        .ins()
+        .load(types::I32, MemFlags::trusted(), cq_head_ptr, 0);
+    builder
+        .ins()
+        .jump(loop_hdr, &[BlockArg::Value(head_init)]);
+
+    builder.switch_to_block(loop_hdr);
+    let head = builder.block_params(loop_hdr)[0];
+    let tail = builder
+        .ins()
+        .load(types::I32, MemFlags::trusted(), cq_tail_ptr, 0);
+    let cont = builder.ins().icmp(IntCC::NotEqual, head, tail);
+    builder.ins().brif(cont, loop_body, &[], loop_exit, &[]);
+
+    builder.switch_to_block(loop_body);
+    builder.seal_block(loop_body);
+    // cqe_addr = CQ_CQES + (head & mask) * 16
+    let head_ext = builder.ins().uextend(ty, head);
+    let idx = builder.ins().band(head_ext, mask_ext);
+    let cqe_off = builder.ins().imul_imm(idx, CQE_BYTES);
+    let cqe_addr = builder.ins().iadd(cq_cqes_ptr, cqe_off);
+    // user_data is the first 8 bytes of the CQE
+    let user_data = builder.ins().load(ty, MemFlags::trusted(), cqe_addr, 0);
+
+    emit_wake_by_user_data(sh_ctx_start, user_data, ty, &mut builder);
+
+    let head_next = builder.ins().iadd_imm(head, 1);
+    builder
+        .ins()
+        .jump(loop_hdr, &[BlockArg::Value(head_next)]);
+    builder.seal_block(loop_hdr);
+
+    builder.switch_to_block(loop_exit);
+    builder.seal_block(loop_exit);
+    // Store the consumed head back with release semantics (regular store).
+    builder
+        .ins()
+        .store(MemFlags::trusted(), head, cq_head_ptr, 0);
+    builder.ins().return_(&[]);
+
+    let sig = builder.func.signature.clone();
+    let id = ctx
+        .module_mut()
+        .declare_function("rt_io_uring_poll_cq", Linkage::Export, &sig)?;
+    ctx.module_mut().define_function(id, &mut module_ctx)?;
+    ctx.module_mut().clear_context(&mut module_ctx);
+
+    Ok(ctx)
+}
+

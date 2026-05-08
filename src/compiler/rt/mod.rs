@@ -11,7 +11,10 @@ use crate::compiler::{
         funcs::{
             alloc::{define_allocate, define_free, define_loads, define_store},
             exit::define_exit,
-            io_uring::{define_io_uring_flush, define_io_uring_setup, define_write_async},
+            io_uring::{
+                define_io_uring_flush, define_io_uring_poll_cq, define_io_uring_setup,
+                define_write_async,
+            },
             mmap::{define_init_heap, define_mmap, define_munmap},
             read::define_read,
             strings::{define_len, define_to_string, define_to_string_with_ln},
@@ -64,6 +67,8 @@ impl RuntimeBuilder {
         let ctx = define_write_async(ctx)?;
         debug!("rt: rt_io_uring_flush");
         let ctx = define_io_uring_flush(ctx)?;
+        debug!("rt: rt_io_uring_poll_cq");
+        let ctx = define_io_uring_poll_cq(ctx)?;
         debug!("rt: rt_write");
         let ctx = define_write(ctx)?;
         debug!("rt: rt_read");

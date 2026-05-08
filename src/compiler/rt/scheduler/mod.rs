@@ -55,6 +55,12 @@ pub fn build_scheduler(ctx: &mut CompilerCtx, builder: &mut FunctionBuilder) -> 
     let check_waited_block = builder.create_block();
 
     builder.switch_to_block(loop_block);
+    // Drain CQ ring on each scheduler tick: wakes any actor whose I/O
+    // completed since last iteration, re-adding them to process_arr.  Cheap
+    // when ring is empty (one head==tail compare and bail).
+    let poll_cq_ref = ctx.get_func(builder, "rt_io_uring_poll_cq")?;
+    builder.ins().call(poll_cq_ref, &[]);
+
     let real_count = ShedulerCtxLayout::get_real_count_of_processes(sh_ptr_var, ctx, builder)?;
     let has_active = builder.ins().icmp_imm(IntCC::NotEqual, real_count, 0);
     builder
