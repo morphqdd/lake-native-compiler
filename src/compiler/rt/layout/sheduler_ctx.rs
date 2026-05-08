@@ -38,24 +38,37 @@ impl ShedulerCtxLayout {
         Ok(())
     }
 
-    pub const SIZE: i32 = 88;
+    pub const SIZE: i32 = 128;
     pub const PROCESS_ARR_FAT: i32 = 0;
     pub const CURRENT_PROCESS: i32 = 8;
     pub const LAST_PROCESS_INDEX: i32 = 16;
-    pub const REDUCTION_LIMIT: i32 = 24;
-    pub const REAL_COUNT_OF_PROCESSES: i32 = 32;
-    pub const REDUCTION_COUNTER: i32 = 40;
-    pub const WAIT_ARR_FAT: i32 = 48;
-    pub const LAST_WAITED_PROCESS_INDEX: i32 = 56;
-    pub const WAITED_PROCESS_COUNT: i32 = 64;
+    pub const REAL_COUNT_OF_PROCESSES: i32 = 24;
+    pub const WAIT_ARR_FAT: i32 = 32;
+    pub const LAST_WAITED_PROCESS_INDEX: i32 = 40;
+    pub const WAITED_PROCESS_COUNT: i32 = 48;
     /// Current capacity (in slots) of `process_arr`.  Doubles when the queue
     /// reaches the cap; the old buffer is freed back to the allocator.
-    pub const PROCESS_ARR_CAP: i32 = 72;
+    pub const PROCESS_ARR_CAP: i32 = 56;
     /// Current capacity (in slots) of `wait_arr`.  Same growth strategy.
-    pub const WAIT_ARR_CAP: i32 = 80;
+    pub const WAIT_ARR_CAP: i32 = 64;
+    // ── io_uring (added in stage 2) ─────────────────────────────────────────
+    /// `io_uring_setup` returns a kernel fd for the ring.
+    pub const IO_URING_FD: i32 = 72;
+    /// mmap base of the SQ ring (head/tail/mask/array all live here).
+    pub const SQ_RING_PTR: i32 = 80;
+    /// mmap base of the CQ ring (head/tail/mask/cqes).
+    pub const CQ_RING_PTR: i32 = 88;
+    /// mmap base of the SQE array (256 × 64 B entries).
+    pub const SQE_ARRAY_PTR: i32 = 96;
+    /// Heap fat-ptr to the parked-actor list.  Stride = 16 B = (proc_ctx, _).
+    pub const IO_PARKED_FAT: i32 = 104;
+    pub const IO_PARKED_COUNT: i32 = 112;
+    pub const IO_PARKED_CAP: i32 = 120;
 
-    pub const REDUCTION_LIMIT_VALUE: i64 = 1000;
     pub const INITIAL_QUEUE_CAP: i64 = 256;
+    /// Initial parked-actor list capacity (pairs).  Grows with the same
+    /// doubling helper as `process_arr` / `wait_arr` (stride parameterised).
+    pub const INITIAL_IO_PARKED_CAP: i64 = 64;
 
     pub fn init(
         ctx: &mut crate::compiler::ctx::CompilerCtx,
@@ -107,18 +120,6 @@ impl ShedulerCtxLayout {
         builder.ins().call(
             store_ref,
             &[sh_ctx_ptr, init_cap, ptr_size, wait_cap_offset],
-        );
-
-        let reduction_limit = builder.ins().iconst(ptr_ty, Self::REDUCTION_LIMIT_VALUE);
-        let reduction_limit_offset = builder.ins().iconst(ptr_ty, Self::REDUCTION_LIMIT as i64);
-        builder.ins().call(
-            store_ref,
-            &[
-                sh_ctx_ptr,
-                reduction_limit,
-                ptr_size,
-                reduction_limit_offset,
-            ],
         );
 
         let var = builder.declare_var(ptr_ty);
@@ -235,27 +236,6 @@ impl ShedulerCtxLayout {
         Ok(())
     }
 
-    pub fn increment_reduction_counter(
-        sh_ptr_var: Variable,
-        ctx: &mut CompilerCtx,
-        builder: &mut FunctionBuilder,
-    ) {
-        let ptr_ty = ctx.module().target_config().pointer_type();
-        let ptr_size = builder.ins().iconst(ptr_ty, ptr_ty.bytes() as i64);
-        let rt_func = ctx.rt_funcs().clone();
-        let load_ref = rt_func.load_u64_ref(ctx.module_mut(), builder);
-        let store_ref = rt_func.store_ref(ctx.module_mut(), builder);
-        let sh_ctx_ptr = builder.use_var(sh_ptr_var);
-
-        let offset = builder.ins().iconst(ptr_ty, Self::REDUCTION_COUNTER as i64);
-        let call = builder.ins().call(load_ref, &[sh_ctx_ptr, offset]);
-        let counter = builder.inst_results(call)[0];
-        let new_counter = builder.ins().iadd_imm(counter, 1);
-        builder
-            .ins()
-            .call(store_ref, &[sh_ctx_ptr, new_counter, ptr_size, offset]);
-    }
-
     pub fn get_real_count_of_processes(
         sh_ctx_ptr: Variable,
         ctx: &mut CompilerCtx,
@@ -346,40 +326,6 @@ impl ShedulerCtxLayout {
         let count = builder.inst_results(call)[0];
         Ok(count)
     }
-    pub fn get_reduction_counter(
-        sh_ctx_ptr: Variable,
-        ctx: &mut CompilerCtx,
-        builder: &mut FunctionBuilder,
-    ) -> Result<Value> {
-        let ptr_ty = ctx.module().target_config().pointer_type();
-        let rt_func = ctx.rt_funcs().clone();
-        let load_func_ref = rt_func.load_u64_ref(ctx.module_mut(), builder);
-        let sh_ctx_ptr = builder.use_var(sh_ctx_ptr);
-        let offset = builder
-            .ins()
-            .iconst(ptr_ty, ShedulerCtxLayout::REDUCTION_COUNTER as i64);
-        let call_load_reduction_counter = builder.ins().call(load_func_ref, &[sh_ctx_ptr, offset]);
-        let reduction_counter = builder.inst_results(call_load_reduction_counter)[0];
-        Ok(reduction_counter)
-    }
-
-    pub fn get_reduction_limit(
-        sh_ctx_ptr: Variable,
-        ctx: &mut CompilerCtx,
-        builder: &mut FunctionBuilder,
-    ) -> Result<Value> {
-        let ptr_ty = ctx.module().target_config().pointer_type();
-        let rt_func = ctx.rt_funcs().clone();
-        let load_func_ref = rt_func.load_u64_ref(ctx.module_mut(), builder);
-        let sh_ctx_ptr = builder.use_var(sh_ctx_ptr);
-        let offset = builder
-            .ins()
-            .iconst(ptr_ty, ShedulerCtxLayout::REDUCTION_LIMIT as i64);
-        let call_load_reduction_limit = builder.ins().call(load_func_ref, &[sh_ctx_ptr, offset]);
-        let reduction_limit = builder.inst_results(call_load_reduction_limit)[0];
-        Ok(reduction_limit)
-    }
-
     pub fn get_current_process(
         sh_ctx_ptr: Variable,
         ctx: &mut CompilerCtx,
@@ -750,15 +696,6 @@ impl ShedulerCtxLayout {
         let load_func_ref = rt_func.load_u64_ref(ctx.module_mut(), builder);
         let store_ref = rt_func.store_ref(ctx.module_mut(), builder);
         let sh_ctx_ptr = builder.use_var(sh_ctx_var);
-
-        // Reset reduction counter when switching processes.
-        let zero = builder.ins().iconst(ptr_ty, 0);
-        let counter_offset = builder
-            .ins()
-            .iconst(ptr_ty, ShedulerCtxLayout::REDUCTION_COUNTER as i64);
-        builder
-            .ins()
-            .call(store_ref, &[sh_ctx_ptr, zero, ptr_size, counter_offset]);
 
         let offset = builder
             .ins()
