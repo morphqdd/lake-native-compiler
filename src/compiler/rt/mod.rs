@@ -11,7 +11,7 @@ use crate::compiler::{
         funcs::{
             alloc::{define_allocate, define_free, define_loads, define_store},
             exit::define_exit,
-            io_uring::define_io_uring_setup,
+            io_uring::{define_io_uring_setup, define_write_async},
             mmap::{define_init_heap, define_mmap, define_munmap},
             read::define_read,
             strings::{define_len, define_to_string, define_to_string_with_ln},
@@ -37,6 +37,9 @@ pub struct RuntimeBuilder;
 impl RuntimeBuilder {
     /// Declare and define all runtime functions.  Must be called first.
     pub fn init(ctx: CompilerCtx) -> Result<CompilerCtx> {
+        let mut ctx = ctx;
+        debug!("rt: declaring scheduler globals");
+        ShedulerCtxLayout::declare_globals(&mut ctx)?;
         debug!("rt: rt_syscall");
         let ctx = declare_syscall_wrapper(ctx)?;
         debug!("rt: rt_exit");
@@ -57,6 +60,8 @@ impl RuntimeBuilder {
         let ctx = define_loads(ctx)?;
         debug!("rt: rt_io_uring_setup");
         let ctx = define_io_uring_setup(ctx)?;
+        debug!("rt: rt_write_async");
+        let ctx = define_write_async(ctx)?;
         debug!("rt: rt_write");
         let ctx = define_write(ctx)?;
         debug!("rt: rt_read");
@@ -74,9 +79,6 @@ impl RuntimeBuilder {
         let rt = RtFuncs::resolve(ctx.module())?;
         ctx.set_rt_funcs(rt);
         debug!("rt: all runtime functions resolved");
-
-        debug!("rt: declaring scheduler globals");
-        ShedulerCtxLayout::declare_globals(&mut ctx)?;
 
         Ok(ctx)
     }

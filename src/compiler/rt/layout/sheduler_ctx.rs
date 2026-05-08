@@ -38,7 +38,7 @@ impl ShedulerCtxLayout {
         Ok(())
     }
 
-    pub const SIZE: i32 = 128;
+    pub const SIZE: i32 = 168;
     pub const PROCESS_ARR_FAT: i32 = 0;
     pub const CURRENT_PROCESS: i32 = 8;
     pub const LAST_PROCESS_INDEX: i32 = 16;
@@ -54,16 +54,26 @@ impl ShedulerCtxLayout {
     // ── io_uring (added in stage 2) ─────────────────────────────────────────
     /// `io_uring_setup` returns a kernel fd for the ring.
     pub const IO_URING_FD: i32 = 72;
-    /// mmap base of the SQ ring (head/tail/mask/array all live here).
-    pub const SQ_RING_PTR: i32 = 80;
-    /// mmap base of the CQ ring (head/tail/mask/cqes).
-    pub const CQ_RING_PTR: i32 = 88;
+    /// Resolved address of the SQ tail counter (u32) — `mmap_sq + sq_off.tail`.
+    pub const SQ_TAIL_PTR: i32 = 80;
+    /// Resolved address of the SQ ring mask (u32) — `mmap_sq + sq_off.ring_mask`.
+    pub const SQ_MASK_PTR: i32 = 88;
+    /// Resolved address of the SQ array (u32 entries) — `mmap_sq + sq_off.array`.
+    pub const SQ_ARRAY_PTR: i32 = 96;
     /// mmap base of the SQE array (256 × 64 B entries).
-    pub const SQE_ARRAY_PTR: i32 = 96;
+    pub const SQE_ARRAY_PTR: i32 = 104;
+    /// Resolved address of the CQ head counter (u32).
+    pub const CQ_HEAD_PTR: i32 = 112;
+    /// Resolved address of the CQ tail counter (u32).
+    pub const CQ_TAIL_PTR: i32 = 120;
+    /// Resolved address of the CQ ring mask (u32).
+    pub const CQ_MASK_PTR: i32 = 128;
+    /// Resolved address of the CQE array (16 B entries).
+    pub const CQ_CQES_PTR: i32 = 136;
     /// Heap fat-ptr to the parked-actor list.  Stride = 16 B = (proc_ctx, _).
-    pub const IO_PARKED_FAT: i32 = 104;
-    pub const IO_PARKED_COUNT: i32 = 112;
-    pub const IO_PARKED_CAP: i32 = 120;
+    pub const IO_PARKED_FAT: i32 = 144;
+    pub const IO_PARKED_COUNT: i32 = 152;
+    pub const IO_PARKED_CAP: i32 = 160;
 
     pub const INITIAL_QUEUE_CAP: i64 = 256;
     /// Initial parked-actor list capacity (pairs).  Grows with the same
