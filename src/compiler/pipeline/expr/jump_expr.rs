@@ -166,16 +166,25 @@ pub fn compile(
                 .call(store_ref, &[ctx_ptr, val, size, temp_offset]);
         }
 
-        // Park-aware special case: `rt_io_park_current()` swaps the running
-        // actor out of process_arr and into io_parked.  The call itself is
-        // emitted normally above; here we override the post-call jump:
+        // Park-aware rt fns: each one swaps the running actor out of
+        // process_arr and into io_parked.  The call itself is emitted
+        // normally above; here we override the post-call jump:
         //   1. Store the resume block id (next_id + 1) into ExecCtx.BLOCK_ID
         //      so the woken actor picks up where it left off.
         //   2. Jump to quantum_continue with STOP_PARK as the next-id
         //      marker; the dispatch chain turns that into a `return
         //      STOP_PARK` from the machine, which the scheduler interprets
         //      as "slot already vacated, just continue the loop".
-        if *callee_name == "rt_io_park_current" {
+        //
+        // For rt_accept_async / rt_recv_async / similar, the rt fn body
+        // submits the SQE itself; we still need to issue the park epilogue
+        // here because the rt fn doesn't (can't) terminate the caller's
+        // CPS block.  rt_io_park_current is the bare park primitive used
+        // when the user paired it with a separate submit (rt_write_async).
+        if matches!(
+            *callee_name,
+            "rt_io_park_current" | "rt_accept_async" | "rt_send_async"
+        ) {
             let resume_id = builder.ins().iconst(ptr_ty, next_id + 1);
             let exec_start = ctx.exec_start(builder, machine_ctx_var);
             builder.ins().store(

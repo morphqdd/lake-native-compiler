@@ -9,7 +9,7 @@
 
 use anyhow::{Result, anyhow};
 use cranelift::{
-    codegen::ir::BlockArg,
+    codegen::ir::{BlockArg, StackSlot, StackSlotData, StackSlotKind},
     module::{FuncOrDataId, Linkage, Module},
     prelude::{
         AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder, IntCC, MemFlags,
@@ -19,7 +19,10 @@ use cranelift::{
 
 use crate::compiler::{
     ctx::CompilerCtx,
-    rt::layout::{FatPtrLayout, sheduler_ctx::ShedulerCtxLayout},
+    rt::layout::{
+        FatPtrLayout, exec_ctx::ExecCtxLayout, process_ctx::ProcessCtxLayout,
+        sheduler_ctx::ShedulerCtxLayout,
+    },
 };
 
 // STOP_PARK lives in `pipeline::machine` (= -4) — see comment on STOP_PARK
@@ -28,8 +31,18 @@ use crate::compiler::{
 
 // Kernel ABI constants.
 const SYS_MMAP: i64 = 9;
+const SYS_CLOSE: i64 = 3;
+const SYS_SOCKET: i64 = 41;
+const SYS_BIND: i64 = 49;
+const SYS_LISTEN: i64 = 50;
+const SYS_SETSOCKOPT: i64 = 54;
 const SYS_IO_URING_SETUP: i64 = 425;
 const SYS_IO_URING_ENTER: i64 = 426;
+
+const AF_INET: i64 = 2;
+const SOCK_STREAM: i64 = 1;
+const SOL_SOCKET: i64 = 1;
+const SO_REUSEADDR: i64 = 2;
 
 const PROT_READ: i64 = 0x1;
 const PROT_WRITE: i64 = 0x2;
@@ -41,6 +54,8 @@ const IORING_OFF_CQ_RING: i64 = 0x8000000;
 const IORING_OFF_SQES: i64 = 0x10000000;
 
 const IORING_OP_WRITE: i64 = 23;
+const IORING_OP_SEND: i64 = 26;
+const IORING_OP_ACCEPT: i64 = 13;
 
 // io_uring_params layout (120 bytes total).
 const PARAMS_SIZE: i64 = 120;
@@ -594,6 +609,7 @@ pub fn define_write_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 fn emit_wake_by_user_data(
     sh_ctx_start: Value,
     user_data: Value,
+    res: Value,
     ty: cranelift::prelude::Type,
     builder: &mut FunctionBuilder,
 ) {
@@ -672,6 +688,26 @@ fn emit_wake_by_user_data(
         sh_ctx_start,
         ShedulerCtxLayout::IO_PARKED_COUNT,
     );
+
+    // Deliver CQE.res into ExecCtx.TEMP_VAL so the resumed CPS block can
+    // read it as the value of the parked async op (e.g.
+    // `let conn = accept(srv)` reads accept's result from TEMP_VAL).
+    //   slot_val (= proc-ctx fat-ptr) → start = process_ctx data
+    //   process_ctx[EXEC_CTX] = exec-ctx fat-ptr
+    //   *exec-ctx fat-ptr = exec_ctx data
+    //   exec_ctx[TEMP_VAL] = res (sign-extended from i32 → ptr_ty)
+    let proc_ctx_data = builder.ins().load(ty, MemFlags::trusted(), slot_val, 0);
+    let exec_ctx_fat = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        proc_ctx_data,
+        ProcessCtxLayout::EXEC_CTX,
+    );
+    let exec_ctx_data = builder.ins().load(ty, MemFlags::trusted(), exec_ctx_fat, 0);
+    let res_ext = builder.ins().sextend(ty, res);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), res_ext, exec_ctx_data, ExecCtxLayout::TEMP_VAL);
 
     // Append slot_val (the woken proc-ctx fat-ptr) back to process_arr.
     let proc_arr_fat = builder.ins().load(
@@ -1006,10 +1042,13 @@ pub fn define_io_uring_poll_cq(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let idx = builder.ins().band(head_ext, mask_ext);
     let cqe_off = builder.ins().imul_imm(idx, CQE_BYTES);
     let cqe_addr = builder.ins().iadd(cq_cqes_ptr, cqe_off);
-    // user_data is the first 8 bytes of the CQE
+    // user_data is the first 8 bytes of the CQE; res is the next i32.
     let user_data = builder.ins().load(ty, MemFlags::trusted(), cqe_addr, 0);
+    let res = builder
+        .ins()
+        .load(types::I32, MemFlags::trusted(), cqe_addr, 8);
 
-    emit_wake_by_user_data(sh_ctx_start, user_data, ty, &mut builder);
+    emit_wake_by_user_data(sh_ctx_start, user_data, res, ty, &mut builder);
 
     let head_next = builder.ins().iadd_imm(head, 1);
     builder
@@ -1034,4 +1073,460 @@ pub fn define_io_uring_poll_cq(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
     Ok(ctx)
 }
+
+/// Build `rt_listen_tcp(port: i64) -> fd: i64`.
+///
+/// Combined helper: creates an IPv4 TCP socket, sets `SO_REUSEADDR`, binds to
+/// `0.0.0.0:port`, and listens with backlog 128.  Sync syscalls only (no
+/// io_uring) — server bring-up is one-shot.
+pub fn define_listen_tcp(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
+    let ty = ctx.module().target_config().pointer_type();
+
+    let syscall_id = match ctx.module().get_name("rt_syscall") {
+        Some(FuncOrDataId::Func(id)) => id,
+        _ => return Err(anyhow!("rt_syscall must be declared before rt_listen_tcp")),
+    };
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut module_ctx = ctx.module().make_context();
+    let mut builder = FunctionBuilder::new(&mut module_ctx.func, &mut builder_ctx);
+
+    builder.func.signature.params.push(AbiParam::new(ty));
+    builder.func.signature.returns.push(AbiParam::new(ty));
+
+    // sockaddr_in is 16 B; optval (int=1 for SO_REUSEADDR) is 4 B.  Allocate
+    // a single 32 B explicit stack slot — first 16 B = sockaddr, last 16 B
+    // for optval (only the leading 4 B used).
+    let scratch: StackSlot = builder
+        .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 32, 4));
+
+    let entry = builder.create_block();
+    builder.append_block_param(entry, ty);
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+
+    let port = builder.block_params(entry)[0];
+
+    let syscall_ref = ctx
+        .module_mut()
+        .declare_func_in_func(syscall_id, &mut builder.func);
+
+    let sa_addr = builder.ins().stack_addr(ty, scratch, 0);
+    let opt_addr = builder.ins().stack_addr(ty, scratch, 16);
+
+    let zero = builder.ins().iconst(ty, 0);
+
+    // Zero the 32 B scratch.
+    for off in (0..32).step_by(8) {
+        builder
+            .ins()
+            .store(MemFlags::trusted(), zero, sa_addr, off);
+    }
+
+    // sockaddr_in:
+    //   0   sin_family = AF_INET (u16)
+    //   2   sin_port   = htons(port) (u16, big-endian)
+    //   4   sin_addr   = 0 (INADDR_ANY)
+    //   8.. zero
+    let af_inet = builder.ins().iconst(types::I16, AF_INET);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), af_inet, sa_addr, 0);
+
+    // htons(port): swap low/high bytes of u16.
+    let port16 = builder.ins().ireduce(types::I16, port);
+    let port_be = builder.ins().bswap(port16);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), port_be, sa_addr, 2);
+
+    // optval = (int)1
+    let one32 = builder.ins().iconst(types::I32, 1);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), one32, opt_addr, 0);
+
+    // socket(AF_INET, SOCK_STREAM, 0) → fd
+    let nr_socket = builder.ins().iconst(ty, SYS_SOCKET);
+    let af = builder.ins().iconst(ty, AF_INET);
+    let sock_stream = builder.ins().iconst(ty, SOCK_STREAM);
+    let call_sock = builder.ins().call(
+        syscall_ref,
+        &[nr_socket, af, sock_stream, zero, zero, zero, zero],
+    );
+    let fd = builder.inst_results(call_sock)[0];
+    let fd_ok = builder.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, fd, 0);
+    builder.ins().trapz(fd_ok, TrapCode::unwrap_user(50));
+
+    // setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &1, 4)
+    let nr_setsockopt = builder.ins().iconst(ty, SYS_SETSOCKOPT);
+    let sol = builder.ins().iconst(ty, SOL_SOCKET);
+    let reuse = builder.ins().iconst(ty, SO_REUSEADDR);
+    let four = builder.ins().iconst(ty, 4);
+    let _ = builder.ins().call(
+        syscall_ref,
+        &[nr_setsockopt, fd, sol, reuse, opt_addr, four, zero],
+    );
+
+    // bind(fd, sa, 16)
+    let nr_bind = builder.ins().iconst(ty, SYS_BIND);
+    let sixteen = builder.ins().iconst(ty, 16);
+    let call_bind = builder.ins().call(
+        syscall_ref,
+        &[nr_bind, fd, sa_addr, sixteen, zero, zero, zero],
+    );
+    let bind_rc = builder.inst_results(call_bind)[0];
+    let bind_ok = builder.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, bind_rc, 0);
+    builder.ins().trapz(bind_ok, TrapCode::unwrap_user(51));
+
+    // listen(fd, 128)
+    let nr_listen = builder.ins().iconst(ty, SYS_LISTEN);
+    let backlog = builder.ins().iconst(ty, 128);
+    let _ = builder.ins().call(
+        syscall_ref,
+        &[nr_listen, fd, backlog, zero, zero, zero, zero],
+    );
+
+    builder.ins().return_(&[fd]);
+
+    let sig = builder.func.signature.clone();
+    let id = ctx
+        .module_mut()
+        .declare_function("rt_listen_tcp", Linkage::Export, &sig)?;
+    ctx.module_mut().define_function(id, &mut module_ctx)?;
+    ctx.module_mut().clear_context(&mut module_ctx);
+
+    Ok(ctx)
+}
+
+/// Build `rt_close(fd: i64)`.
+pub fn define_close(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
+    let ty = ctx.module().target_config().pointer_type();
+
+    let syscall_id = match ctx.module().get_name("rt_syscall") {
+        Some(FuncOrDataId::Func(id)) => id,
+        _ => return Err(anyhow!("rt_syscall must be declared before rt_close")),
+    };
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut module_ctx = ctx.module().make_context();
+    let mut builder = FunctionBuilder::new(&mut module_ctx.func, &mut builder_ctx);
+
+    builder.func.signature.params.push(AbiParam::new(ty));
+
+    let entry = builder.create_block();
+    builder.append_block_param(entry, ty);
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+
+    let fd = builder.block_params(entry)[0];
+
+    let syscall_ref = ctx
+        .module_mut()
+        .declare_func_in_func(syscall_id, &mut builder.func);
+    let nr = builder.ins().iconst(ty, SYS_CLOSE);
+    let zero = builder.ins().iconst(ty, 0);
+    let _ = builder
+        .ins()
+        .call(syscall_ref, &[nr, fd, zero, zero, zero, zero, zero]);
+    builder.ins().return_(&[]);
+
+    let sig = builder.func.signature.clone();
+    let id = ctx
+        .module_mut()
+        .declare_function("rt_close", Linkage::Export, &sig)?;
+    ctx.module_mut().define_function(id, &mut module_ctx)?;
+    ctx.module_mut().clear_context(&mut module_ctx);
+
+    Ok(ctx)
+}
+
+/// Emit a generic SQE-fill at the next SQ tail slot for a 4-arg op shape:
+/// {opcode, fd, addr, len}.  `addr_ext` may be 0 for ops that don't use it
+/// (e.g. accept).  Returns `()` — caller is responsible for the io_uring_enter
+/// wakeup if any.
+fn emit_submit_sqe(
+    sh_ctx_start: Value,
+    opcode_imm: i64,
+    fd: Value,
+    addr_ext: Value,
+    len_ext: Value,
+    ty: cranelift::prelude::Type,
+    builder: &mut FunctionBuilder,
+) {
+    let sq_tail_ptr = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::SQ_TAIL_PTR,
+    );
+    let sq_mask_ptr = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::SQ_MASK_PTR,
+    );
+    let sq_array_ptr = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::SQ_ARRAY_PTR,
+    );
+    let sqe_array_ptr = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::SQE_ARRAY_PTR,
+    );
+
+    let tail = builder
+        .ins()
+        .load(types::I32, MemFlags::trusted(), sq_tail_ptr, 0);
+    let mask = builder
+        .ins()
+        .load(types::I32, MemFlags::trusted(), sq_mask_ptr, 0);
+    let idx32 = builder.ins().band(tail, mask);
+    let idx = builder.ins().uextend(ty, idx32);
+
+    let sqe_offset = builder.ins().imul_imm(idx, SQE_BYTES);
+    let sqe_addr = builder.ins().iadd(sqe_array_ptr, sqe_offset);
+
+    let zero64 = builder.ins().iconst(ty, 0);
+    for i in 0..8 {
+        builder
+            .ins()
+            .store(MemFlags::trusted(), zero64, sqe_addr, i * 8);
+    }
+
+    let opcode = builder.ins().iconst(types::I8, opcode_imm);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), opcode, sqe_addr, 0);
+    let fd32 = builder.ins().ireduce(types::I32, fd);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), fd32, sqe_addr, 4);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), addr_ext, sqe_addr, 16);
+    let len32 = builder.ins().ireduce(types::I32, len_ext);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), len32, sqe_addr, 24);
+
+    // user_data = current proc-ctx fat-ptr
+    let cur_idx = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::CURRENT_PROCESS,
+    );
+    let proc_arr_fat = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::PROCESS_ARR_FAT,
+    );
+    let proc_arr_start = builder.ins().load(ty, MemFlags::trusted(), proc_arr_fat, 0);
+    let cur_off = builder.ins().ishl_imm(cur_idx, 3);
+    let cur_addr = builder.ins().iadd(proc_arr_start, cur_off);
+    let proc_ctx = builder.ins().load(ty, MemFlags::trusted(), cur_addr, 0);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), proc_ctx, sqe_addr, 32);
+
+    // SQ.array[idx] = idx
+    let arr_off = builder.ins().ishl_imm(idx, 2);
+    let arr_slot = builder.ins().iadd(sq_array_ptr, arr_off);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), idx32, arr_slot, 0);
+
+    let new_tail = builder.ins().iadd_imm(tail, 1);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), new_tail, sq_tail_ptr, 0);
+}
+
+/// Build `rt_accept_async(fd: i64)` — a parking accept.
+///
+/// Emits a `IORING_OP_ACCEPT` SQE with `addr=0`, `len=0` (don't care about
+/// peer address for now), submits via `io_uring_enter(min_complete=0)` to
+/// nudge the kernel, then returns to the caller.  The frontend's park-aware
+/// codegen runs the park epilogue around this call (set BLOCK_ID, jump
+/// STOP_PARK), and on CQE the woken actor reads its new conn fd from
+/// ExecCtx.TEMP_VAL.
+pub fn define_accept_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
+    let ty = ctx.module().target_config().pointer_type();
+
+    let syscall_id = match ctx.module().get_name("rt_syscall") {
+        Some(FuncOrDataId::Func(id)) => id,
+        _ => return Err(anyhow!("rt_syscall must be declared before rt_accept_async")),
+    };
+    let sched_fat_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
+        Some(FuncOrDataId::Data(id)) => id,
+        _ => return Err(anyhow!("sheduler_ctx_fat_ptr global not found")),
+    };
+    let park_id = match ctx.module().get_name("rt_io_park_current") {
+        Some(FuncOrDataId::Func(id)) => id,
+        _ => return Err(anyhow!("rt_io_park_current must be declared before rt_accept_async")),
+    };
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut module_ctx = ctx.module().make_context();
+    let mut builder = FunctionBuilder::new(&mut module_ctx.func, &mut builder_ctx);
+
+    builder.func.signature.params.push(AbiParam::new(ty));
+
+    let entry = builder.create_block();
+    builder.append_block_param(entry, ty);
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+
+    let fd = builder.block_params(entry)[0];
+
+    let syscall_ref = ctx
+        .module_mut()
+        .declare_func_in_func(syscall_id, &mut builder.func);
+    let sched_gv = ctx
+        .module_mut()
+        .declare_data_in_func(sched_fat_id, &mut builder.func);
+    let park_ref = ctx
+        .module_mut()
+        .declare_func_in_func(park_id, &mut builder.func);
+    let sh_ctx_fat = builder.ins().global_value(ty, sched_gv);
+    let sh_ctx_start = builder.ins().load(ty, MemFlags::trusted(), sh_ctx_fat, 0);
+
+    let zero = builder.ins().iconst(ty, 0);
+
+    emit_submit_sqe(sh_ctx_start, IORING_OP_ACCEPT, fd, zero, zero, ty, &mut builder);
+
+    // Submit immediately — accept is rare enough that batching across
+    // distinct accept calls would just add latency.
+    let ring_fd = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::IO_URING_FD,
+    );
+    let nr_enter = builder.ins().iconst(ty, SYS_IO_URING_ENTER);
+    let one = builder.ins().iconst(ty, 1);
+    let _ = builder.ins().call(
+        syscall_ref,
+        &[nr_enter, ring_fd, one, zero, zero, zero, zero],
+    );
+
+    // Park the current actor — caller's frontend epilogue will set BLOCK_ID
+    // and return STOP_PARK from the machine.
+    builder.ins().call(park_ref, &[]);
+
+    builder.ins().return_(&[]);
+
+    let sig = builder.func.signature.clone();
+    let id = ctx
+        .module_mut()
+        .declare_function("rt_accept_async", Linkage::Export, &sig)?;
+    ctx.module_mut().define_function(id, &mut module_ctx)?;
+    ctx.module_mut().clear_context(&mut module_ctx);
+
+    Ok(ctx)
+}
+
+/// Build `rt_send(fd, fat_ptr, size)` — parking send.  Submits an
+/// IORING_OP_SEND SQE, immediately enters the kernel to nudge submission,
+/// then parks the current actor.  On CQE the actor wakes with the bytes-sent
+/// count in ExecCtx.TEMP_VAL.
+///
+/// We park on every send (rather than batching) so user code can safely do
+/// `rt_send(fd, …); rt_close(fd)` without racing the close against an
+/// un-flushed SQE.  Higher-throughput batched send can be added later as a
+/// separate `rt_send_async` if needed.
+pub fn define_send_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
+    let ty = ctx.module().target_config().pointer_type();
+
+    let syscall_id = match ctx.module().get_name("rt_syscall") {
+        Some(FuncOrDataId::Func(id)) => id,
+        _ => return Err(anyhow!("rt_syscall must be declared before rt_send_async")),
+    };
+    let sched_fat_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
+        Some(FuncOrDataId::Data(id)) => id,
+        _ => return Err(anyhow!("sheduler_ctx_fat_ptr global not found")),
+    };
+    let park_id = match ctx.module().get_name("rt_io_park_current") {
+        Some(FuncOrDataId::Func(id)) => id,
+        _ => return Err(anyhow!("rt_io_park_current must be declared before rt_send_async")),
+    };
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut module_ctx = ctx.module().make_context();
+    let mut builder = FunctionBuilder::new(&mut module_ctx.func, &mut builder_ctx);
+
+    for _ in 0..3 {
+        builder.func.signature.params.push(AbiParam::new(ty));
+    }
+
+    let entry = builder.create_block();
+    for _ in 0..3 {
+        builder.append_block_param(entry, ty);
+    }
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+
+    let [fd, fat_ptr, size] = builder.block_params(entry)[0..3] else {
+        unreachable!()
+    };
+
+    let syscall_ref = ctx
+        .module_mut()
+        .declare_func_in_func(syscall_id, &mut builder.func);
+    let sched_gv = ctx
+        .module_mut()
+        .declare_data_in_func(sched_fat_id, &mut builder.func);
+    let park_ref = ctx
+        .module_mut()
+        .declare_func_in_func(park_id, &mut builder.func);
+    let sh_ctx_fat = builder.ins().global_value(ty, sched_gv);
+    let sh_ctx_start = builder.ins().load(ty, MemFlags::trusted(), sh_ctx_fat, 0);
+
+    // Bounds check + extract payload start.
+    let start = FatPtrLayout::load_start(&mut builder, ty, fat_ptr);
+    let end = FatPtrLayout::load_end(&mut builder, ty, fat_ptr);
+    let access_end = builder.ins().iadd(start, size);
+    let in_bounds = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThanOrEqual, access_end, end);
+    builder
+        .ins()
+        .trapz(in_bounds, TrapCode::unwrap_user(32));
+
+    emit_submit_sqe(sh_ctx_start, IORING_OP_SEND, fd, start, size, ty, &mut builder);
+
+    // Submit immediately and park.  No batching: callers typically `close`
+    // right after send, so we cannot afford an un-flushed SQE.
+    let zero64 = builder.ins().iconst(ty, 0);
+    let ring_fd = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::IO_URING_FD,
+    );
+    let nr_enter = builder.ins().iconst(ty, SYS_IO_URING_ENTER);
+    let one = builder.ins().iconst(ty, 1);
+    let _ = builder.ins().call(
+        syscall_ref,
+        &[nr_enter, ring_fd, one, zero64, zero64, zero64, zero64],
+    );
+    builder.ins().call(park_ref, &[]);
+    builder.ins().return_(&[]);
+
+    let sig = builder.func.signature.clone();
+    let id = ctx
+        .module_mut()
+        .declare_function("rt_send_async", Linkage::Export, &sig)?;
+    ctx.module_mut().define_function(id, &mut module_ctx)?;
+    ctx.module_mut().clear_context(&mut module_ctx);
+
+    Ok(ctx)
+}
+
 
