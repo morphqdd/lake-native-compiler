@@ -755,10 +755,15 @@ fn emit_wake_by_user_data(
     builder.seal_block(scan_done);
 }
 
-/// Build `rt_io_uring_wait_cqe()` — blocking call to `io_uring_enter` that
-/// returns once **at least one** CQE has been posted by the kernel.  Used
-/// by the scheduler when it has no runnable processes but has actors parked
-/// on I/O — keeps the user-space loop off the CPU until something completes.
+/// Build `rt_io_uring_wait_cqe()` — combined submit + wait through a single
+/// `io_uring_enter` syscall.  Submits any SQEs queued via `emit_submit_sqe`
+/// (count tracked in SQE_PENDING) AND blocks until at least one CQE arrives.
+/// Resets SQE_PENDING to 0 on return.  Used by the scheduler when there's
+/// nothing runnable but actors parked on I/O.
+///
+/// Halves the syscall rate vs separate submit + wait: previously each
+/// accept/send pair did one syscall to submit and another to wait (two per
+/// connection); now both fold into one.
 pub fn define_io_uring_wait_cqe(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let ty = ctx.module().target_config().pointer_type();
 
@@ -794,15 +799,28 @@ pub fn define_io_uring_wait_cqe(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         sh_ctx_start,
         ShedulerCtxLayout::IO_URING_FD,
     );
+    let pending = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::SQE_PENDING,
+    );
 
-    // io_uring_enter(fd, to_submit=0, min_complete=1, flags=IORING_ENTER_GETEVENTS).
+    // io_uring_enter(fd, to_submit=pending, min_complete=1,
+    //                flags=IORING_ENTER_GETEVENTS)
     let nr = builder.ins().iconst(ty, SYS_IO_URING_ENTER);
     let zero = builder.ins().iconst(ty, 0);
     let one = builder.ins().iconst(ty, 1);
     let flags = builder.ins().iconst(ty, 1); // IORING_ENTER_GETEVENTS = 1
     let _ = builder.ins().call(
         syscall_ref,
-        &[nr, ring_fd, zero, one, flags, zero, zero],
+        &[nr, ring_fd, pending, one, flags, zero, zero],
+    );
+    builder.ins().store(
+        MemFlags::trusted(),
+        zero,
+        sh_ctx_start,
+        ShedulerCtxLayout::SQE_PENDING,
     );
 
     builder.ins().return_(&[]);
@@ -1346,6 +1364,25 @@ fn emit_submit_sqe(
     builder
         .ins()
         .store(MemFlags::trusted(), new_tail, sq_tail_ptr, 0);
+
+    // Bump SQE_PENDING — every caller goes through here, so this is the
+    // single source of truth for "how many SQEs are queued but not yet
+    // submitted to the kernel".  The scheduler folds the submit count into
+    // its combined `io_uring_enter(fd, pending, 1, GETEVENTS)` wait, so
+    // submit-and-park paths never issue their own syscall.
+    let pending = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::SQE_PENDING,
+    );
+    let pending_next = builder.ins().iadd_imm(pending, 1);
+    builder.ins().store(
+        MemFlags::trusted(),
+        pending_next,
+        sh_ctx_start,
+        ShedulerCtxLayout::SQE_PENDING,
+    );
 }
 
 /// Build `rt_accept_async(fd: i64)` — a parking accept.
@@ -1401,20 +1438,10 @@ pub fn define_accept_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
     emit_submit_sqe(sh_ctx_start, IORING_OP_ACCEPT, fd, zero, zero, ty, &mut builder);
 
-    // Submit immediately — accept is rare enough that batching across
-    // distinct accept calls would just add latency.
-    let ring_fd = builder.ins().load(
-        ty,
-        MemFlags::trusted(),
-        sh_ctx_start,
-        ShedulerCtxLayout::IO_URING_FD,
-    );
-    let nr_enter = builder.ins().iconst(ty, SYS_IO_URING_ENTER);
-    let one = builder.ins().iconst(ty, 1);
-    let _ = builder.ins().call(
-        syscall_ref,
-        &[nr_enter, ring_fd, one, zero, zero, zero, zero],
-    );
+    // No explicit io_uring_enter — emit_submit_sqe bumped SQE_PENDING; the
+    // scheduler's combined wait+submit on its next park-tick will fold this
+    // SQE into a single syscall along with any other queued submissions.
+    let _ = syscall_ref;
 
     // Park the current actor — caller's frontend epilogue will set BLOCK_ID
     // and return STOP_PARK from the machine.
@@ -1501,21 +1528,10 @@ pub fn define_send_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
     emit_submit_sqe(sh_ctx_start, IORING_OP_SEND, fd, start, size, ty, &mut builder);
 
-    // Submit immediately and park.  No batching: callers typically `close`
-    // right after send, so we cannot afford an un-flushed SQE.
-    let zero64 = builder.ins().iconst(ty, 0);
-    let ring_fd = builder.ins().load(
-        ty,
-        MemFlags::trusted(),
-        sh_ctx_start,
-        ShedulerCtxLayout::IO_URING_FD,
-    );
-    let nr_enter = builder.ins().iconst(ty, SYS_IO_URING_ENTER);
-    let one = builder.ins().iconst(ty, 1);
-    let _ = builder.ins().call(
-        syscall_ref,
-        &[nr_enter, ring_fd, one, zero64, zero64, zero64, zero64],
-    );
+    // No explicit io_uring_enter (see rt_accept_async).  Pending count is
+    // bumped by emit_submit_sqe; the scheduler's combined wait+submit
+    // syscall handles the actual submission.
+    let _ = syscall_ref;
     builder.ins().call(park_ref, &[]);
     builder.ins().return_(&[]);
 

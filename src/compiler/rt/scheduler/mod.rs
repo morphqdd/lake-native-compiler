@@ -99,10 +99,10 @@ pub fn build_scheduler(ctx: &mut CompilerCtx, builder: &mut FunctionBuilder) -> 
 
     builder.switch_to_block(wait_io_block);
     builder.seal_block(wait_io_block);
-    // Flush any residual pending submissions first so the kernel actually
-    // has work to complete.
-    let flush_ref0 = ctx.get_func(builder, "rt_io_uring_flush")?;
-    builder.ins().call(flush_ref0, &[]);
+    // Single combined io_uring_enter: submits all pending SQEs AND blocks
+    // until at least one CQE arrives.  Halves syscall rate for the
+    // submit-and-park hot path (accept / send) by folding the previous
+    // separate submit + wait into one kernel transition.
     let wait_ref = ctx.get_func(builder, "rt_io_uring_wait_cqe")?;
     builder.ins().call(wait_ref, &[]);
     builder.ins().jump(loop_block, &[]);
