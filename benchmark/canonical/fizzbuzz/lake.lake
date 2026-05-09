@@ -1,0 +1,27 @@
+@rt(rt_write)
+@rt(to_string_with_ln)
+@rt(len)
+@rt(rt_allocate)
+
+loop is {
+  31 i64 -> { }
+  i  i64 -> {
+    let m3 i64 = i - i / 3 * 3
+    let m5 i64 = i - i / 5 * 5
+    let is3 i64 = 0 == m3
+    let is5 i64 = 0 == m5
+    let code i64 = 2 * is3 + is5
+    when code {
+      3 -> { rt_write(1 "FizzBuzz\n" 9) }
+      2 -> { rt_write(1 "Fizz\n" 5) }
+      1 -> { rt_write(1 "Buzz\n" 5) }
+      0 -> {
+        let s i64 = to_string_with_ln(i)
+        rt_write(1 s len(s))
+      }
+    }
+    self(i + 1)
+  }
+}
+
+main is { _ -> { loop(1) } }

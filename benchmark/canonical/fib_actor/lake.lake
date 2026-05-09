@@ -1,0 +1,16 @@
+@rt(rt_write)
+@rt(to_string_with_ln)
+@rt(len)
+@rt(rt_allocate)
+
+fib is {
+  0 i64 a i64 b i64 -> {
+    let s i64 = to_string_with_ln(a)
+    rt_write(1 s len(s))
+  }
+  n i64 a i64 b i64 -> {
+    self(n - 1  b  a + b)
+  }
+}
+
+main is { _ -> { fib(20 0 1) } }

@@ -177,11 +177,10 @@ fn count_branch_vars(branch: &Branch<'_>) -> usize {
         .iter()
         .filter(|e| matches!(e, Expr::Let { .. }))
         .count();
-    let pattern_slots = branch
-        .patterns
-        .iter()
-        .filter(|p| !p.inner.is_wildcard() && !p.inner.is_literal_guard())
-        .count();
+    // Every pattern position consumes a slot — see branch.rs for why guards
+    // and wildcards are still counted.  Keeping the slot reservation
+    // pos-aligned with call args is what makes guard-prefixed branches work.
+    let pattern_slots = branch.patterns.len();
     pattern_slots + body_lets
 }
 

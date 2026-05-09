@@ -71,10 +71,19 @@ pub fn compile_branch(
     let mut branch_switch = Switch::new();
     let mut block_id: i64 = 0;
 
-    // Allocate slots for non-wildcard, non-guard params (0..N-1).
-    // These are input parameters filled by the spawner/caller from JUMP_ARGS.
-    for pattern in &patterns {
+    // Allocate one variable slot per pattern position, including guards and
+    // wildcards.  The spawner / change_state always writes call args into
+    // VARIABLES at slot[i] = arg[i], so the branch's var-name → slot mapping
+    // must use the same position-based indexing — otherwise a branch with a
+    // leading guard (`0 i64 a i64 b i64`) reads `a` from the guard slot.
+    //
+    // Wildcards and literal guards still consume a slot so subsequent named
+    // params line up; they just don't get a binding name.
+    for (pos, pattern) in patterns.iter().enumerate() {
         if pattern.is_wildcard() || pattern.is_literal_guard() {
+            // Reserve the slot under an anonymous key so the index counter
+            // stays in lock-step with pattern position.
+            state.insert(format!("__pat_{pos}"), ptr_ty);
             continue;
         }
         let ident_str = Clean::<Ident<'_>>::clean(pattern).to_string();
