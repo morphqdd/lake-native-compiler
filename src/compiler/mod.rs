@@ -208,20 +208,97 @@ fn index_machine(
 }
 
 /// Count the variable slots a branch will occupy.
-/// Uses `Clean<Vec<Expr>>` to get the unwrapped body expressions, then counts
-/// top-level `Expr::Let` bindings.  This is the exact count for the current IR
-/// where only `let` nodes and patterns allocate variable slots.
+///
+/// Slots come from three places:
+///
+///   * The branch's own pattern positions — every position takes one slot
+///     so the spawner / change_state writes line up with arg indices,
+///     including wildcards and literal guards (see branch.rs).
+///
+///   * `let` bindings anywhere in the body — top-level, inside `when`
+///     arms, and inside `wait` handler bodies.  Lowering of ret-machines
+///     introduces nested lets in the form of `let __ret_N_pid = M(self
+///     args); wait __ret_N_pid { ... let __ret_M_pid = ... }`, so we
+///     have to recurse rather than count top-level lets only.
+///
+///   * `wait` handler pattern positions — each handler's
+///     non-wildcard, non-guard parameter consumes a slot at codegen
+///     time (`wait_expr.rs::compile`).  Sibling handlers share slots
+///     so we take the maximum across them rather than the sum.
 fn count_branch_vars(branch: &Branch<'_>) -> usize {
-    let body: Vec<Expr<'_>> = Clean::<Vec<Expr<'_>>>::clean(branch);
-    let body_lets = body
+    let body_slots: usize = branch
+        .body
         .iter()
-        .filter(|e| matches!(e, Expr::Let { .. }))
-        .count();
-    // Every pattern position consumes a slot — see branch.rs for why guards
-    // and wildcards are still counted.  Keeping the slot reservation
-    // pos-aligned with call args is what makes guard-prefixed branches work.
-    let pattern_slots = branch.patterns.len();
-    pattern_slots + body_lets
+        .map(|e| count_expr_slots(&e.inner))
+        .sum();
+    branch.patterns.len() + body_slots
+}
+
+fn count_expr_slots(expr: &Expr<'_>) -> usize {
+    match expr {
+        Expr::Let { default, .. } => {
+            // The let itself contributes one slot, plus whatever its
+            // initializer expression introduces.
+            1 + default
+                .as_ref()
+                .map(|d| count_expr_slots(&d.inner))
+                .unwrap_or(0)
+        }
+        Expr::When { branches, cond } => {
+            count_expr_slots(&cond.inner)
+                + branches
+                    .iter()
+                    .map(|(_, body)| body.iter().map(|e| count_expr_slots(&e.inner)).sum::<usize>())
+                    .max()
+                    .unwrap_or(0)
+        }
+        Expr::Wait { handlers, filter } => {
+            let filter_slots: usize =
+                filter.iter().map(|f| count_expr_slots(&f.inner)).sum();
+            // All wait handlers share the same slot range — see
+            // `wait_expr.rs`.  Take the maximum across siblings rather
+            // than the sum.
+            let handler_max = handlers
+                .iter()
+                .map(|h| {
+                    let pat_slots = h
+                        .inner
+                        .patterns
+                        .iter()
+                        .filter(|p| !p.inner.is_wildcard() && !p.inner.is_literal_guard())
+                        .count();
+                    let body_slots: usize = h
+                        .inner
+                        .body
+                        .iter()
+                        .map(|e| count_expr_slots(&e.inner))
+                        .sum();
+                    pat_slots + body_slots
+                })
+                .max()
+                .unwrap_or(0);
+            filter_slots + handler_max
+        }
+        Expr::Jump { ident, args } => {
+            count_expr_slots(&ident.inner)
+                + args.iter().map(|a| count_expr_slots(&a.inner)).sum::<usize>()
+        }
+        Expr::MethodCall { receiver, args, .. } => {
+            count_expr_slots(&receiver.inner)
+                + args.iter().map(|a| count_expr_slots(&a.inner)).sum::<usize>()
+        }
+        Expr::Add(l, r)
+        | Expr::Sub(l, r)
+        | Expr::Mul(l, r)
+        | Expr::Div(l, r)
+        | Expr::Eq(l, r)
+        | Expr::Le(l, r)
+        | Expr::Ge(l, r)
+        | Expr::Lt(l, r)
+        | Expr::Gt(l, r) => count_expr_slots(&l.inner) + count_expr_slots(&r.inner),
+        Expr::Neg(inner) | Expr::Ret(inner) => count_expr_slots(&inner.inner),
+        _ => 0,
+    }
 }
 
 /// Hash a branch's pattern to produce a unique u64 key and the non-default
