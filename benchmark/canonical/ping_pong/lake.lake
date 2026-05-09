@@ -1,0 +1,28 @@
+@rt(rt_write)
+
+ponger is {
+  _ -> { wait { partner pid -> { self(partner 5) } } }
+  partner pid 0 i64 -> { }
+  partner pid n i64 -> {
+    wait { _ i64 -> {
+      partner(1)
+      self(partner n - 1)
+    } }
+  }
+}
+
+pinger is {
+  partner pid 0 i64 -> { rt_write(1 "5 rounds completed\n" 19) }
+  partner pid n i64 -> {
+    partner(1)
+    wait { _ i64 -> { self(partner n - 1) } }
+  }
+}
+
+main is {
+  _ -> {
+    let po pid = ponger()
+    let pi pid = pinger(po 5)
+    po(pi)
+  }
+}

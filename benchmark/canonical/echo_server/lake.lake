@@ -1,0 +1,20 @@
+@rt(rt_listen_tcp)
+@rt(rt_accept_async)
+@rt(rt_send_async)
+@rt(rt_close)
+
+serve is {
+  srv i64 -> {
+    let conn i64 = rt_accept_async(srv)
+    rt_send_async(conn "hi\n" 3)
+    rt_close(conn)
+    self(srv)
+  }
+}
+
+main is {
+  _ -> {
+    let srv i64 = rt_listen_tcp(8080)
+    serve(srv)
+  }
+}

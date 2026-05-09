@@ -1,27 +1,55 @@
 # Canonical task benchmarks
 
 Productivity / expressiveness comparison: same task implemented in each
-language, compared by:
+language, compared by **lines of source that carry meaning** (blank
+lines and single-line comments stripped).
 
-- **Lines of code** (excluding blank lines and comments)
-- **Boilerplate ratio** (ceremony chars / business-logic chars)
-- **Source size in bytes**
+This axis does **not** measure speed.  See `perf/` for that.
 
-## Tasks (TODO — none implemented yet)
+## Tasks
 
-| Task | Status | Demonstrates |
-|---|---|---|
-| fizzbuzz       | TODO | basic control flow + I/O |
-| fib_actor      | TODO | one actor computes fib(N) and prints |
-| ping_pong      | TODO | two actors exchanging N round-trips |
-| echo_server    | BLOCKED | needs sockets / `rt_listen` / `rt_accept` |
-| word_count     | BLOCKED | needs file I/O / `rt_open` |
+| Task          | Status | Demonstrates                          |
+|---            |---     |---                                    |
+| fizzbuzz      | done   | basic control flow + I/O              |
+| fib_actor     | done   | actor model + tail recursion          |
+| ping_pong     | done   | mailbox-style message passing         |
+| echo_server   | done   | TCP listen/accept/send/close          |
+| word_count    | partial — Lake blocked | stdin streaming I/O |
 
-Each task lives in `canonical/<task>/` with one file per language
-(`lake.lake`, `cpp.cpp`, `go.go`, `rust/`).
+Lake's `word_count` is gated on `rt_read` returning the read byte count
+(currently void).  Once that's fixed it can be implemented in a handful
+of lines using `rt_load_u8` and a self-recursive counter — see the
+commented body in `word_count/lake.lake`.
 
-The harness for this axis is **not yet implemented**. When ready it will:
+## Layout
 
-1. `wc -l --no-blank --no-comment` each file
-2. produce `results/canonical-loc.md` with a side-by-side table
-3. surface counts in the summary
+Each task lives in `canonical/<task>/` with one source file per
+language plus a `manifest.sh` describing the task:
+
+```
+canonical/<task>/
+  manifest.sh            # NAME, DESC, LANGS
+  lake.lake
+  go.go
+  cpp.cpp                # optional
+  c.c                    # optional
+  rust/
+    Cargo.toml
+    src/main.rs
+```
+
+## Harness
+
+`./benchmark/run.sh canonical` invokes `_axis.sh`, which:
+
+1. Walks each task directory.
+2. Counts effective LoC for each language source (skips blanks, `//`
+   line comments, and shell `#` comments).
+3. Writes a side-by-side table to `benchmark/results/canonical.md`
+   and prints a per-task summary.
+
+Filter to one task:
+
+```bash
+./benchmark/run.sh canonical fizzbuzz
+```

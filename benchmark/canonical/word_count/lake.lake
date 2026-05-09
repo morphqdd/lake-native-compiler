@@ -1,0 +1,19 @@
+// BLOCKED: rt_read currently returns void.  To count newlines we need the
+// byte-count returned by the read syscall — kernel hands it back in rax,
+// but Lake's `rt_read` discards the return value.  Once rt_read returns
+// the byte count (and ideally rt_load_u8 is exposed to Lake source), this
+// can be implemented as:
+//
+//   loop is {
+//     buf i64 0 i64 lines i64 -> { print lines }
+//     buf i64 i i64 lines i64 -> {
+//       let b i64 = rt_load_u8(buf i - 1)
+//       let nl i64 = b == 10
+//       self(buf i - 1 lines + nl)
+//     }
+//   }
+//   main is { _ -> {
+//     let buf i64 = rt_allocate(4096)
+//     let n i64 = rt_read(0 buf 4096)   // currently void, blocks impl
+//     loop(buf n 0)
+//   } }

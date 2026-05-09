@@ -1,0 +1,13 @@
+[package]
+name = "word_count"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "word_count"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
