@@ -3,7 +3,7 @@ use cranelift::{
     codegen::ir::BlockArg,
     frontend::Switch,
     module::{FuncOrDataId, Module},
-    prelude::{FunctionBuilder, InstBuilder, MemFlags, Variable},
+    prelude::{FunctionBuilder, InstBuilder, IntCC, MemFlags, Variable},
 };
 
 use crate::compiler::{
@@ -61,6 +61,22 @@ pub fn compile_send(
         .ins()
         .call(load_ref, &[vars_ptr, pid_slot_offset]);
     let pid_val = builder.inst_results(call_pid)[0];
+
+    // ── 1a. Null-pid check ──────────────────────────────────────────────
+    // The lowering pass for ret-machine calls without a `let` binding
+    // passes 0 as the implicit __caller pid sentinel.  When the
+    // ret-machine then runs `__caller(self X)` (= a send to that null
+    // pid), we silently drop it: dereferencing 0 as a process_ctx
+    // fat-ptr would segfault.  Live pids are heap-allocated and never
+    // zero, so a single icmp is sufficient.
+    let send_block = builder.create_block();
+    let continue_block = builder.create_block();
+    let pid_is_null = builder.ins().icmp_imm(IntCC::Equal, pid_val, 0);
+    builder
+        .ins()
+        .brif(pid_is_null, continue_block, &[], send_block, &[]);
+
+    builder.switch_to_block(send_block);
 
     // ── 2. Load target's exec_ctx ───────────────────────────────────────
     // PID = process_ctx_fat_ptr
@@ -127,8 +143,6 @@ pub fn compile_send(
     // We need a Variable for wake_process. Create a temporary one.
     let sh_var = builder.declare_var(ptr_ty);
     builder.def_var(sh_var, sh_fat_ptr);
-
-    let continue_block = builder.create_block();
 
     ShedulerCtxLayout::wake_process(sh_var, pid_val, ctx, builder, continue_block)?;
 
