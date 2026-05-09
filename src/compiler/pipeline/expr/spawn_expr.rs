@@ -151,6 +151,11 @@ pub fn compile_spawn(
     let proc_ctx_fat_ptr =
         ProcessCtxLayout::init_ctx(ctx, builder, machine_name, exec_ctx_fat_ptr)?;
 
+    // Stash the new actor's own pid (its proc_ctx fat-ptr address) inside
+    // its ExecCtx so source-level `self` can read it back.  Other actors
+    // already use this same address as the actor's pid.
+    ExecCtxLayout::store(builder, proc_ctx_fat_ptr, exec_ctx_ptr, ExecCtxLayout::OWN_PID);
+
     let sched_data_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
         Some(FuncOrDataId::Data(id)) => id,
         _ => bail!("sheduler_ctx_fat_ptr global not found"),

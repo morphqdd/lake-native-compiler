@@ -8,7 +8,7 @@ use crate::compiler::ctx::CompilerCtx;
 /// Runtime execution context layout.
 /// Single source of truth for all field offsets.
 ///
-/// Memory layout (64 bytes):
+/// Memory layout (72 bytes):
 /// +0  branch_id    : i64  — which branch of the machine is active
 /// +8  block_id     : i64  — which block inside the branch to execute next
 /// +16 temp_val     : i64  — scratch register for passing values between blocks
@@ -17,10 +17,14 @@ use crate::compiler::ctx::CompilerCtx;
 /// +40 mailbox_fat  : i64  — fat ptr to ring-buffer mailbox (256 × 8 bytes)
 /// +48 mailbox_head : i64  — read index (consumer)
 /// +56 mailbox_tail : i64  — write index (producer)
+/// +64 own_pid      : i64  — process_ctx fat-ptr address of THIS actor
+///                            (= the value other actors use to send to it).
+///                            Filled in by spawn; consumed when source code
+///                            reads bare `self` as a pid value.
 pub struct ExecCtxLayout;
 
 impl ExecCtxLayout {
-    pub const SIZE: i32 = 64;
+    pub const SIZE: i32 = 72;
     pub const BRANCH_ID: i32 = 0;
     pub const BLOCK_ID: i32 = 8;
     pub const TEMP_VAL: i32 = 16;
@@ -29,6 +33,7 @@ impl ExecCtxLayout {
     pub const MAILBOX_FAT: i32 = 40;
     pub const MAILBOX_HEAD: i32 = 48;
     pub const MAILBOX_TAIL: i32 = 56;
+    pub const OWN_PID: i32 = 64;
 
     /// Emit a direct load of a field from a raw ctx pointer.
     /// `ctx_ptr` must point to the start of the ExecCtx data (not the fat ptr).
@@ -61,8 +66,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn layout_size_is_64() {
-        assert_eq!(ExecCtxLayout::SIZE, 64);
+    fn layout_size_is_72() {
+        assert_eq!(ExecCtxLayout::SIZE, 72);
     }
 
     #[test]
@@ -75,11 +80,11 @@ mod tests {
         assert_eq!(ExecCtxLayout::MAILBOX_FAT, 40);
         assert_eq!(ExecCtxLayout::MAILBOX_HEAD, 48);
         assert_eq!(ExecCtxLayout::MAILBOX_TAIL, 56);
+        assert_eq!(ExecCtxLayout::OWN_PID, 64);
     }
 
     #[test]
     fn last_field_fits_within_size() {
-        // MAILBOX_TAIL field is i64 (8 bytes), must fit in SIZE
-        assert!(ExecCtxLayout::MAILBOX_TAIL + 8 <= ExecCtxLayout::SIZE);
+        assert!(ExecCtxLayout::OWN_PID + 8 <= ExecCtxLayout::SIZE);
     }
 }

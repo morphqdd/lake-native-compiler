@@ -5,11 +5,14 @@ use cranelift::{
     module::Module,
     prelude::{FunctionBuilder, InstBuilder, IntCC, MemFlags, Variable},
 };
-use lake_frontend::api::ast::{Branch, Clean, Ident, Pattern, Type};
+use lake_frontend::api::{
+    ast::{Branch, Clean, Ident, Pattern, Type},
+    expr::Expr,
+};
 
 use crate::compiler::{
     ctx::CompilerCtx,
-    pipeline::expr::{BranchState, StmtOutcome, compile_expr},
+    pipeline::expr::{BranchState, StmtOutcome, compile_expr, pure_expr},
     rt::layout::ExecCtxLayout,
 };
 
@@ -51,7 +54,7 @@ use crate::compiler::{
 ///   BLOCK_ID = N
 ///   jump quantum_continue(STOP_WAIT)
 /// ```
-pub(crate) fn compile(
+pub(crate) fn compile<'a>(
     ctx: &mut CompilerCtx,
     builder: &mut FunctionBuilder<'_>,
     machine_ctx_var: Variable,
@@ -59,6 +62,7 @@ pub(crate) fn compile(
     branch_switch: &mut Switch,
     state: &mut BranchState,
     collect: Vec<Branch<'_>>,
+    filter: Vec<Expr<'a>>,
 ) -> Result<StmtOutcome> {
     let ptr_ty = ctx.module().target_config().pointer_type();
     let rt_funcs = ctx.rt_funcs().clone();
@@ -147,6 +151,16 @@ pub(crate) fn compile(
     let wait_check_block = builder.create_block();
     let dequeue_block = builder.create_block();
     let suspend_block = builder.create_block();
+    // Reached when a filter is present and the dequeued message's first
+    // arg (sender pid) doesn't match any filter pid.  Drops the
+    // message (HEAD has already advanced) and re-enters wait_check
+    // so the next message can be tried.  This is "drop on miss" — a
+    // simpler semantics than full Erlang-style selective receive,
+    // sufficient for the sync-return convention where the caller
+    // expects only one specific reply while in the wait.
+    let drop_block = builder.create_block();
+    // Block where dispatch happens after filter (if any) succeeds.
+    let dispatch_block = builder.create_block();
 
     // Per-handler jump trampoline blocks (needed because Switch targets must be
     // Cranelift blocks, not block IDs in the quantum loop).
@@ -164,8 +178,16 @@ pub(crate) fn compile(
         builder.ins().brif(has_msg, dequeue_block, &[], suspend_block, &[]);
     }
 
+    // dispatch_block takes the message's first arg as a block parameter
+    // when one is available — this avoids reaching across Rust block
+    // scopes for the Cranelift `Value`.  When dequeue produces no
+    // discriminant we pass a zero placeholder which dispatch_block
+    // ignores because `has_guards` will be false in that case.
+    builder.append_block_param(dispatch_block, ptr_ty);
+
     // ── dequeue_block ────────────────────────────────────────────────────────
     builder.switch_to_block(dequeue_block);
+    let mut discriminant: Option<cranelift::prelude::Value> = None;
     {
         let ctx_ptr = builder.use_var(machine_ctx_var);
         let exec_start = builder.ins().load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
@@ -176,8 +198,9 @@ pub(crate) fn compile(
         let mailbox_fat = ExecCtxLayout::load(builder, ptr_ty, exec_start, ExecCtxLayout::MAILBOX_FAT);
         let head = ExecCtxLayout::load(builder, ptr_ty, exec_start, ExecCtxLayout::MAILBOX_HEAD);
 
-        // Load discriminant (first mailbox arg) for guard dispatch
-        let discriminant = if has_guards && dequeue_arg_count > 0 {
+        // Load discriminant (first mailbox arg) — needed both for guard
+        // dispatch and for the optional sender-pid filter check below.
+        discriminant = if (has_guards || !filter.is_empty()) && dequeue_arg_count > 0 {
             let msg_index_mod = builder.ins().band_imm(head, 255);
             let msg_offset = builder.ins().imul_imm(msg_index_mod, 8);
             let call = builder.ins().call(load_ref, &[mailbox_fat, msg_offset]);
@@ -217,9 +240,64 @@ pub(crate) fn compile(
         let new_head_mod = builder.ins().band_imm(new_head, 255);
         ExecCtxLayout::store(builder, new_head_mod, exec_start, ExecCtxLayout::MAILBOX_HEAD);
 
+        // Discriminant value passed to dispatch_block.  Zero placeholder
+        // when no discriminant was loaded (no guards, no filter).
+        let disc_for_dispatch = discriminant
+            .unwrap_or_else(|| builder.ins().iconst(ptr_ty, 0));
+
+        // Filter check (only when `wait <pid>* { ... }` had filter pids).
+        // For each filter expression, fold its value at runtime and
+        // compare against the message's first arg (the sender pid by
+        // convention).  Any match → dispatch; no match → drop_block.
+        if !filter.is_empty() {
+            let disc = discriminant.expect("filter requires a non-empty message");
+            // pure_expr::fold expects the *start* of the variables
+            // buffer, not the fat-pointer address.  Dereference once.
+            let vars_ptr_for_filter =
+                builder.ins().load(ptr_ty, MemFlags::trusted(), vars_ptr, 0);
+            // OR-chain: each check goes to dispatch_block on hit, falls
+            // through to next check on miss.  Final miss → drop_block.
+            for (idx, filter_expr) in filter.iter().enumerate() {
+                let next_check_block = if idx + 1 == filter.len() {
+                    drop_block
+                } else {
+                    builder.create_block()
+                };
+                let pid_val = pure_expr::fold(
+                    filter_expr,
+                    builder,
+                    ptr_ty,
+                    Some(vars_ptr_for_filter),
+                    state,
+                );
+                let eq = builder.ins().icmp(IntCC::Equal, disc, pid_val);
+                builder.ins().brif(
+                    eq,
+                    dispatch_block,
+                    &[BlockArg::Value(disc_for_dispatch)],
+                    next_check_block,
+                    &[],
+                );
+                if next_check_block != drop_block {
+                    builder.switch_to_block(next_check_block);
+                }
+            }
+        } else {
+            builder
+                .ins()
+                .jump(dispatch_block, &[BlockArg::Value(disc_for_dispatch)]);
+        }
+    }
+
+    // ── dispatch_block ────────────────────────────────────────────────────
+    builder.switch_to_block(dispatch_block);
+    {
+        // Discriminant arrives as a block parameter from dequeue_block (or
+        // from any of the filter chain's success branches).
+        let disc = builder.block_params(dispatch_block)[0];
+
         // Dispatch
         if has_guards {
-            let disc = discriminant.unwrap();
             let mut guard_switch = Switch::new();
             let mut wildcard_block = no_match_block;
 
@@ -249,6 +327,19 @@ pub(crate) fn compile(
     builder.switch_to_block(no_match_block);
     {
         // Silently skip: re-enter wait_check on next quantum
+        let v = builder.ins().iconst(ptr_ty, block_id);
+        builder.ins().jump(qb, &[BlockArg::Value(v)]);
+    }
+
+    // ── drop_block: filter rejected the message ──────────────────────────
+    // The message has already been removed from the mailbox (HEAD was
+    // advanced before the filter check).  Re-enter wait_check so the
+    // next message — if any — gets the same treatment.  This is
+    // "drop on miss"; full Erlang-style selective receive (where
+    // non-matching messages stay in the mailbox for later) is future
+    // work and would require a more elaborate mailbox layout.
+    builder.switch_to_block(drop_block);
+    {
         let v = builder.ins().iconst(ptr_ty, block_id);
         builder.ins().jump(qb, &[BlockArg::Value(v)]);
     }

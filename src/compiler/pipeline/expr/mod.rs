@@ -182,7 +182,7 @@ pub fn compile_expr(
                 })
                 .collect(),
         ),
-        Expr::Wait { handlers } => wait_expr::compile(
+        Expr::Wait { handlers, filter } => wait_expr::compile(
             ctx,
             builder,
             machine_ctx_var,
@@ -190,6 +190,7 @@ pub fn compile_expr(
             branch_switch,
             state,
             handlers.iter().map(|branch| branch.inner.clone()).collect(),
+            filter.iter().map(|f| f.inner.clone()).collect(),
         ),
         _ => bail!("Unsupported expression type: {:?}", expr),
     }

@@ -30,8 +30,31 @@ pub fn is_pure(expr: &Expr) -> bool {
     }
 }
 
+/// Does this expression mention `self`?  Used by [`compile`] to decide
+/// whether to plumb the current process's pid through to [`fold_with_self`].
+fn has_self(expr: &Expr) -> bool {
+    match expr {
+        Expr::Var("self", _) => true,
+        Expr::Neg(inner) => has_self(&inner.inner),
+        Expr::Add(l, r)
+        | Expr::Sub(l, r)
+        | Expr::Mul(l, r)
+        | Expr::Div(l, r)
+        | Expr::Le(l, r)
+        | Expr::Ge(l, r)
+        | Expr::Eq(l, r)
+        | Expr::Lt(l, r)
+        | Expr::Gt(l, r) => has_self(&l.inner) || has_self(&r.inner),
+        _ => false,
+    }
+}
+
 fn has_var(expr: &Expr) -> bool {
     match expr {
+        // `self` resolves to the current pid via `machine_ctx_var`, not
+        // through the variables table, so it doesn't count as a "var" for
+        // the purposes of deciding whether to load the vars buffer.
+        Expr::Var("self", _) => false,
         Expr::Var(..) => true,
         Expr::Neg(inner) => has_var(&inner.inner),
         Expr::Add(l, r)
@@ -54,9 +77,29 @@ pub fn fold(
     vars_start: Option<Value>,
     state: &BranchState,
 ) -> Value {
+    fold_with_self(expr, builder, ptr_ty, vars_start, None, state)
+}
+
+/// Like [`fold`] but with an extra `self_pid` parameter — the value to
+/// substitute for `Var("self")`.  Callers that want to use `self` as a
+/// pure value (e.g. as an argument to another machine) provide the
+/// current process's pid here; existing call sites that don't yet
+/// support `self` use [`fold`].
+pub fn fold_with_self(
+    expr: &Expr,
+    builder: &mut FunctionBuilder,
+    ptr_ty: Type,
+    vars_start: Option<Value>,
+    self_pid: Option<Value>,
+    state: &BranchState,
+) -> Value {
     match expr {
         Expr::Num(s, _) => builder.ins().iconst(ptr_ty, s.parse::<i64>().unwrap_or(0)),
         Expr::Bool(b) => builder.ins().iconst(ptr_ty, if *b { 1 } else { 0 }),
+        Expr::Var("self", _) => self_pid.expect(
+            "self used as a value but no self_pid supplied — call \
+             pure_expr::compile or pass self_pid through fold_with_self",
+        ),
         Expr::Var(name, _) => {
             let (_, slot) = state.get(name).expect("variable not found in state");
             debug_assert!(slot < state.len(), "slot {slot} out of range {}", state.len());
@@ -64,57 +107,57 @@ pub fn fold(
             builder.ins().load(ptr_ty, MemFlags::trusted(), vs, slot as i32 * 8)
         }
         Expr::Add(l, r) => {
-            let lv = fold(&l.inner, builder, ptr_ty, vars_start, state);
-            let rv = fold(&r.inner, builder, ptr_ty, vars_start, state);
+            let lv = fold_with_self(&l.inner, builder, ptr_ty, vars_start, self_pid, state);
+            let rv = fold_with_self(&r.inner, builder, ptr_ty, vars_start, self_pid, state);
             builder.ins().iadd(lv, rv)
         }
         Expr::Sub(l, r) => {
-            let lv = fold(&l.inner, builder, ptr_ty, vars_start, state);
-            let rv = fold(&r.inner, builder, ptr_ty, vars_start, state);
+            let lv = fold_with_self(&l.inner, builder, ptr_ty, vars_start, self_pid, state);
+            let rv = fold_with_self(&r.inner, builder, ptr_ty, vars_start, self_pid, state);
             builder.ins().isub(lv, rv)
         }
         Expr::Mul(l, r) => {
-            let lv = fold(&l.inner, builder, ptr_ty, vars_start, state);
-            let rv = fold(&r.inner, builder, ptr_ty, vars_start, state);
+            let lv = fold_with_self(&l.inner, builder, ptr_ty, vars_start, self_pid, state);
+            let rv = fold_with_self(&r.inner, builder, ptr_ty, vars_start, self_pid, state);
             builder.ins().imul(lv, rv)
         }
         Expr::Div(l, r) => {
-            let lv = fold(&l.inner, builder, ptr_ty, vars_start, state);
-            let rv = fold(&r.inner, builder, ptr_ty, vars_start, state);
+            let lv = fold_with_self(&l.inner, builder, ptr_ty, vars_start, self_pid, state);
+            let rv = fold_with_self(&r.inner, builder, ptr_ty, vars_start, self_pid, state);
             builder.ins().sdiv(lv, rv)
         }
         Expr::Le(l, r) => {
-            let lv = fold(&l.inner, builder, ptr_ty, vars_start, state);
-            let rv = fold(&r.inner, builder, ptr_ty, vars_start, state);
+            let lv = fold_with_self(&l.inner, builder, ptr_ty, vars_start, self_pid, state);
+            let rv = fold_with_self(&r.inner, builder, ptr_ty, vars_start, self_pid, state);
             let cmp = builder.ins().icmp(IntCC::SignedLessThanOrEqual, lv, rv);
             builder.ins().uextend(ptr_ty, cmp)
         }
         Expr::Ge(l, r) => {
-            let lv = fold(&l.inner, builder, ptr_ty, vars_start, state);
-            let rv = fold(&r.inner, builder, ptr_ty, vars_start, state);
+            let lv = fold_with_self(&l.inner, builder, ptr_ty, vars_start, self_pid, state);
+            let rv = fold_with_self(&r.inner, builder, ptr_ty, vars_start, self_pid, state);
             let cmp = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, lv, rv);
             builder.ins().uextend(ptr_ty, cmp)
         }
         Expr::Eq(l, r) => {
-            let lv = fold(&l.inner, builder, ptr_ty, vars_start, state);
-            let rv = fold(&r.inner, builder, ptr_ty, vars_start, state);
+            let lv = fold_with_self(&l.inner, builder, ptr_ty, vars_start, self_pid, state);
+            let rv = fold_with_self(&r.inner, builder, ptr_ty, vars_start, self_pid, state);
             let cmp = builder.ins().icmp(IntCC::Equal, lv, rv);
             builder.ins().uextend(ptr_ty, cmp)
         }
         Expr::Lt(l, r) => {
-            let lv = fold(&l.inner, builder, ptr_ty, vars_start, state);
-            let rv = fold(&r.inner, builder, ptr_ty, vars_start, state);
+            let lv = fold_with_self(&l.inner, builder, ptr_ty, vars_start, self_pid, state);
+            let rv = fold_with_self(&r.inner, builder, ptr_ty, vars_start, self_pid, state);
             let cmp = builder.ins().icmp(IntCC::SignedLessThan, lv, rv);
             builder.ins().uextend(ptr_ty, cmp)
         }
         Expr::Gt(l, r) => {
-            let lv = fold(&l.inner, builder, ptr_ty, vars_start, state);
-            let rv = fold(&r.inner, builder, ptr_ty, vars_start, state);
+            let lv = fold_with_self(&l.inner, builder, ptr_ty, vars_start, self_pid, state);
+            let rv = fold_with_self(&r.inner, builder, ptr_ty, vars_start, self_pid, state);
             let cmp = builder.ins().icmp(IntCC::SignedGreaterThan, lv, rv);
             builder.ins().uextend(ptr_ty, cmp)
         }
         Expr::Neg(inner) => {
-            let v = fold(&inner.inner, builder, ptr_ty, vars_start, state);
+            let v = fold_with_self(&inner.inner, builder, ptr_ty, vars_start, self_pid, state);
             builder.ins().ineg(v)
         }
         _ => unreachable!("fold called on non-pure expr: {:?}", expr),
@@ -148,7 +191,22 @@ pub fn compile(
         None
     };
 
-    let result = fold(expr, builder, ptr_ty, vars_start, state);
+    // `self` as a value resolves to the current actor's pid (= the
+    // process_ctx fat-ptr address that other actors use to send to it).
+    // It's stashed in this actor's ExecCtx at OWN_PID by spawn /
+    // init_main_process; load it on demand.
+    let self_pid = if has_self(expr) {
+        Some(builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            exec_start,
+            ExecCtxLayout::OWN_PID,
+        ))
+    } else {
+        None
+    };
+
+    let result = fold_with_self(expr, builder, ptr_ty, vars_start, self_pid, state);
 
     builder
         .ins()

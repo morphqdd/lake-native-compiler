@@ -224,6 +224,11 @@ impl ShedulerCtxLayout {
 
         let process_ctx = ProcessCtxLayout::init_ctx(ctx, builder, "main", main_ctx_fat_ptr)?;
 
+        // Stash main's own pid (its proc_ctx fat-ptr address) for source-
+        // level `self` reads.  Spawned actors get the same treatment in
+        // `spawn_expr`.
+        ExecCtxLayout::store(builder, process_ctx, main_ctx_ptr, ExecCtxLayout::OWN_PID);
+
         let rt_funcs = ctx.rt_funcs().clone();
         let load_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
         let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
