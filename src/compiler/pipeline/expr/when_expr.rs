@@ -167,21 +167,28 @@ pub fn compile<'a>(
                     false,
                 )?;
                 let mut keys_data_desc = DataDescription::new();
-                let mut keys_bytes = vec![];
-                keys.iter().for_each(|key| {
-                    key.to_le_bytes()
-                        .iter()
-                        .for_each(|&byte| keys_bytes.push(byte))
-                });
 
-                debug!("MPHF keys: {:?} {:?}", keys, keys_bytes);
+                // The runtime verification (`keys_array[idx] == input_hash`)
+                // requires the array to be laid out in **MPHF-permuted**
+                // order: position `mphf.lookup(k)` must hold `k`.  Storing in
+                // the original branch order only works when MPHF happens to
+                // produce the identity mapping; with three or more keys
+                // that's the exception, not the rule.
+                let mut keys_table = vec![0u64; keys.len()];
+                for (i, &key) in keys.iter().enumerate() {
+                    let index = mphf.lookup(key) as usize;
+                    keys_table[index] = key;
+                    when_switch.set_entry(index as u128, b_ret[i]);
+                }
+
+                let mut keys_bytes = vec![];
+                for key in &keys_table {
+                    keys_bytes.extend_from_slice(&key.to_le_bytes());
+                }
+                debug!("MPHF keys (permuted): {:?} {:?}", keys_table, keys_bytes);
                 keys_data_desc.define(keys_bytes.into());
                 ctx.module_mut()
                     .define_data(keys_data_id, &keys_data_desc)?;
-                for (i, &key) in keys.iter().enumerate() {
-                    let index = mphf.lookup(key);
-                    when_switch.set_entry(index as u128, b_ret[i]);
-                }
                 let start = builder.ins().load(ptr_ty, MemFlags::trusted(), temp_off, 0);
                 let end = builder.ins().load(ptr_ty, MemFlags::trusted(), temp_off, 8);
 

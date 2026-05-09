@@ -60,7 +60,6 @@ fn when_numeric_three_branches() {
 }
 
 #[test]
-#[ignore = "BUG: `when buf { \"lit\" -> ... }` over `let buf str = ...` produces no output"]
 fn when_string_match() {
     let src = r#"
         @rt(rt_write)

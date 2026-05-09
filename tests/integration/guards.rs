@@ -35,8 +35,6 @@ fn int_guard_self_transition() {
 }
 
 #[test]
-#[ignore = "BUG[lake-frontend]: literal-guard branches lose param type in match signature \
-            (E003 'no branch matches'; reports `_, _` instead of `(i64), (i64)`)"]
 fn int_guard_single_match_no_wildcard() {
     // No wildcard branch — calling with unmatched value should silently
     // fall through (no panic, no output).
@@ -52,7 +50,6 @@ fn int_guard_single_match_no_wildcard() {
 }
 
 #[test]
-#[ignore = "BUG[lake-frontend]: P001 parser does not accept unary minus on call args (`f(-7)`)"]
 fn int_guard_negative_value() {
     let src = r#"
         @rt(rt_write)
