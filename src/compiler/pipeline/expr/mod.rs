@@ -60,9 +60,11 @@ pub mod when_expr;
 #[derive(Debug, Default)]
 pub struct BranchState {
     vars: HashMap<String, (Type, usize)>,
-    /// Lake-level type strings for variables (e.g. "i64", "str", "{}").
-    /// Used to resolve the correct type when the frontend emits `{}` for
-    /// variables whose type is known from the pattern declaration.
+    /// Lake-level type strings for variables (e.g. "i64", "str", "pid").
+    /// Used by `jump_expr` as a fallback when the resolver left a
+    /// variable reference's type as `Type::Unknown` (rendered "?") —
+    /// the BranchState records the type recorded at let / pattern
+    /// binding time and we recover it here.
     lake_types: HashMap<String, String>,
     /// Current base slot in JUMP_ARGS for the innermost call being compiled.
     /// Nested calls advance this by the outer call's arg count so that they

@@ -5,7 +5,7 @@
 
 serve is {
   srv i64 -> {
-    let conn i64 = rt_accept_async(srv)
+    let conn = rt_accept_async(srv)
     rt_send_async(conn "hi\n" 3)
     rt_close(conn)
     self(srv)
@@ -14,7 +14,7 @@ serve is {
 
 main is {
   _ -> {
-    let srv i64 = rt_listen_tcp(8080)
+    let srv = rt_listen_tcp(8080)
     serve(srv)
   }
 }

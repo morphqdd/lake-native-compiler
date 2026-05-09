@@ -22,7 +22,6 @@ pinger is {
 main is {
   _ -> {
     let po pid = ponger()
-    let pi pid = pinger(po 5)
-    po(pi)
+    po(pinger(po 5))
   }
 }

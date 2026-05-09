@@ -5,7 +5,7 @@
 
 fib is {
   0 i64 a i64 b i64 -> {
-    let s i64 = to_string_with_ln(a)
+    let s = to_string_with_ln(a)
     rt_write(1 s len(s))
   }
   n i64 a i64 b i64 -> {

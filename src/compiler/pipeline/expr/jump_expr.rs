@@ -209,12 +209,19 @@ pub fn compile(
         Ok(StmtOutcome::Continue(next_id + 1))
     } else {
         // ── Check if callee is a pid-typed variable → message send ──────
+        // After the resolver runs the AST has every variable's type
+        // filled in, but a small minority (let-RHS that the inferrer
+        // gave up on, plus expressions the resolver hasn't reached) can
+        // still arrive here as `Type::Unknown` rendering as `?`.  In
+        // that case we fall back to the BranchState's lake-type table,
+        // which carries the type recorded at let / pattern binding
+        // time.  Anything past that stays unknown.
         let callee_lake_type = {
             let raw = _ty.to_string();
-            if raw == "{}" {
+            if raw == "?" {
                 state
                     .lake_type_of(callee_name)
-                    .unwrap_or("{}")
+                    .unwrap_or("?")
                     .to_string()
             } else {
                 raw
