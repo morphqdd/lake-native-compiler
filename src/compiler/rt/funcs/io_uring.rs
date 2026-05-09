@@ -79,7 +79,7 @@ const CQ_OFF_CQES: i32 = 20;
 const SQE_BYTES: i64 = 64;
 const CQE_BYTES: i64 = 16;
 
-const RING_ENTRIES: i64 = 256;
+const RING_ENTRIES: i64 = 4096;
 /// Number of SQEs to accumulate before issuing a single `io_uring_enter`.
 /// Higher = better throughput, worse latency for the laggard submission.
 /// 16 keeps p99 latency well under a millisecond at sane CPU speeds while
@@ -598,12 +598,11 @@ pub fn define_write_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     Ok(ctx)
 }
 
-/// Emit IR that wakes the actor identified by `user_data` if it is currently
-/// in `io_parked`.  Linear scan up to `IO_PARKED_COUNT`; on match, swap-and-pop
-/// the slot, append the proc-ctx fat-ptr back into `process_arr` (using the
-/// dynamic-grow helper), and increment REAL_COUNT.  Silent no-op when
-/// `user_data` is 0 (sentinel for fire-and-forget submissions) or when no
-/// match is found.
+/// Emit IR that wakes the actor identified by `user_data` (its proc-ctx
+/// fat-ptr address) if it is currently parked.  O(1) lookup via the
+/// intrusive `ProcessCtxLayout::IO_PARKED_IDX` field — no scan over
+/// io_parked.  Silent no-op when `user_data` is 0 (sentinel for non-parking
+/// fire-and-forget submissions like `rt_write_async` to /dev/null).
 ///
 /// Inlined into `rt_io_uring_poll_cq`; not exposed as a runtime function.
 fn emit_wake_by_user_data(
@@ -615,15 +614,25 @@ fn emit_wake_by_user_data(
 ) {
     // Bail when user_data == 0 (no actor was parked for this CQE).
     let nonzero = builder.ins().icmp_imm(IntCC::NotEqual, user_data, 0);
-    let scan_block = builder.create_block();
-    let scan_done = builder.create_block();
+    let wake_block = builder.create_block();
+    let wake_done = builder.create_block();
     builder
         .ins()
-        .brif(nonzero, scan_block, &[], scan_done, &[]);
+        .brif(nonzero, wake_block, &[], wake_done, &[]);
 
-    // ── scan_block: walk io_parked[0..count] ────────────────────────────────
-    builder.switch_to_block(scan_block);
-    builder.seal_block(scan_block);
+    builder.switch_to_block(wake_block);
+    builder.seal_block(wake_block);
+
+    // user_data IS the parked actor's proc-ctx fat-ptr.  Read its stashed
+    // io_parked slot index — set in rt_io_park_current at park time.
+    let proc_ctx_data = builder.ins().load(ty, MemFlags::trusted(), user_data, 0);
+    let match_idx = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        proc_ctx_data,
+        ProcessCtxLayout::IO_PARKED_IDX,
+    );
+
     let parked_fat = builder.ins().load(
         ty,
         MemFlags::trusted(),
@@ -638,41 +647,13 @@ fn emit_wake_by_user_data(
         ShedulerCtxLayout::IO_PARKED_COUNT,
     );
 
-    // Loop: i = 0; while i < count: cmp slot==user_data
-    let loop_hdr = builder.create_block();
-    let loop_body = builder.create_block();
-    let found = builder.create_block();
-    builder.append_block_param(loop_hdr, ty);
-
-    let zero = builder.ins().iconst(ty, 0);
-    builder.ins().jump(loop_hdr, &[BlockArg::Value(zero)]);
-
-    builder.switch_to_block(loop_hdr);
-    let i = builder.block_params(loop_hdr)[0];
-    let cont = builder.ins().icmp(IntCC::UnsignedLessThan, i, parked_count);
-    builder.ins().brif(cont, loop_body, &[], scan_done, &[]);
-
-    builder.switch_to_block(loop_body);
-    builder.seal_block(loop_body);
-    let slot_off = builder.ins().ishl_imm(i, 3);
-    let slot_addr = builder.ins().iadd(parked_start, slot_off);
-    let slot_val = builder.ins().load(ty, MemFlags::trusted(), slot_addr, 0);
-    let eq = builder.ins().icmp(IntCC::Equal, slot_val, user_data);
-    let i_next = builder.ins().iadd_imm(i, 1);
-    builder.ins().brif(
-        eq,
-        found,
-        &[BlockArg::Value(i)],
-        loop_hdr,
-        &[BlockArg::Value(i_next)],
-    );
-    builder.append_block_param(found, ty);
-    builder.seal_block(loop_hdr);
-
-    // ── found: swap-and-pop io_parked, append to process_arr, REAL_COUNT++ ──
-    builder.switch_to_block(found);
-    builder.seal_block(found);
-    let match_idx = builder.block_params(found)[0];
+    // ── O(1) swap-and-pop io_parked: ────────────────────────────────────────
+    //   last_idx = count - 1
+    //   last_val = io_parked[last_idx]
+    //   io_parked[match_idx] = last_val
+    //   last_val.proc_ctx.IO_PARKED_IDX = match_idx   (keep the moved actor's
+    //                                                  intrusive idx coherent)
+    //   IO_PARKED_COUNT = last_idx
     let last_idx = builder.ins().iadd_imm(parked_count, -1);
     let last_off = builder.ins().ishl_imm(last_idx, 3);
     let last_addr = builder.ins().iadd(parked_start, last_off);
@@ -682,6 +663,30 @@ fn emit_wake_by_user_data(
     builder
         .ins()
         .store(MemFlags::trusted(), last_val, match_addr, 0);
+
+    // Update the moved actor's intrusive idx so its subsequent wake (if it
+    // re-parks before getting woken) finds the right slot.  Skip when the
+    // popped slot WAS the last one (match_idx == last_idx) — same actor, no
+    // move actually happened.
+    let same = builder.ins().icmp(IntCC::Equal, match_idx, last_idx);
+    let fix_idx_block = builder.create_block();
+    let fix_idx_done = builder.create_block();
+    builder.ins().brif(same, fix_idx_done, &[], fix_idx_block, &[]);
+
+    builder.switch_to_block(fix_idx_block);
+    builder.seal_block(fix_idx_block);
+    let last_proc_data = builder.ins().load(ty, MemFlags::trusted(), last_val, 0);
+    builder.ins().store(
+        MemFlags::trusted(),
+        match_idx,
+        last_proc_data,
+        ProcessCtxLayout::IO_PARKED_IDX,
+    );
+    builder.ins().jump(fix_idx_done, &[]);
+
+    builder.switch_to_block(fix_idx_done);
+    builder.seal_block(fix_idx_done);
+
     builder.ins().store(
         MemFlags::trusted(),
         last_idx,
@@ -689,14 +694,11 @@ fn emit_wake_by_user_data(
         ShedulerCtxLayout::IO_PARKED_COUNT,
     );
 
-    // Deliver CQE.res into ExecCtx.TEMP_VAL so the resumed CPS block can
-    // read it as the value of the parked async op (e.g.
-    // `let conn = accept(srv)` reads accept's result from TEMP_VAL).
-    //   slot_val (= proc-ctx fat-ptr) → start = process_ctx data
+    // Deliver CQE.res into ExecCtx.TEMP_VAL.
+    //   user_data (= proc-ctx fat-ptr) → process_ctx data already loaded above
     //   process_ctx[EXEC_CTX] = exec-ctx fat-ptr
     //   *exec-ctx fat-ptr = exec_ctx data
     //   exec_ctx[TEMP_VAL] = res (sign-extended from i32 → ptr_ty)
-    let proc_ctx_data = builder.ins().load(ty, MemFlags::trusted(), slot_val, 0);
     let exec_ctx_fat = builder.ins().load(
         ty,
         MemFlags::trusted(),
@@ -705,9 +707,14 @@ fn emit_wake_by_user_data(
     );
     let exec_ctx_data = builder.ins().load(ty, MemFlags::trusted(), exec_ctx_fat, 0);
     let res_ext = builder.ins().sextend(ty, res);
-    builder
-        .ins()
-        .store(MemFlags::trusted(), res_ext, exec_ctx_data, ExecCtxLayout::TEMP_VAL);
+    builder.ins().store(
+        MemFlags::trusted(),
+        res_ext,
+        exec_ctx_data,
+        ExecCtxLayout::TEMP_VAL,
+    );
+
+    let slot_val = user_data;
 
     // Append slot_val (the woken proc-ctx fat-ptr) back to process_arr.
     let proc_arr_fat = builder.ins().load(
@@ -749,10 +756,10 @@ fn emit_wake_by_user_data(
         sh_ctx_start,
         ShedulerCtxLayout::REAL_COUNT_OF_PROCESSES,
     );
-    builder.ins().jump(scan_done, &[]);
+    builder.ins().jump(wake_done, &[]);
 
-    builder.switch_to_block(scan_done);
-    builder.seal_block(scan_done);
+    builder.switch_to_block(wake_done);
+    builder.seal_block(wake_done);
 }
 
 /// Build `rt_io_uring_wait_cqe()` — combined submit + wait through a single
@@ -960,6 +967,18 @@ pub fn define_io_park_current(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         new_parked,
         sh_ctx_start,
         ShedulerCtxLayout::IO_PARKED_COUNT,
+    );
+
+    // Stash the slot index in the actor's ProcessCtx so the wake path can
+    // swap-and-pop in O(1) without scanning io_parked.
+    //   proc_ctx is a fat-ptr; deref → process_ctx data; write idx at
+    //   IO_PARKED_IDX offset.
+    let proc_ctx_data = builder.ins().load(ty, MemFlags::trusted(), proc_ctx, 0);
+    builder.ins().store(
+        MemFlags::trusted(),
+        parked_count,
+        proc_ctx_data,
+        ProcessCtxLayout::IO_PARKED_IDX,
     );
 
     builder.ins().return_(&[]);
@@ -1197,9 +1216,9 @@ pub fn define_listen_tcp(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let bind_ok = builder.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, bind_rc, 0);
     builder.ins().trapz(bind_ok, TrapCode::unwrap_user(51));
 
-    // listen(fd, 128)
+    // listen(fd, 4096)
     let nr_listen = builder.ins().iconst(ty, SYS_LISTEN);
-    let backlog = builder.ins().iconst(ty, 128);
+    let backlog = builder.ins().iconst(ty, 4096);
     let _ = builder.ins().call(
         syscall_ref,
         &[nr_listen, fd, backlog, zero, zero, zero, zero],

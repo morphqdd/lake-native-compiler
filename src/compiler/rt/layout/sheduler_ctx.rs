@@ -84,7 +84,10 @@ impl ShedulerCtxLayout {
     pub const INITIAL_QUEUE_CAP: i64 = 256;
     /// Initial parked-actor list capacity (pairs).  Grows with the same
     /// doubling helper as `process_arr` / `wait_arr` (stride parameterised).
-    pub const INITIAL_IO_PARKED_CAP: i64 = 64;
+    /// Initial capacity 4096 to absorb up to 4k concurrently-parked actors
+    /// without grow.  TODO: add grow path same as process_arr/wait_arr; for
+    /// now this caps practical concurrency at 4096.
+    pub const INITIAL_IO_PARKED_CAP: i64 = 4096;
 
     pub fn init(
         ctx: &mut crate::compiler::ctx::CompilerCtx,

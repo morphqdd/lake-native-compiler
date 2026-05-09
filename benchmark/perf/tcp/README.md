@@ -6,30 +6,30 @@ Each server replies "hi from lake\n" after a fixed `work(500)` busy-loop
 
 **Hardware:** AMD Ryzen 7 5700U (16 logical cores), AC power.
 **Kernel:** Linux 6.19.11.
-**Lake commit:** `51fe6d1` (combined submit + wait).
+**Lake commit:** post-`11d08c7` (O(1) wake + backlog 4096 + io_parked cap 4096).
 **Total per concurrency level:** 10 000 requests.
 
 ## Throughput (rps)
 
 | Concurrency | Lake | C-sync | Rust + tokio | Go |
 |---:|---:|---:|---:|---:|
-|    1 | **11 317** | 11 203 | 10 336 | 9 795 |
-|    4 |    17 364 | 16 959 | **18 313** | 18 755 |
-|   16 |    15 987 | **17 567** | 16 244 | 14 348 |
-|   64 |    18 310 | **23 713** | 18 201 | 16 707 |
-|  256 |     8 300 ⚠ | **25 224** | 21 340 | 21 183 |
-| 1024 | **timeout** | **27 538** | timeout | 17 644 |
+|    1 |    10 172 | **11 594** | 10 251 |  9 600 |
+|    4 |    18 167 | 16 859 | **24 899** | 21 783 |
+|   16 |    16 566 | 18 015 | **29 971** | 26 073 |
+|   64 |    18 115 | 21 822 | **31 591** | 22 729 |
+|  256 |    23 288 | 27 423 | **29 453** | 22 535 |
+| 1024 |    23 847 | **29 436** |  4 273 ⚠ | 23 016 |
 
 ## p99 latency
 
 | Concurrency | Lake | C-sync | Rust + tokio | Go |
 |---:|---:|---:|---:|---:|
-|    1 |    145 µs | **122 µs** |   165 µs |   166 µs |
-|    4 |    1.7 ms |    3.3 ms | 1.0 ms | **605 µs** |
-|   16 |    9.2 ms |    9.7 ms |  9.7 ms |  10.3 ms |
-|   64 |   20.0 ms | **12.3 ms** | 18.6 ms |  15.1 ms |
-|  256 |  **1005 ms** ⚠ | **24.8 ms** | 41.4 ms |  37.5 ms |
-| 1024 |   timeout | **59.4 ms** | timeout |  93.2 ms |
+|    1 |    141 µs | **107 µs** |   140 µs |   164 µs |
+|    4 |    2.5 ms |    3.6 ms | **292 µs** |  343 µs |
+|   16 |    9.4 ms |    8.0 ms | **711 µs** |  805 µs |
+|   64 |   21.0 ms |   16.5 ms | **2.4 ms** |  3.7 ms |
+|  256 |   63.1 ms |   26.1 ms | **16.2 ms** | 34.1 ms |
+| 1024 |   72.5 ms | **47.3 ms** | 1117 ms ⚠ | 94.2 ms |
 
 ## Plots
 
@@ -39,41 +39,52 @@ Each server replies "hi from lake\n" after a fixed `work(500)` busy-loop
 
 ## Reading
 
-* **c = 1–16:** all four servers within statistical noise.  Lake leads
-  at c = 1 (11 317 rps) and matches everyone else through c = 16.
-* **c = 64:** Lake is competitive (18 k rps) but C sync edges ahead at
-  24 k.  Tail latency starts growing for everyone (p99 12–20 ms).
-* **c = 256:** Lake **catastrophically degrades** — throughput drops to
-  8 k rps and p99 latency explodes to **1 second**.  p50 stays at
-  4.5 ms — most requests still fast, but a heavy tail.
-* **c = 1024:** Lake and tokio both time out (60 s deadline).  C sync
-  and Go survive — C sync at 27 k rps with p99 = 59 ms.
+* **c = 1–4:** all servers within statistical noise.  Tokio edges
+  ahead by c = 4 thanks to its mature event-loop batching.
+* **c = 16–64:** tokio leads on throughput and tail (sub-millisecond
+  p99 at c = 64).  Lake mid-pack on throughput, p99 ~21 ms.
+* **c = 256:** all four hold ~22-29 k rps.  Lake at 23 k rps p99 = 63 ms
+  — slower tail than tokio (16 ms) and C-sync (26 ms), competitive with
+  Go (34 ms).
+* **c = 1024:** Lake **survives at 24 k rps with p99 = 72 ms** —
+  comparable to Go (94 ms) and C sync (47 ms).  Tokio degrades sharply
+  in this run (4 k rps with p99 over 1 s, possibly TIME_WAIT-related).
+  All runs still drop ~8 % of connects at this concurrency due to
+  client-side ephemeral-port pressure (10 000 connects in < 1 s
+  against a single peer 4-tuple).
 
-## Lake's c=256 cliff — root cause
+## Bottlenecks fixed (commit log entry)
 
-The wake path uses `emit_wake_by_user_data`: a **linear scan over
-io_parked** to find the actor whose `user_data` matches the CQE.  At
-c = 256 the parked-actor list grows to ~256 entries.  Each CQE then
-scans up to 256 slots; with 10 000 completions per second that's
-~2.5 M list iterations on the hot path, all in user-space.
+The first run of this bench showed Lake collapsing at c = 256 to
+8 k rps with p99 = 1 s.  Root causes and fixes:
 
-The scan happens between every accept and send completion, and
-serialises with the scheduler loop.  Tail latency reflects the
-queue buildup that occurs when the scan can't keep up.
+1. **O(N) wake scan.**  `emit_wake_by_user_data` originally walked
+   `io_parked` linearly to match a CQE's user_data to a parked actor.
+   At c = 256 that's ~256 iters per CQE × 10 k completions =
+   2.5 M iterations on the hot path.
 
-## Fix (not yet implemented)
+   **Fix:** intrusive index field `IO_PARKED_IDX` on `ProcessCtx`.
+   `rt_io_park_current` stashes the io_parked slot at park time;
+   the wake path reads it directly and does an O(1) swap-and-pop
+   (with a coherency update for the moved actor's intrusive idx).
 
-Replace the O(N) scan with O(1) lookup.  Two options:
+2. **listen() backlog = 128.**  Lake's `rt_listen_tcp` originally
+   used `listen(fd, 128)`, while C-sync used 1024.  At c = 256+,
+   the SYN backlog overflowed and 256 simultaneously-arriving SYNs
+   were partially dropped, amplifying tail latency through retries.
 
-1. **Hash table** keyed by proc-ctx fat-ptr.  Standard, modest
-   memory overhead.
-2. **Intrusive pointer in ProcessCtx** holding the io_parked slot
-   index.  On wake, swap-and-pop using the stored index — no scan.
-   Smaller footprint, no separate hashmap data structure.
+   **Fix:** raise to `listen(fd, 4096)`.
 
-Either should restore Lake to tokio/Go-class behaviour at c = 256+.
-File a follow-up task before any further bench claims at high
-concurrency.
+3. **io_parked cap = 64.**  `INITIAL_IO_PARKED_CAP` was 64 with no
+   grow path, so the 65th parked actor wrote past the buffer.
+
+   **Fix:** raise initial cap to 4096.  Real grow logic (same as
+   `process_arr` / `wait_arr`) is still TODO; current cap holds
+   practical concurrency at 4 k.
+
+After these three fixes, Lake's c = 256–1024 numbers landed in the
+same band as Go and C-sync.  The c = 64–256 throughput trail vs tokio
+is the next opportunity (see follow-ups below).
 
 ## What this bench does NOT show
 

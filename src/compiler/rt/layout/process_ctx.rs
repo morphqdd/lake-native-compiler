@@ -9,9 +9,14 @@ use crate::compiler::{ctx::CompilerCtx, rt::layout::ExecCtxLayout};
 pub struct ProcessCtxLayout;
 
 impl ProcessCtxLayout {
-    pub const SIZE: i32 = 16;
+    pub const SIZE: i32 = 24;
     pub const FUNC_PTR: i32 = 0;
     pub const EXEC_CTX: i32 = 8;
+    /// Slot index in `sh_ctx.io_parked` while this actor is parked, or
+    /// undefined when the actor is in `process_arr`.  Maintained by
+    /// `rt_io_park_current` (write on park) and `emit_wake_by_user_data`
+    /// (used to swap-and-pop in O(1) without scanning `io_parked`).
+    pub const IO_PARKED_IDX: i32 = 16;
 
     pub fn init_ctx(
         ctx: &mut CompilerCtx,
