@@ -12,7 +12,7 @@ use lake_frontend::{
         ast::{Branch, Clean, Item, MachineItem, Pattern, Type},
         expr::Expr,
     },
-    prelude::build_ast,
+    prelude::{build_program, load_and_build},
 };
 use log::{debug, error, info};
 
@@ -35,52 +35,92 @@ pub fn compile<SP: AsRef<Path>>(
     let path = source_path.as_ref();
     info!("compile: {} (opt={})", path.display(), opt.as_str());
 
-    let src = fs::read_to_string(path)?;
-    let ast = build_ast(path, &src).map_err(|err| {
+    // ── Phase 1: load all sources (entry + transitively imported) ──────────
+    let sources = load_and_build(path).map_err(|errs| {
         pb.finish_and_clear();
-        err.1.display(&src, path);
+        // Best-effort diagnostic display: each error has a span into one
+        // of the loaded files; we render against the entry file as a
+        // fallback when the loader fails before parsing succeeds.
+        let entry_src = fs::read_to_string(path).unwrap_or_default();
+        errs.display(&entry_src, path);
+        anyhow!("Failed to load Lake program")
+    })?;
+
+    // ── Phase 2: parse → populate registry → resolve → typecheck ───────────
+    let lake_program = build_program(&sources).map_err(|errs| {
+        pb.finish_and_clear();
+        // Render diagnostics against every loaded file in turn; spans
+        // outside the file's range simply don't render.
+        for f in sources.files() {
+            errs.display(&f.src, &f.source_path);
+        }
         anyhow!("Failed while build ast!")
     })?;
-    info!("parsed {} top-level items", ast.1.len());
-    debug!("ast: {:?}", ast.1);
+
+    let module_count = lake_program.program.modules.len();
+    let item_count: usize = lake_program
+        .program
+        .modules
+        .iter()
+        .map(|m| m.ast.len())
+        .sum();
+    info!(
+        "parsed {} module{} ({} top-level items)",
+        module_count,
+        if module_count == 1 { "" } else { "s" },
+        item_count
+    );
 
     let mut ctx = CompilerCtx::new(opt);
 
     info!("initializing runtime");
     ctx = RuntimeBuilder::init(ctx)?;
 
+    // Iterate every loaded module's items in turn for each pass.
+    // Cross-module name collisions (two `pub` machines with the same
+    // name in different modules) would surface through
+    // `predeclare_machine`'s registry — for now we assume globally
+    // unique machine names.  Real mangling lands when the first
+    // collision in stdlib forces it.
+
     info!("indexing machines and patterns");
-    for item in &ast.1 {
-        match &item.inner {
-            Item::Directive(directive) if directive.name.as_str() == "rt" => {
-                let Type::Named(func_name) = &directive.args[0].inner else {
-                    bail!("@rt expects a named type, found: {:?}", directive.args[0]);
-                };
-                debug!("index: @rt '{}'", func_name.0);
-                ctx.declare_rt_func_in_prog(func_name.0);
+    for module in &lake_program.program.modules {
+        for item in &module.ast {
+            match &item.inner {
+                Item::Directive(directive) if directive.name.as_str() == "rt" => {
+                    let Type::Named(func_name) = &directive.args[0].inner else {
+                        bail!("@rt expects a named type, found: {:?}", directive.args[0]);
+                    };
+                    debug!("index: @rt '{}'", func_name.0);
+                    ctx.declare_rt_func_in_prog(func_name.0);
+                }
+                Item::Machine(machine) => {
+                    let name = machine.inner.ident.to_string();
+                    debug!("index: pre-declare machine '{name}'");
+                    ctx.add_machine(&name);
+                    ctx.predeclare_machine(&name)?;
+                }
+                _ => {}
             }
-            Item::Machine(machine) => {
-                let name = machine.inner.ident.to_string();
-                debug!("index: pre-declare machine '{name}'");
-                ctx.add_machine(&name);
-                ctx.predeclare_machine(&name)?;
-            }
-            _ => {}
         }
     }
     // Pass 2: branch patterns — compute hashes once and store in registry.
-    for item in &ast.1 {
-        if let Item::Machine(machine) = &item.inner {
-            index_machine(&mut ctx, &machine.inner)?;
+    for module in &lake_program.program.modules {
+        for item in &module.ast {
+            if let Item::Machine(machine) = &item.inner {
+                index_machine(&mut ctx, &machine.inner)?;
+            }
         }
     }
 
-    for item in &ast.1 {
-        if let Item::Machine(machine) = &item.inner {
-            info!("compiling machine '{}'", machine.inner.ident.to_string());
-            if let Err(err) = compile_machine(&mut ctx, &machine.inner, 256) {
-                error!("{}", err);
-                debug!("{:#?}", ctx.get_registry());
+    for module in &lake_program.program.modules {
+        for item in &module.ast {
+            if let Item::Machine(machine) = &item.inner {
+                info!("compiling machine '{}'", machine.inner.ident.to_string());
+                if let Err(err) = compile_machine(&mut ctx, &machine.inner, 256) {
+                    error!("{}", err);
+                    debug!("{:#?}", ctx.get_registry());
+                }
             }
         }
     }
