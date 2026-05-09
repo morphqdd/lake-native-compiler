@@ -15,7 +15,7 @@ loop is {
       3 -> { rt_write(1 "FizzBuzz\n" 9) }
       2 -> { rt_write(1 "Fizz\n" 5) }
       1 -> { rt_write(1 "Buzz\n" 5) }
-      0 -> {
+      _ -> {
         let s i64 = to_string_with_ln(i)
         rt_write(1 s len(s))
       }

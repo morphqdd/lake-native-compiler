@@ -22,6 +22,11 @@ enum WhenBranchType {
     Ptr,
 }
 
+/// True for the wildcard pattern `_` used as a default arm in `when`.
+fn is_wildcard(expr: &Expr<'_>) -> bool {
+    matches!(expr, Expr::Var("_", _))
+}
+
 pub fn compile<'a>(
     ctx: &mut CompilerCtx,
     builder: &mut FunctionBuilder,
@@ -33,6 +38,26 @@ pub fn compile<'a>(
     branches: Vec<(Expr<'a>, Vec<Expr<'a>>)>,
 ) -> Result<StmtOutcome> {
     let ptr_ty = ctx.module().target_config().pointer_type();
+
+    // Detect a wildcard `_` arm — at most one is allowed.  When present it
+    // becomes the default destination of the dispatch switch instead of the
+    // implicit "fall through to after_when" path.
+    let wildcard_idx: Option<usize> = {
+        let positions: Vec<usize> = branches
+            .iter()
+            .enumerate()
+            .filter(|(_, (cond, _))| is_wildcard(cond))
+            .map(|(i, _)| i)
+            .collect();
+        if positions.len() > 1 {
+            bail!(
+                "`when` accepts at most one wildcard `_` arm, got {} (at indices {:?})",
+                positions.len(),
+                positions
+            );
+        }
+        positions.into_iter().next()
+    };
 
     let b_check = builder.create_block();
     let b_ret: Vec<_> = (0..branches.len())
@@ -118,7 +143,21 @@ pub fn compile<'a>(
     {
         let mut keys = vec![];
         let mut when_switch = Switch::new();
-        let when_branch_type = get_ty(&branches.iter().nth(0).unwrap().0)?;
+        // Pick the type from the first non-wildcard arm — wildcards have no
+        // discriminant kind of their own.
+        let typed_arm = branches
+            .iter()
+            .find(|(c, _)| !is_wildcard(c))
+            .ok_or_else(|| {
+                anyhow::anyhow!("`when` requires at least one typed arm in addition to `_`")
+            })?;
+        let when_branch_type = get_ty(&typed_arm.0)?;
+        // Default destination of the dispatch switch: the wildcard arm's body
+        // start when one exists, otherwise the implicit fall-through block.
+        let default_block = match wildcard_idx {
+            Some(idx) => b_ret[idx],
+            None => b_no_match,
+        };
 
         let ctx_ptr = builder.use_var(machine_ctx_var);
         let raw_ctx_ptr = builder.ins().load(ptr_ty, MemFlags::new(), ctx_ptr, 0);
@@ -127,14 +166,25 @@ pub fn compile<'a>(
         let index_ext = match when_branch_type {
             WhenBranchType::Simple => {
                 for (i, (cond_span, _)) in branches.iter().enumerate() {
+                    if is_wildcard(cond_span) {
+                        continue;
+                    }
                     when_switch.set_entry(literal_value(cond_span)?, b_ret[i]);
                 }
                 temp_off
             }
             WhenBranchType::Ptr => {
-                for (cond_span, _) in branches.iter() {
+                // Track the original branch index for each non-wildcard key
+                // so the switch can map the MPHF index back to the right
+                // body block.
+                let mut key_branch_idx: Vec<usize> = Vec::new();
+                for (i, (cond_span, _)) in branches.iter().enumerate() {
+                    if is_wildcard(cond_span) {
+                        continue;
+                    }
                     let key = hash_lit(cond_span)?;
                     keys.push(key);
+                    key_branch_idx.push(i);
                 }
                 let mphf = MphfBuilder::build(&keys);
 
@@ -178,7 +228,7 @@ pub fn compile<'a>(
                 for (i, &key) in keys.iter().enumerate() {
                     let index = mphf.lookup(key) as usize;
                     keys_table[index] = key;
-                    when_switch.set_entry(index as u128, b_ret[i]);
+                    when_switch.set_entry(index as u128, b_ret[key_branch_idx[i]]);
                 }
 
                 let mut keys_bytes = vec![];
@@ -216,14 +266,14 @@ pub fn compile<'a>(
                 let verified_block = builder.create_block();
                 builder
                     .ins()
-                    .brif(matches, verified_block, &[], b_no_match, &[]);
+                    .brif(matches, verified_block, &[], default_block, &[]);
 
                 builder.switch_to_block(verified_block);
                 builder.seal_block(verified_block);
                 index_ext
             }
         };
-        when_switch.emit(builder, index_ext, b_no_match);
+        when_switch.emit(builder, index_ext, default_block);
     }
     outer_switch.set_entry(disc_done_id as u128, b_check);
 
