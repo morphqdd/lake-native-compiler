@@ -9,7 +9,7 @@ use anyhow::{Result, anyhow, bail};
 use indicatif::ProgressBar;
 use lake_frontend::{
     api::{
-        ast::{Branch, Clean, MachineItem, Pattern, Type},
+        ast::{Branch, Clean, Item, MachineItem, Pattern, Type},
         expr::Expr,
     },
     prelude::build_ast,
@@ -41,7 +41,7 @@ pub fn compile<SP: AsRef<Path>>(
         err.1.display(&src, path);
         anyhow!("Failed while build ast!")
     })?;
-    info!("parsed {} top-level expressions", ast.1.len());
+    info!("parsed {} top-level items", ast.1.len());
     debug!("ast: {:?}", ast.1);
 
     let mut ctx = CompilerCtx::new(opt);
@@ -50,16 +50,16 @@ pub fn compile<SP: AsRef<Path>>(
     ctx = RuntimeBuilder::init(ctx)?;
 
     info!("indexing machines and patterns");
-    for expr in &ast.1 {
-        match &expr.inner {
-            Expr::Directive(directive) if directive.name.as_str() == "rt" => {
+    for item in &ast.1 {
+        match &item.inner {
+            Item::Directive(directive) if directive.name.as_str() == "rt" => {
                 let Type::Named(func_name) = &directive.args[0].inner else {
                     bail!("@rt expects a named type, found: {:?}", directive.args[0]);
                 };
                 debug!("index: @rt '{}'", func_name.0);
                 ctx.declare_rt_func_in_prog(func_name.0);
             }
-            Expr::Machine(machine) => {
+            Item::Machine(machine) => {
                 let name = machine.inner.ident.to_string();
                 debug!("index: pre-declare machine '{name}'");
                 ctx.add_machine(&name);
@@ -69,14 +69,14 @@ pub fn compile<SP: AsRef<Path>>(
         }
     }
     // Pass 2: branch patterns — compute hashes once and store in registry.
-    for expr in &ast.1 {
-        if let Expr::Machine(machine) = &expr.inner {
+    for item in &ast.1 {
+        if let Item::Machine(machine) = &item.inner {
             index_machine(&mut ctx, &machine.inner)?;
         }
     }
 
-    for expr in &ast.1 {
-        if let Expr::Machine(machine) = &expr.inner {
+    for item in &ast.1 {
+        if let Item::Machine(machine) = &item.inner {
             info!("compiling machine '{}'", machine.inner.ident.to_string());
             if let Err(err) = compile_machine(&mut ctx, &machine.inner, 256) {
                 error!("{}", err);
@@ -222,11 +222,15 @@ pub(crate) fn hash_call_args(
         let ty_str = match arg {
             Expr::Var(name, ty) => {
                 let raw = ty.to_string();
-                if raw == "{}" {
+                // The resolver leaves `Type::Unknown` (rendered as `?`) for
+                // variable references whose type is determined later by the
+                // enclosing pattern.  Recover the declared type from
+                // `var_types` in that case.
+                if raw == "?" {
                     var_types
                         .get(name.to_string().as_str())
                         .map(|s| s.as_str())
-                        .unwrap_or("{}")
+                        .unwrap_or("?")
                         .to_string()
                 } else {
                     raw
@@ -237,11 +241,12 @@ pub(crate) fn hash_call_args(
                 Expr::Var(_, ty) => ty.to_string(),
                 _ => continue,
             },
-            // Arithmetic and comparison ops produce i64.
+            // Arithmetic, negation, and comparison ops produce i64.
             Expr::Add(_, _)
             | Expr::Sub(_, _)
             | Expr::Mul(_, _)
             | Expr::Div(_, _)
+            | Expr::Neg(_)
             | Expr::Le(_, _)
             | Expr::Ge(_, _)
             | Expr::Eq(_, _)

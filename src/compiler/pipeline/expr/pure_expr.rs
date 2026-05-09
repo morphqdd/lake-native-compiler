@@ -16,6 +16,7 @@ use crate::compiler::{
 pub fn is_pure(expr: &Expr) -> bool {
     match expr {
         Expr::Num(..) | Expr::Bool(..) | Expr::Var(..) => true,
+        Expr::Neg(inner) => is_pure(&inner.inner),
         Expr::Add(l, r)
         | Expr::Sub(l, r)
         | Expr::Mul(l, r)
@@ -32,6 +33,7 @@ pub fn is_pure(expr: &Expr) -> bool {
 fn has_var(expr: &Expr) -> bool {
     match expr {
         Expr::Var(..) => true,
+        Expr::Neg(inner) => has_var(&inner.inner),
         Expr::Add(l, r)
         | Expr::Sub(l, r)
         | Expr::Mul(l, r)
@@ -110,6 +112,10 @@ pub fn fold(
             let rv = fold(&r.inner, builder, ptr_ty, vars_start, state);
             let cmp = builder.ins().icmp(IntCC::SignedGreaterThan, lv, rv);
             builder.ins().uextend(ptr_ty, cmp)
+        }
+        Expr::Neg(inner) => {
+            let v = fold(&inner.inner, builder, ptr_ty, vars_start, state);
+            builder.ins().ineg(v)
         }
         _ => unreachable!("fold called on non-pure expr: {:?}", expr),
     }
