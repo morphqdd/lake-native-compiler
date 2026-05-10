@@ -7,6 +7,44 @@ use cranelift::{
 
 use crate::compiler::ctx::CompilerCtx;
 
+/// Build `rt_str_ptr(fat_ptr: i64) -> i64`.
+///
+/// Returns the start pointer (raw byte address) extracted from a fat-pointer
+/// header.  Pure read of `*(fat_ptr + 0)`.  No payload access, no bounds.
+///
+/// Intended for `experimental/` stdlib that builds I/O directly on
+/// `rt_syscall` and needs the raw byte pointer that the kernel expects for
+/// `write(2)`, `sendto(2)`, etc.
+pub fn define_str_ptr(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
+    let ty = ctx.module().target_config().pointer_type();
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut module_ctx = ctx.module().make_context();
+    let mut builder = FunctionBuilder::new(&mut module_ctx.func, &mut builder_ctx);
+
+    builder.func.signature.params.push(AbiParam::new(ty));
+    builder.func.signature.returns.push(AbiParam::new(ty));
+
+    let entry = builder.create_block();
+    builder.append_block_param(entry, ty);
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+
+    let fat_ptr = builder.block_params(entry)[0];
+    let start = builder.ins().load(ty, MemFlags::new(), fat_ptr, 0);
+    builder.ins().return_(&[start]);
+
+    builder.seal_all_blocks();
+
+    let sig = builder.func.signature.clone();
+    let id = ctx
+        .module_mut()
+        .declare_function("rt_str_ptr", Linkage::Export, &sig)?;
+    ctx.module_mut().define_function(id, &mut module_ctx)?;
+    ctx.module_mut().clear_context(&mut module_ctx);
+    Ok(ctx)
+}
+
 /// Build `len(fat_ptr: i64) -> i64`.
 ///
 /// Returns the number of bytes in the fat-pointer region:

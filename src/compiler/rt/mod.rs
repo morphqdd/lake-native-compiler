@@ -19,7 +19,7 @@ use crate::compiler::{
             },
             mmap::{define_init_heap, define_mmap, define_munmap},
             read::define_read,
-            strings::{define_len, define_to_string, define_to_string_with_ln},
+            strings::{define_len, define_str_ptr, define_to_string, define_to_string_with_ln},
             syscall::declare_syscall_wrapper,
             write::{define_write, define_write_static},
         },
@@ -90,6 +90,8 @@ impl RuntimeBuilder {
         let ctx = define_write_static(ctx)?;
         debug!("rt: len");
         let ctx = define_len(ctx)?;
+        debug!("rt: rt_str_ptr");
+        let ctx = define_str_ptr(ctx)?;
         debug!("rt: to_string_with_ln");
         let ctx = define_to_string_with_ln(ctx)?;
         debug!("rt: to_string");
