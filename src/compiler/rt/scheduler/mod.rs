@@ -69,21 +69,15 @@ pub fn build_scheduler(ctx: &mut CompilerCtx, builder: &mut FunctionBuilder) -> 
         .ins()
         .brif(has_active, exec_block, &[], check_waited_block, &[]);
 
+    // Order matters: if any actor is parked on I/O we MUST hit wait_cqe
+    // before bouncing back through `loop_block`, otherwise message-
+    // waiting actors keep us in a busy loop forever (poll_cq finds
+    // nothing because we never called wait_cqe to actually drive the
+    // kernel forward).  Check parked-on-I/O FIRST, then fall through to
+    // the message-waited check.
     builder.switch_to_block(check_waited_block);
-    let waited = ShedulerCtxLayout::get_waited_processes(sh_ptr_var, ctx, builder)?;
-    let has_waited = builder.ins().icmp_imm(IntCC::NotEqual, waited, 0);
     let check_io_parked_block = builder.create_block();
-    builder
-        .ins()
-        .brif(has_waited, loop_block, &[], check_io_parked_block, &[]);
-
-    // No runnable processes and no message-waiters — but if anyone is parked
-    // on I/O, block on `io_uring_enter(min_complete=1)` until at least one
-    // CQE arrives, then loop back and let `poll_cq` wake the lucky actor(s).
-    builder.switch_to_block(check_io_parked_block);
-    builder.seal_block(check_io_parked_block);
     let sh_use = builder.use_var(sh_ptr_var);
-    // sh_use is the fat-ptr address; deref to get raw sh_ctx data start.
     let sh_data = builder.ins().load(ptr_ty, MemFlags::trusted(), sh_use, 0);
     let parked_count = builder.ins().load(
         ptr_ty,
@@ -95,7 +89,19 @@ pub fn build_scheduler(ctx: &mut CompilerCtx, builder: &mut FunctionBuilder) -> 
     let wait_io_block = builder.create_block();
     builder
         .ins()
-        .brif(has_parked, wait_io_block, &[], exit_block, &[]);
+        .brif(has_parked, wait_io_block, &[], check_io_parked_block, &[]);
+
+    // No I/O parking — fall back to "are any actors waiting for a
+    // message?" and if so loop (poll_cq might still wake one if the
+    // message arrived between iterations).  When neither is true the
+    // scheduler exits.
+    builder.switch_to_block(check_io_parked_block);
+    builder.seal_block(check_io_parked_block);
+    let waited = ShedulerCtxLayout::get_waited_processes(sh_ptr_var, ctx, builder)?;
+    let has_waited = builder.ins().icmp_imm(IntCC::NotEqual, waited, 0);
+    builder
+        .ins()
+        .brif(has_waited, loop_block, &[], exit_block, &[]);
 
     builder.switch_to_block(wait_io_block);
     builder.seal_block(wait_io_block);

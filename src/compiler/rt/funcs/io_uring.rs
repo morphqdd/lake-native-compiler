@@ -56,6 +56,7 @@ const IORING_OFF_SQES: i64 = 0x10000000;
 const IORING_OP_WRITE: i64 = 23;
 const IORING_OP_SEND: i64 = 26;
 const IORING_OP_ACCEPT: i64 = 13;
+const IORING_OP_RECV: i64 = 27;
 
 // io_uring_params layout (120 bytes total).
 const PARAMS_SIZE: i64 = 120;
@@ -1558,6 +1559,87 @@ pub fn define_send_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let id = ctx
         .module_mut()
         .declare_function("rt_send_async", Linkage::Export, &sig)?;
+    ctx.module_mut().define_function(id, &mut module_ctx)?;
+    ctx.module_mut().clear_context(&mut module_ctx);
+
+    Ok(ctx)
+}
+
+/// `rt_recv_async(fd, fat_ptr, size)` — submit an `IORING_OP_RECV` SQE
+/// reading up to `size` bytes from the connected socket `fd` into the
+/// buffer pointed to by `fat_ptr`, then park the calling actor.  When
+/// the io_uring CQE delivers the result, `emit_wake_by_user_data`
+/// stores the byte count in the actor's `TEMP_VAL`, so source-level
+/// `let n = rt_recv_async(conn buf size)` (or the stdlib `recv`
+/// wrapper) sees `n` as the number of bytes read.
+pub fn define_recv_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
+    let ty = ctx.module().target_config().pointer_type();
+
+    let syscall_id = match ctx.module().get_name("rt_syscall") {
+        Some(FuncOrDataId::Func(id)) => id,
+        _ => return Err(anyhow!("rt_syscall must be declared before rt_recv_async")),
+    };
+    let sched_fat_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
+        Some(FuncOrDataId::Data(id)) => id,
+        _ => return Err(anyhow!("sheduler_ctx_fat_ptr global not found")),
+    };
+    let park_id = match ctx.module().get_name("rt_io_park_current") {
+        Some(FuncOrDataId::Func(id)) => id,
+        _ => return Err(anyhow!("rt_io_park_current must be declared before rt_recv_async")),
+    };
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut module_ctx = ctx.module().make_context();
+    let mut builder = FunctionBuilder::new(&mut module_ctx.func, &mut builder_ctx);
+
+    for _ in 0..3 {
+        builder.func.signature.params.push(AbiParam::new(ty));
+    }
+
+    let entry = builder.create_block();
+    for _ in 0..3 {
+        builder.append_block_param(entry, ty);
+    }
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+
+    let [fd, fat_ptr, size] = builder.block_params(entry)[0..3] else {
+        unreachable!()
+    };
+
+    let _ = syscall_id;
+    let sched_gv = ctx
+        .module_mut()
+        .declare_data_in_func(sched_fat_id, &mut builder.func);
+    let park_ref = ctx
+        .module_mut()
+        .declare_func_in_func(park_id, &mut builder.func);
+    let sh_ctx_fat = builder.ins().global_value(ty, sched_gv);
+    let sh_ctx_start = builder.ins().load(ty, MemFlags::trusted(), sh_ctx_fat, 0);
+
+    // Bounds check + extract payload start.  The buffer must hold at
+    // least `size` bytes — same shape as rt_send_async / rt_read.
+    let start = FatPtrLayout::load_start(&mut builder, ty, fat_ptr);
+    let end = FatPtrLayout::load_end(&mut builder, ty, fat_ptr);
+    let access_end = builder.ins().iadd(start, size);
+    let in_bounds = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThanOrEqual, access_end, end);
+    builder
+        .ins()
+        .trapz(in_bounds, TrapCode::unwrap_user(32));
+
+    emit_submit_sqe(sh_ctx_start, IORING_OP_RECV, fd, start, size, ty, &mut builder);
+
+    // Park the calling actor; the scheduler's combined wait+submit will
+    // flush the SQE and wake us when the CQE arrives.
+    builder.ins().call(park_ref, &[]);
+    builder.ins().return_(&[]);
+
+    let sig = builder.func.signature.clone();
+    let id = ctx
+        .module_mut()
+        .declare_function("rt_recv_async", Linkage::Export, &sig)?;
     ctx.module_mut().define_function(id, &mut module_ctx)?;
     ctx.module_mut().clear_context(&mut module_ctx);
 

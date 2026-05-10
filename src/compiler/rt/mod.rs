@@ -14,8 +14,8 @@ use crate::compiler::{
             io_uring::{
                 define_accept_async, define_close, define_io_park_current,
                 define_io_uring_flush, define_io_uring_poll_cq, define_io_uring_setup,
-                define_io_uring_wait_cqe, define_listen_tcp, define_send_async,
-                define_write_async,
+                define_io_uring_wait_cqe, define_listen_tcp, define_recv_async,
+                define_send_async, define_write_async,
             },
             mmap::{define_init_heap, define_mmap, define_munmap},
             read::define_read,
@@ -78,9 +78,10 @@ impl RuntimeBuilder {
         debug!("rt: rt_listen_tcp / rt_close");
         let ctx = define_listen_tcp(ctx)?;
         let ctx = define_close(ctx)?;
-        debug!("rt: rt_accept_async / rt_send_async");
+        debug!("rt: rt_accept_async / rt_send_async / rt_recv_async");
         let ctx = define_accept_async(ctx)?;
         let ctx = define_send_async(ctx)?;
+        let ctx = define_recv_async(ctx)?;
         debug!("rt: rt_write");
         let ctx = define_write(ctx)?;
         debug!("rt: rt_read");

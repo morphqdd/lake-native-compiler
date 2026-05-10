@@ -183,7 +183,7 @@ pub fn compile(
         // when the user paired it with a separate submit (rt_write_async).
         if matches!(
             *callee_name,
-            "rt_io_park_current" | "rt_accept_async" | "rt_send_async"
+            "rt_io_park_current" | "rt_accept_async" | "rt_send_async" | "rt_recv_async"
         ) {
             let resume_id = builder.ins().iconst(ptr_ty, next_id + 1);
             let exec_start = ctx.exec_start(builder, machine_ctx_var);
