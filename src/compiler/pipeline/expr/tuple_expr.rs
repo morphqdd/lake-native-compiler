@@ -1,15 +1,18 @@
+use std::hash::{DefaultHasher, Hash, Hasher};
+
 use anyhow::Result;
+use base64ct::{Base64, Encoding};
 use cranelift::{
     codegen::ir::BlockArg,
     frontend::Switch,
-    module::Module,
-    prelude::{FunctionBuilder, InstBuilder, MemFlags, Variable},
+    module::{DataDescription, FuncOrDataId, Linkage, Module},
+    prelude::{FunctionBuilder, InstBuilder, MemFlags, Type as CType, Value, Variable},
 };
 use lake_frontend::api::expr::Expr;
 
 use crate::compiler::{
     ctx::CompilerCtx,
-    pipeline::expr::{BranchState, StmtOutcome, pure_expr},
+    pipeline::expr::{BranchState, StmtOutcome, pure_expr, string_expr},
     rt::layout::ExecCtxLayout,
 };
 
@@ -35,11 +38,17 @@ pub fn compile(
 ) -> Result<StmtOutcome> {
     let ptr_ty = ctx.module().target_config().pointer_type();
 
-    // All elements must be pure so we can evaluate them eagerly within
-    // a single block.  Non-pure shapes (Jump / When / Wait / Let) would
-    // need their own CPS chain — defer until we have a real use case.
+    // All elements must be either a) pure (Num / Var / arith / atom)
+    // so `fold` can resolve them inside this block, or b) a string
+    // literal — strings are immutable values but their payload lives
+    // in a module-level data section + fat-ptr companion that needs
+    // `&mut CompilerCtx` to declare, which `fold` doesn't have.  We
+    // emit the data section here and substitute the fat-ptr global
+    // for that element below; everything else still runs through
+    // the pure-expr fold path.
     for (i, e) in elems.iter().enumerate() {
-        if !pure_expr::is_pure(e) {
+        let ok = matches!(e, Expr::String(..)) || pure_expr::is_pure(e);
+        if !ok {
             anyhow::bail!(
                 "tuple element {i} is not a pure expression (use a `let` to \
                  bind the result of an effectful expression first): {:?}",
@@ -86,8 +95,15 @@ pub fn compile(
     let payload_start = builder.ins().load(ptr_ty, MemFlags::trusted(), fat_ptr, 0);
 
     // Fold each element into a Cranelift value and write it into its slot.
+    // String literals are pure but their payload lives in a module-level
+    // data section + fat-ptr companion that `fold` can't materialise on
+    // its own (no &mut CompilerCtx).  Emit the data declarations here
+    // and lower the element to a global_value load before storing.
     for (i, e) in elems.iter().enumerate() {
-        let v = pure_expr::fold_with_self(e, builder, ptr_ty, vars_start, self_pid, state);
+        let v = match e {
+            Expr::String(s, _) => emit_string_fat_ptr(ctx, builder, ptr_ty, s)?,
+            _ => pure_expr::fold_with_self(e, builder, ptr_ty, vars_start, self_pid, state),
+        };
         builder
             .ins()
             .store(MemFlags::trusted(), v, payload_start, (i as i32) * 8);
@@ -132,6 +148,67 @@ fn references_var(expr: &Expr) -> bool {
         | Expr::Shr(l, r) => references_var(&l.inner) || references_var(&r.inner),
         _ => false,
     }
+}
+
+/// Mirror `string_expr::compile`'s data-section setup but return the
+/// fat-ptr's address as a Cranelift `Value` instead of stashing it in
+/// `TEMP_VAL`.  Used by tuple element compilation to write a string
+/// literal directly into a tuple slot.
+fn emit_string_fat_ptr(
+    ctx: &mut CompilerCtx,
+    builder: &mut FunctionBuilder,
+    ptr_ty: CType,
+    s: &str,
+) -> Result<Value> {
+    let mut hasher = DefaultHasher::new();
+    s.hash(&mut hasher);
+    let hash = hasher.finish();
+    let encoded = Base64::encode_string(&hash.to_be_bytes());
+
+    let bytes = string_expr::unescape(s);
+
+    let data_id = match ctx.module().get_name(&encoded) {
+        Some(FuncOrDataId::Data(id)) => id,
+        _ => {
+            let id = ctx
+                .module_mut()
+                .declare_data(&encoded, Linkage::Export, false, false)?;
+            let mut desc = DataDescription::new();
+            desc.define(bytes.clone().into_boxed_slice());
+            ctx.module_mut().define_data(id, &desc)?;
+            id
+        }
+    };
+
+    let fat_ptr_name = format!("fp_{encoded}");
+    let fat_ptr_id = match ctx.module().get_name(&fat_ptr_name) {
+        Some(FuncOrDataId::Data(id)) => id,
+        _ => {
+            let id = ctx
+                .module_mut()
+                .declare_data(&fat_ptr_name, Linkage::Export, true, false)?;
+            let mut desc = DataDescription::new();
+            desc.define_zeroinit(16);
+            ctx.module_mut().define_data(id, &desc)?;
+            id
+        }
+    };
+
+    let data_gv = ctx
+        .module_mut()
+        .declare_data_in_func(data_id, builder.func);
+    let fat_ptr_gv = ctx
+        .module_mut()
+        .declare_data_in_func(fat_ptr_id, builder.func);
+
+    let data_ptr = builder.ins().global_value(ptr_ty, data_gv);
+    let fat_ptr = builder.ins().global_value(ptr_ty, fat_ptr_gv);
+    let end_ptr = builder.ins().iadd_imm(data_ptr, bytes.len() as i64);
+
+    builder.ins().store(MemFlags::new(), data_ptr, fat_ptr, 0);
+    builder.ins().store(MemFlags::new(), end_ptr, fat_ptr, 8);
+
+    Ok(fat_ptr)
 }
 
 fn references_self(expr: &Expr) -> bool {
