@@ -402,7 +402,45 @@ pub fn define_store(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .ins()
         .trapz(in_bounds, TrapCode::unwrap_user(32));
 
-    builder.ins().store(MemFlags::new(), val, access_ptr, 0);
+    // Byte-by-byte store loop — write the LSB-first `size` bytes of
+    // `val` to `access_ptr`.  Cranelift's plain `store` always emits
+    // the full value-type width (i64 = 8 bytes) and would overrun
+    // the caller's intended byte count, clobbering adjacent heap
+    // headers.  set_be32's `rt_store(buf, byte, 1, off)` for offsets
+    // near a 32-byte buffer's end was silently overwriting the
+    // following allocation's fat-ptr.start field — observed in the
+    // SHA-256 test (sha_min8) where 7+ sequential set_be32 calls
+    // corrupted the spawned actor's exec_ctx and produced &main as
+    // a JUMP_ARGS fat-ptr.  The loop honours `size` at runtime.
+    let bloop_h = builder.create_block();
+    let bloop_b = builder.create_block();
+    let bret = builder.create_block();
+    builder.append_block_param(bloop_h, ty);
+    let zero = builder.ins().iconst(ty, 0);
+    builder
+        .ins()
+        .jump(bloop_h, &[cranelift::codegen::ir::BlockArg::Value(zero)]);
+
+    builder.switch_to_block(bloop_h);
+    let i = builder.block_params(bloop_h)[0];
+    let cond = builder.ins().icmp(IntCC::UnsignedLessThan, i, size);
+    builder.ins().brif(cond, bloop_b, &[], bret, &[]);
+
+    builder.switch_to_block(bloop_b);
+    builder.seal_block(bloop_b);
+    let shift_bits = builder.ins().imul_imm(i, 8);
+    let shifted = builder.ins().ushr(val, shift_bits);
+    let byte = builder.ins().ireduce(cranelift::prelude::types::I8, shifted);
+    let dst = builder.ins().iadd(access_ptr, i);
+    builder.ins().store(MemFlags::new(), byte, dst, 0);
+    let i_next = builder.ins().iadd_imm(i, 1);
+    builder
+        .ins()
+        .jump(bloop_h, &[cranelift::codegen::ir::BlockArg::Value(i_next)]);
+    builder.seal_block(bloop_h);
+
+    builder.switch_to_block(bret);
+    builder.seal_block(bret);
     builder.ins().return_(&[]);
 
     let sig = builder.func.signature.clone();
