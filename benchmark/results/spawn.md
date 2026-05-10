@@ -1,5 +1,5 @@
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `lake (cooperative, ExecCtx alloc)` | 9.5 ± 0.5 | 8.7 | 11.3 | 1.00 |
-| `go (goroutines, GOMAXPROCS=1)` | 193.3 ± 7.1 | 182.4 | 203.6 | 20.29 ± 1.38 |
-| `rust (tokio current_thread)` | 35.9 ± 1.2 | 33.7 | 38.6 | 3.77 ± 0.25 |
+| `lake (cooperative, ExecCtx alloc)` | 13.3 ± 0.7 | 12.1 | 15.9 | 1.00 |
+| `go (goroutines, GOMAXPROCS=1)` | 204.1 ± 11.3 | 190.9 | 225.6 | 15.32 ± 1.16 |
+| `rust (tokio current_thread)` | 40.9 ± 1.5 | 38.3 | 45.4 | 3.07 ± 0.20 |
