@@ -51,6 +51,7 @@ pub mod pure_expr;
 pub mod send_expr;
 pub mod spawn_expr;
 pub mod string_expr;
+pub mod tuple_expr;
 pub mod var_expr;
 pub mod wait_expr;
 pub mod when_expr;
@@ -194,6 +195,18 @@ pub fn compile_expr(
             handlers.iter().map(|branch| branch.inner.clone()).collect(),
             filter.iter().map(|f| f.inner.clone()).collect(),
         ),
+        Expr::Tuple(elems) => {
+            let inner: Vec<Expr<'_>> = elems.iter().map(|e| e.inner.clone()).collect();
+            tuple_expr::compile(
+                ctx,
+                builder,
+                machine_ctx_var,
+                block_id,
+                branch_switch,
+                state,
+                &inner,
+            )
+        }
         _ => bail!("Unsupported expression type: {:?}", expr),
     }
 }

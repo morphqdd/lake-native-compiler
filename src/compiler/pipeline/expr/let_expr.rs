@@ -45,9 +45,18 @@ pub fn compile(
     let b = builder.create_block();
     builder.switch_to_block(b);
 
-    // Register the variable and get its slot index.
+    // Register the variable and get its slot index.  Composite types
+    // (Struct/Tuple, atom) all live as fat-pointer i64s at runtime, so
+    // collapse them to "i64" before the type-map lookup; the surface
+    // string is still kept as the Lake-level type for downstream
+    // diagnostics via `lake_type_of`.
+    let lookup_key = match ty {
+        Type::Struct(_) => "i64".to_string(),
+        Type::Named(ident) if ident.inner.0 == "atom" => "i64".to_string(),
+        _ => ty.to_string(),
+    };
     let cranelift_ty = ctx
-        .lookup_type(&ty.to_string())
+        .lookup_type(&lookup_key)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("Unknown type '{}'", ty.to_string()))?
         .unwrap_simple();

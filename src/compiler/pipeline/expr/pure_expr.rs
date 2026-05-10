@@ -15,8 +15,9 @@ use crate::compiler::{
 
 pub fn is_pure(expr: &Expr) -> bool {
     match expr {
-        Expr::Num(..) | Expr::Bool(..) | Expr::Var(..) => true,
+        Expr::Num(..) | Expr::Bool(..) | Expr::Var(..) | Expr::Atom(..) => true,
         Expr::Neg(inner) => is_pure(&inner.inner),
+        Expr::TupleIndex { receiver, .. } => is_pure(&receiver.inner),
         Expr::Add(l, r)
         | Expr::Sub(l, r)
         | Expr::Mul(l, r)
@@ -30,12 +31,26 @@ pub fn is_pure(expr: &Expr) -> bool {
     }
 }
 
+/// Stable compile-time mapping from an atom name to its runtime ID.
+///
+/// Two `:ok` literals anywhere in the program fold to the same `i64`,
+/// which is what equality and pattern dispatch rely on.  We use the
+/// stable `DefaultHasher` (SipHash) and force the low bit so the value
+/// is always non-zero — `0` stays available as the "no atom" sentinel.
+pub fn atom_id(name: &str) -> i64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    name.hash(&mut h);
+    (h.finish() as i64) | 1
+}
+
 /// Does this expression mention `self`?  Used by [`compile`] to decide
 /// whether to plumb the current process's pid through to [`fold_with_self`].
 fn has_self(expr: &Expr) -> bool {
     match expr {
         Expr::Var("self", _) => true,
         Expr::Neg(inner) => has_self(&inner.inner),
+        Expr::TupleIndex { receiver, .. } => has_self(&receiver.inner),
         Expr::Add(l, r)
         | Expr::Sub(l, r)
         | Expr::Mul(l, r)
@@ -57,6 +72,7 @@ fn has_var(expr: &Expr) -> bool {
         Expr::Var("self", _) => false,
         Expr::Var(..) => true,
         Expr::Neg(inner) => has_var(&inner.inner),
+        Expr::TupleIndex { receiver, .. } => has_var(&receiver.inner),
         Expr::Add(l, r)
         | Expr::Sub(l, r)
         | Expr::Mul(l, r)
@@ -96,6 +112,23 @@ pub fn fold_with_self(
     match expr {
         Expr::Num(s, _) => builder.ins().iconst(ptr_ty, s.parse::<i64>().unwrap_or(0)),
         Expr::Bool(b) => builder.ins().iconst(ptr_ty, if *b { 1 } else { 0 }),
+        Expr::Atom(name) => builder.ins().iconst(ptr_ty, atom_id(name)),
+        Expr::TupleIndex { receiver, index } => {
+            let recv_val = fold_with_self(
+                &receiver.inner,
+                builder,
+                ptr_ty,
+                vars_start,
+                self_pid,
+                state,
+            );
+            // The receiver is the address of a 16 B fat-ptr `{start, end}`.
+            // Tuple payload is `[elem0, elem1, ...]`, each i64-sized.
+            let start = builder.ins().load(ptr_ty, MemFlags::trusted(), recv_val, 0);
+            builder
+                .ins()
+                .load(ptr_ty, MemFlags::trusted(), start, (*index as i32) * 8)
+        }
         Expr::Var("self", _) => self_pid.expect(
             "self used as a value but no self_pid supplied — call \
              pure_expr::compile or pass self_pid through fold_with_self",
