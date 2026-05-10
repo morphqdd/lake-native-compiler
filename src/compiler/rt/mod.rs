@@ -9,7 +9,7 @@ use crate::compiler::{
     ctx::{CompilerCtx, rt_funcs::RtFuncs},
     rt::{
         funcs::{
-            alloc::{define_allocate, define_free, define_loads, define_store},
+            alloc::{define_allocate, define_copy_bytes, define_free, define_loads, define_store},
             exit::define_exit,
             io_uring::{
                 define_accept_async, define_close, define_io_park_current,
@@ -63,6 +63,8 @@ impl RuntimeBuilder {
         let ctx = define_store(ctx)?;
         debug!("rt: rt_load_u{{8,16,32,64}}");
         let ctx = define_loads(ctx)?;
+        debug!("rt: rt_copy_bytes");
+        let ctx = define_copy_bytes(ctx)?;
         debug!("rt: rt_io_uring_setup");
         let ctx = define_io_uring_setup(ctx)?;
         debug!("rt: rt_write_async");

@@ -301,6 +301,19 @@ fn count_expr_slots(expr: &Expr<'_>) -> usize {
     }
 }
 
+/// Collapse Lake-surface type names that share the runtime ABI to a
+/// single canonical form.  At the symbol layer `str`, `atom`, `pid`,
+/// and a generic i64 buffer are all 64-bit values, so the dispatch
+/// hash treats them as one type.  Without this, an `at(buf i64)`
+/// branch would refuse a call site that passes a `str` literal even
+/// though the runtime cannot tell them apart.
+fn canon_arg_ty(s: &str) -> &str {
+    match s {
+        "str" | "atom" | "pid" => "i64",
+        other => other,
+    }
+}
+
 /// Hash a branch's pattern to produce a unique u64 key and the non-default
 /// parameter count.  Only the *type* of each non-default parameter is hashed
 /// (not the binding name) so the hash is identical to `hash_call_args` when
@@ -314,8 +327,10 @@ pub(crate) fn hash_pattern(patterns: &[Pattern<'_>]) -> (u64, usize) {
         }
         param_count += 1;
         let ty = Clean::<Type<'_>>::clean(p);
-        debug!("Hashed pattern ty: {ty}");
-        ty.to_string().hash(&mut hasher);
+        let ty_str = ty.to_string();
+        let canon = canon_arg_ty(&ty_str);
+        debug!("Hashed pattern ty: {ty} → {canon}");
+        canon.hash(&mut hasher);
     }
     (hasher.finish(), param_count)
 }
@@ -371,8 +386,9 @@ pub(crate) fn hash_call_args(
             Expr::Bool(_) => "i64".to_string(),
             _ => continue,
         };
-        debug!("Hashed arg ty: {ty_str}");
-        ty_str.hash(&mut hasher);
+        let canon = canon_arg_ty(&ty_str);
+        debug!("Hashed arg ty: {ty_str} → {canon}");
+        canon.hash(&mut hasher);
     }
     hasher.finish()
 }

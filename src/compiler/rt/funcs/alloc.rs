@@ -480,3 +480,106 @@ pub fn define_loads(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
     Ok(ctx)
 }
+
+/// Build `rt_copy_bytes(dst_fat, dst_off, src_fat, src_off, len) -> {}`.
+///
+/// Bounds-checked byte-by-byte memcpy.  Used by stdlib helpers that
+/// build a result buffer from one or more source slices (string
+/// concat, response builders, hash digest assembly, …).  Both ranges
+/// are validated against their respective fat-pointer end markers
+/// before the copy starts; an out-of-range access traps.
+///
+/// The inner loop is a Cranelift loop with one byte per iteration.
+/// LLVM-style memcpy intrinsics aren't available in the embedded
+/// build, but Cranelift's regalloc + CSE keep this within ~3
+/// instructions per byte at -O.  When the language gains a
+/// dedicated `buf` type we can switch the hot path to a wider
+/// load / store stride.
+pub fn define_copy_bytes(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
+    use cranelift::codegen::ir::BlockArg;
+    let ptr_ty = ctx.module().target_config().pointer_type();
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut module_ctx = ctx.module().make_context();
+    let mut builder = FunctionBuilder::new(&mut module_ctx.func, &mut builder_ctx);
+
+    for _ in 0..5 {
+        builder.func.signature.params.push(AbiParam::new(ptr_ty));
+    }
+
+    // ── Blocks ───────────────────────────────────────────────────────────────
+    let entry = builder.create_block();
+    for _ in 0..5 {
+        builder.append_block_param(entry, ptr_ty);
+    }
+    let loop_hdr = builder.create_block();
+    builder.append_block_param(loop_hdr, ptr_ty); // i (counter)
+    let loop_body = builder.create_block();
+    let exit = builder.create_block();
+
+    // ── entry ────────────────────────────────────────────────────────────────
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+    let params = builder.block_params(entry);
+    let (dst_fat, dst_off, src_fat, src_off, len) =
+        (params[0], params[1], params[2], params[3], params[4]);
+
+    let dst_start = FatPtrLayout::load_start(&mut builder, ptr_ty, dst_fat);
+    let dst_end = FatPtrLayout::load_end(&mut builder, ptr_ty, dst_fat);
+    let src_start = FatPtrLayout::load_start(&mut builder, ptr_ty, src_fat);
+    let src_end = FatPtrLayout::load_end(&mut builder, ptr_ty, src_fat);
+
+    // dst_access_end = dst_start + dst_off + len
+    let dst_access_base = builder.ins().iadd(dst_start, dst_off);
+    let dst_access_end = builder.ins().iadd(dst_access_base, len);
+    let src_access_base = builder.ins().iadd(src_start, src_off);
+    let src_access_end = builder.ins().iadd(src_access_base, len);
+
+    let dst_in_bounds = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThanOrEqual, dst_access_end, dst_end);
+    builder
+        .ins()
+        .trapz(dst_in_bounds, TrapCode::unwrap_user(33));
+    let src_in_bounds = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThanOrEqual, src_access_end, src_end);
+    builder
+        .ins()
+        .trapz(src_in_bounds, TrapCode::unwrap_user(34));
+
+    let zero = builder.ins().iconst(ptr_ty, 0);
+    builder.ins().jump(loop_hdr, &[BlockArg::Value(zero)]);
+
+    // ── loop_hdr (i) ─────────────────────────────────────────────────────────
+    builder.switch_to_block(loop_hdr);
+    let i = builder.block_params(loop_hdr)[0];
+    let cont = builder.ins().icmp(IntCC::UnsignedLessThan, i, len);
+    builder.ins().brif(cont, loop_body, &[], exit, &[]);
+
+    // ── loop_body ────────────────────────────────────────────────────────────
+    builder.switch_to_block(loop_body);
+    builder.seal_block(loop_body);
+    let src_addr = builder.ins().iadd(src_access_base, i);
+    let byte = builder
+        .ins()
+        .load(cranelift::prelude::types::I8, MemFlags::new(), src_addr, 0);
+    let dst_addr = builder.ins().iadd(dst_access_base, i);
+    builder.ins().store(MemFlags::new(), byte, dst_addr, 0);
+    let next_i = builder.ins().iadd_imm(i, 1);
+    builder.ins().jump(loop_hdr, &[BlockArg::Value(next_i)]);
+    builder.seal_block(loop_hdr);
+
+    // ── exit ─────────────────────────────────────────────────────────────────
+    builder.switch_to_block(exit);
+    builder.seal_block(exit);
+    builder.ins().return_(&[]);
+
+    let sig = builder.func.signature.clone();
+    let id = ctx
+        .module_mut()
+        .declare_function("rt_copy_bytes", Linkage::Export, &sig)?;
+    ctx.module_mut().define_function(id, &mut module_ctx)?;
+    ctx.module_mut().clear_context(&mut module_ctx);
+    Ok(ctx)
+}
