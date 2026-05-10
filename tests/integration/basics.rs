@@ -21,3 +21,19 @@ fn empty_main_exits_zero() {
     let out = run(src).unwrap();
     assert_eq!(out.exit_code, 0);
 }
+
+#[test]
+fn paren_grouping_in_expression() {
+    // Without grouping, `2 * 3 + 4` is `(2*3)+4 = 10`.  With grouping
+    // `2 * (3 + 4)` is 14 — the test exit-codes the difference so a
+    // regression in the new `(expr)` atom is impossible to miss.
+    let src = r#"
+        @rt(rt_exit)
+        main is { _ -> {
+          let a = 2 * (3 + 4)
+          rt_exit(a)
+        } }
+    "#;
+    let out = run(src).unwrap();
+    assert_eq!(out.exit_code, 14);
+}
