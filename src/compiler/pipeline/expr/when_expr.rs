@@ -285,6 +285,10 @@ fn literal_value(expr: &Expr<'_>) -> Result<u128> {
         Expr::Bool(false) => Ok(0),
         Expr::Bool(true) => Ok(1),
         Expr::Num(s, _) => Ok(s.parse::<i64>()? as u64 as u128),
+        // An atom in a `when` arm dispatches on its compile-time hash —
+        // identical to how the discriminant fold emits the value, so
+        // equality holds.
+        Expr::Atom(name) => Ok(super::pure_expr::atom_id(name) as u64 as u128),
         other => bail!("unsupported when condition: {:?}", other),
     }
 }
@@ -300,8 +304,9 @@ fn get_ty(expr: &Expr<'_>) -> Result<WhenBranchType> {
     match expr {
         Expr::Bool(false) => Ok(WhenBranchType::Simple),
         Expr::Bool(true) => Ok(WhenBranchType::Simple),
-        Expr::Num(s, _) => Ok(WhenBranchType::Simple),
-        Expr::String(s, _) => Ok(WhenBranchType::Ptr),
+        Expr::Num(_, _) => Ok(WhenBranchType::Simple),
+        Expr::Atom(_) => Ok(WhenBranchType::Simple),
+        Expr::String(_, _) => Ok(WhenBranchType::Ptr),
         other => bail!("unsupported when condition: {:?}", other),
     }
 }
