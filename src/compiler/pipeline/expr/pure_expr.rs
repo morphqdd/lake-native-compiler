@@ -125,7 +125,9 @@ pub fn fold_with_self(
     state: &BranchState,
 ) -> Value {
     match expr {
-        Expr::Num(s, _) => builder.ins().iconst(ptr_ty, s.parse::<i64>().unwrap_or(0)),
+        Expr::Num(s, _) => builder
+            .ins()
+            .iconst(ptr_ty, lake_frontend::api::expr::parse_int_literal(s).unwrap_or(0)),
         Expr::Bool(b) => builder.ins().iconst(ptr_ty, if *b { 1 } else { 0 }),
         Expr::Atom(name) => builder.ins().iconst(ptr_ty, atom_id(name)),
         Expr::TupleIndex { receiver, index } => {

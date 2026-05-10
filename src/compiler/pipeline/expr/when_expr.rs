@@ -284,7 +284,7 @@ fn literal_value(expr: &Expr<'_>) -> Result<u128> {
     match expr {
         Expr::Bool(false) => Ok(0),
         Expr::Bool(true) => Ok(1),
-        Expr::Num(s, _) => Ok(s.parse::<i64>()? as u64 as u128),
+        Expr::Num(s, _) => Ok(lake_frontend::api::expr::parse_int_literal(s)? as u64 as u128),
         // An atom in a `when` arm dispatches on its compile-time hash —
         // identical to how the discriminant fold emits the value, so
         // equality holds.
