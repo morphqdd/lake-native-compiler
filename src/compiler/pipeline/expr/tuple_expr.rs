@@ -124,7 +124,12 @@ fn references_var(expr: &Expr) -> bool {
         | Expr::Ge(l, r)
         | Expr::Eq(l, r)
         | Expr::Lt(l, r)
-        | Expr::Gt(l, r) => references_var(&l.inner) || references_var(&r.inner),
+        | Expr::Gt(l, r)
+        | Expr::BAnd(l, r)
+        | Expr::BOr(l, r)
+        | Expr::BXor(l, r)
+        | Expr::Shl(l, r)
+        | Expr::Shr(l, r) => references_var(&l.inner) || references_var(&r.inner),
         _ => false,
     }
 }
@@ -142,7 +147,12 @@ fn references_self(expr: &Expr) -> bool {
         | Expr::Ge(l, r)
         | Expr::Eq(l, r)
         | Expr::Lt(l, r)
-        | Expr::Gt(l, r) => references_self(&l.inner) || references_self(&r.inner),
+        | Expr::Gt(l, r)
+        | Expr::BAnd(l, r)
+        | Expr::BOr(l, r)
+        | Expr::BXor(l, r)
+        | Expr::Shl(l, r)
+        | Expr::Shr(l, r) => references_self(&l.inner) || references_self(&r.inner),
         _ => false,
     }
 }

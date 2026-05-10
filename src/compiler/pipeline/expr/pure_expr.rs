@@ -26,7 +26,12 @@ pub fn is_pure(expr: &Expr) -> bool {
         | Expr::Ge(l, r)
         | Expr::Eq(l, r)
         | Expr::Lt(l, r)
-        | Expr::Gt(l, r) => is_pure(&l.inner) && is_pure(&r.inner),
+        | Expr::Gt(l, r)
+        | Expr::BAnd(l, r)
+        | Expr::BOr(l, r)
+        | Expr::BXor(l, r)
+        | Expr::Shl(l, r)
+        | Expr::Shr(l, r) => is_pure(&l.inner) && is_pure(&r.inner),
         _ => false,
     }
 }
@@ -59,7 +64,12 @@ fn has_self(expr: &Expr) -> bool {
         | Expr::Ge(l, r)
         | Expr::Eq(l, r)
         | Expr::Lt(l, r)
-        | Expr::Gt(l, r) => has_self(&l.inner) || has_self(&r.inner),
+        | Expr::Gt(l, r)
+        | Expr::BAnd(l, r)
+        | Expr::BOr(l, r)
+        | Expr::BXor(l, r)
+        | Expr::Shl(l, r)
+        | Expr::Shr(l, r) => has_self(&l.inner) || has_self(&r.inner),
         _ => false,
     }
 }
@@ -81,7 +91,12 @@ fn has_var(expr: &Expr) -> bool {
         | Expr::Ge(l, r)
         | Expr::Eq(l, r)
         | Expr::Lt(l, r)
-        | Expr::Gt(l, r) => has_var(&l.inner) || has_var(&r.inner),
+        | Expr::Gt(l, r)
+        | Expr::BAnd(l, r)
+        | Expr::BOr(l, r)
+        | Expr::BXor(l, r)
+        | Expr::Shl(l, r)
+        | Expr::Shr(l, r) => has_var(&l.inner) || has_var(&r.inner),
         _ => false,
     }
 }
@@ -192,6 +207,32 @@ pub fn fold_with_self(
         Expr::Neg(inner) => {
             let v = fold_with_self(&inner.inner, builder, ptr_ty, vars_start, self_pid, state);
             builder.ins().ineg(v)
+        }
+        Expr::BAnd(l, r) => {
+            let lv = fold_with_self(&l.inner, builder, ptr_ty, vars_start, self_pid, state);
+            let rv = fold_with_self(&r.inner, builder, ptr_ty, vars_start, self_pid, state);
+            builder.ins().band(lv, rv)
+        }
+        Expr::BOr(l, r) => {
+            let lv = fold_with_self(&l.inner, builder, ptr_ty, vars_start, self_pid, state);
+            let rv = fold_with_self(&r.inner, builder, ptr_ty, vars_start, self_pid, state);
+            builder.ins().bor(lv, rv)
+        }
+        Expr::BXor(l, r) => {
+            let lv = fold_with_self(&l.inner, builder, ptr_ty, vars_start, self_pid, state);
+            let rv = fold_with_self(&r.inner, builder, ptr_ty, vars_start, self_pid, state);
+            builder.ins().bxor(lv, rv)
+        }
+        Expr::Shl(l, r) => {
+            let lv = fold_with_self(&l.inner, builder, ptr_ty, vars_start, self_pid, state);
+            let rv = fold_with_self(&r.inner, builder, ptr_ty, vars_start, self_pid, state);
+            builder.ins().ishl(lv, rv)
+        }
+        Expr::Shr(l, r) => {
+            let lv = fold_with_self(&l.inner, builder, ptr_ty, vars_start, self_pid, state);
+            let rv = fold_with_self(&r.inner, builder, ptr_ty, vars_start, self_pid, state);
+            // Logical / unsigned right shift — what crypto code expects.
+            builder.ins().ushr(lv, rv)
         }
         _ => unreachable!("fold called on non-pure expr: {:?}", expr),
     }
