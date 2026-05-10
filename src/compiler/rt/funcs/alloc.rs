@@ -427,11 +427,12 @@ pub fn define_loads(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
         builder.func.signature.params.push(AbiParam::new(ptr_ty));
         builder.func.signature.params.push(AbiParam::new(ptr_ty));
-        builder
-            .func
-            .signature
-            .returns
-            .push(AbiParam::new(loaded_ty));
+        // Always return i64 so callers can store the value in any
+        // i64-sized slot (TEMP_VAL, vars[], call args).  The narrow
+        // load is widened in the body via uextend; the rt_registry
+        // signature side already advertises `i64` as the return type
+        // so the surface and ABI match.
+        builder.func.signature.returns.push(AbiParam::new(ptr_ty));
 
         let entry = builder.create_block();
         builder.append_block_param(entry, ptr_ty);
@@ -456,9 +457,16 @@ pub fn define_loads(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
             .ins()
             .trapz(in_bounds, TrapCode::unwrap_user(32));
 
-        let val = builder
+        let raw_val = builder
             .ins()
             .load(loaded_ty, MemFlags::new(), access_ptr, 0);
+        // Widen to ptr_ty (i64) when narrower; for the 64-bit case
+        // uextend would error, so just pass through.
+        let val = if bits < 64 {
+            builder.ins().uextend(ptr_ty, raw_val)
+        } else {
+            raw_val
+        };
         builder.ins().return_(&[val]);
 
         let sig = builder.func.signature.clone();
