@@ -62,25 +62,43 @@ pub fn compile_send(
         .call(load_ref, &[vars_ptr, pid_slot_offset]);
     let pid_val = builder.inst_results(call_pid)[0];
 
-    // ── 1a. Null-pid check ──────────────────────────────────────────────
+    // ── 1a. Resolve pid → proc_ctx via the scheduler's pid_table.
     // The lowering pass for ret-machine calls without a `let` binding
-    // passes 0 as the implicit __caller pid sentinel.  When the
-    // ret-machine then runs `__caller(self X)` (= a send to that null
-    // pid), we silently drop it: dereferencing 0 as a process_ctx
-    // fat-ptr would segfault.  Live pids are heap-allocated and never
-    // zero, so a single icmp is sufficient.
+    // passes 0 as the implicit __caller pid sentinel.  Slot 0 of the
+    // pid_table is reserved as the null sentinel and stays 0, so the
+    // null pid yields a 0 proc_ctx and we silently drop the send.
+    // Dead actors' pids likewise read back as 0 because
+    // `clear_pid` zeroes their slot during reclamation, so a stale
+    // pid (#73) can no longer cause a wrong actor to receive the
+    // message.
+    let sched_data_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
+        Some(FuncOrDataId::Data(id)) => id,
+        _ => bail!("sheduler_ctx_fat_ptr global not found"),
+    };
+    let sched_gv = ctx
+        .module_mut()
+        .declare_data_in_func(sched_data_id, &mut builder.func);
+    let sh_fat_ptr_for_lookup = builder.ins().global_value(ptr_ty, sched_gv);
+    let target_proc_ctx_fat = ShedulerCtxLayout::lookup_proc_ctx(
+        sh_fat_ptr_for_lookup,
+        pid_val,
+        ctx,
+        builder,
+    );
+
     let send_block = builder.create_block();
     let continue_block = builder.create_block();
-    let pid_is_null = builder.ins().icmp_imm(IntCC::Equal, pid_val, 0);
+    let proc_ctx_is_null = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, target_proc_ctx_fat, 0);
     builder
         .ins()
-        .brif(pid_is_null, continue_block, &[], send_block, &[]);
+        .brif(proc_ctx_is_null, continue_block, &[], send_block, &[]);
 
     builder.switch_to_block(send_block);
 
-    // ── 2. Load target's exec_ctx ───────────────────────────────────────
-    // PID = process_ctx_fat_ptr
-    let target_exec_ctx_fat = ProcessCtxLayout::get_exec_ctx(pid_val, ctx, builder)?;
+    // ── 2. Load target's exec_ctx via its proc_ctx fat-ptr ──────────────
+    let target_exec_ctx_fat = ProcessCtxLayout::get_exec_ctx(target_proc_ctx_fat, ctx, builder)?;
     let target_exec_start =
         FatPtrLayout::load_start(builder, ptr_ty, target_exec_ctx_fat);
 
@@ -131,18 +149,10 @@ pub fn compile_send(
     );
 
     // ── 4. Wake target process ──────────────────────────────────────────
-    let sched_data_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
-        Some(FuncOrDataId::Data(id)) => id,
-        _ => bail!("sheduler_ctx_fat_ptr global not found"),
-    };
-    let sched_gv = ctx
-        .module_mut()
-        .declare_data_in_func(sched_data_id, &mut builder.func);
-    let sh_fat_ptr = builder.ins().global_value(ptr_ty, sched_gv);
-
-    // We need a Variable for wake_process. Create a temporary one.
+    // Reuse the scheduler ctx fat-ptr we already loaded for the
+    // pid_table lookup — same data section, no need to import twice.
     let sh_var = builder.declare_var(ptr_ty);
-    builder.def_var(sh_var, sh_fat_ptr);
+    builder.def_var(sh_var, sh_fat_ptr_for_lookup);
 
     ShedulerCtxLayout::wake_process(sh_var, pid_val, ctx, builder, continue_block)?;
 

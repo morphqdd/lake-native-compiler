@@ -92,3 +92,61 @@ fn scheduler_queue_grows_past_initial_cap() {
     let s = out.stdout_str();
     assert_eq!(s.matches('y').count(), 300);
 }
+
+/// Bug #73: two sequential calls to a self-loop ret-machine with a side
+/// effect.  The first actor (cd_actor_1) ran correctly and produced its
+/// reply; on death the scheduler freed its proc_ctx fat-ptr, which the
+/// allocator pushed to a free list and immediately handed out to the
+/// second actor (cd_actor_2).  Because pids were process_ctx addresses,
+/// cd_actor_2 inherited cd_actor_1's pid — wait2's filter accepted a
+/// stale identifier and main returned r2 = stale value without ever
+/// running the second actor.  Fixed by switching to a monotonic pid +
+/// pid_table indirection: dead actors leave a permanent gap in the
+/// table, so a recycled proc_ctx address can never collide with an
+/// older pid.
+#[test]
+fn sequential_ret_self_loop_actors_each_run_once() {
+    let src = r#"
+        @rt(rt_exit)
+        @rt(rt_write)
+
+        cd is {
+          x i64 -> ret i64 {
+            rt_write(1 "*" 1)
+            when x == 0 {
+              true -> { rt_write(1 "Z" 1) ret 99 }
+              _    -> { self(x - 1) }
+            }
+          }
+        }
+
+        main is {
+          _ -> {
+            let r1 = cd(2)
+            rt_write(1 "[" 1)
+            let r2 = cd(3)
+            rt_write(1 "]" 1)
+            rt_exit(r1 + r2)
+          }
+        }
+    "#;
+    let out = run(src).unwrap();
+    assert_eq!(out.exit_code, 198, "stderr: {:?}", out.stderr);
+    let s = out.stdout_str();
+    // cd(2) runs: 3 stars + Z. cd(3) runs: 4 stars + Z. main brackets `[`
+    // and `]` between them.  Order constraints: brackets land between the
+    // two actors (main parks until cd_actor_1 replies, then prints `[`,
+    // spawns cd_actor_2, parks again, prints `]` after the second reply).
+    assert_eq!(
+        s.matches('*').count(),
+        7,
+        "expected 7 stars (3 from cd(2) + 4 from cd(3)), got {s:?}"
+    );
+    assert_eq!(
+        s.matches('Z').count(),
+        2,
+        "expected 2 Z markers (one per actor), got {s:?}"
+    );
+    assert!(s.contains('['), "missing `[` separator: {s:?}");
+    assert!(s.contains(']'), "missing `]` separator: {s:?}");
+}

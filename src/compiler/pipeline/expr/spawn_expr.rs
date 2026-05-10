@@ -151,11 +151,6 @@ pub fn compile_spawn(
     let proc_ctx_fat_ptr =
         ProcessCtxLayout::init_ctx(ctx, builder, machine_name, exec_ctx_fat_ptr)?;
 
-    // Stash the new actor's own pid (its proc_ctx fat-ptr address) inside
-    // its ExecCtx so source-level `self` can read it back.  Other actors
-    // already use this same address as the actor's pid.
-    ExecCtxLayout::store(builder, proc_ctx_fat_ptr, exec_ctx_ptr, ExecCtxLayout::OWN_PID);
-
     let sched_data_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
         Some(FuncOrDataId::Data(id)) => id,
         _ => bail!("sheduler_ctx_fat_ptr global not found"),
@@ -165,10 +160,19 @@ pub fn compile_spawn(
         .declare_data_in_func(sched_data_id, &mut builder.func);
     let sh_ctx_ptr = builder.ins().global_value(ptr_ty, sched_gv);
 
+    // Assign a monotonic pid for the spawned actor and stash it in its
+    // OWN_PID slot.  Source-level `self` returns this pid; sends look
+    // it up via pid_table to find the proc_ctx.  Critical for #73:
+    // every spawn gets a fresh integer that can never collide with a
+    // dead actor's pid even if the underlying proc_ctx fat-ptr address
+    // gets recycled by the free-list allocator.
+    let new_pid = ShedulerCtxLayout::assign_pid(sh_ctx_ptr, proc_ctx_fat_ptr, ctx, builder);
+    ExecCtxLayout::store(builder, new_pid, exec_ctx_ptr, ExecCtxLayout::OWN_PID);
+
     ShedulerCtxLayout::new_process(sh_ctx_ptr, proc_ctx_fat_ptr, ctx, builder)?;
 
-    // ── Store PID (proc_ctx_fat_ptr) in spawning process's TEMP_VAL ─────
-    // Allows `let p pid = machine()` to capture the spawned process's PID.
+    // ── Store the spawned actor's PID (monotonic i64) in the spawning
+    // process's TEMP_VAL so `let p pid = machine()` captures it. ─────
     let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
     let spawning_ctx = builder.use_var(machine_ctx_var);
     let temp_offset = builder
@@ -177,7 +181,7 @@ pub fn compile_spawn(
     let size = builder.ins().iconst(ptr_ty, 8);
     builder.ins().call(
         store_ref,
-        &[spawning_ctx, proc_ctx_fat_ptr, size, temp_offset],
+        &[spawning_ctx, new_pid, size, temp_offset],
     );
 
     let next_id = block_id + 1;

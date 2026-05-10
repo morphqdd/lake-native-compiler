@@ -38,7 +38,7 @@ impl ShedulerCtxLayout {
         Ok(())
     }
 
-    pub const SIZE: i32 = 176;
+    pub const SIZE: i32 = 224;
     pub const PROCESS_ARR_FAT: i32 = 0;
     pub const CURRENT_PROCESS: i32 = 8;
     pub const LAST_PROCESS_INDEX: i32 = 16;
@@ -51,6 +51,30 @@ impl ShedulerCtxLayout {
     pub const PROCESS_ARR_CAP: i32 = 56;
     /// Current capacity (in slots) of `wait_arr`.  Same growth strategy.
     pub const WAIT_ARR_CAP: i32 = 64;
+    /// Generation-tagged pid table.  Each entry is 16 bytes:
+    ///   { gen: i64, proc_ctx_fat_ptr: i64 }
+    /// PIDs are encoded `(gen << 32) | slot`; lookup compares `entry.gen`
+    /// against the high 32 bits of the pid before returning proc_ctx —
+    /// stale pids (those carrying the old gen of a recycled slot) fail
+    /// the check and resolve to 0 (silent send drop, no false wake).
+    /// Slot 0 is reserved as the null-pid sentinel; pid 0 always reads
+    /// gen=0, slot=0, where pid_table[0].gen=0 by zero-init.  Real pids
+    /// start at gen=1, so the null check always succeeds harmlessly.
+    pub const PID_TABLE_FAT: i32 = 176;
+    /// Capacity (in slots, 16 bytes each) of `pid_table`.  Doubles when
+    /// the high water mark reaches the cap.
+    pub const PID_TABLE_CAP: i32 = 184;
+    /// High water mark — the next fresh slot to allocate when
+    /// `free_slots` is empty.  Starts at 1 (slot 0 reserved for null
+    /// sentinel).
+    pub const PID_TABLE_LEN: i32 = 192;
+    /// Stack of recycled slot indices.  When an actor dies, its slot
+    /// index is pushed here; `assign_pid` pops before consuming a fresh
+    /// slot from `PID_TABLE_LEN`.  Bounded by peak-concurrent dead-but-
+    /// not-yet-reused actors.
+    pub const FREE_SLOTS_FAT: i32 = 200;
+    pub const FREE_SLOTS_CAP: i32 = 208;
+    pub const FREE_SLOTS_LEN: i32 = 216;
     // ── io_uring (added in stage 2) ─────────────────────────────────────────
     /// `io_uring_setup` returns a kernel fd for the ring.
     pub const IO_URING_FD: i32 = 72;
@@ -141,9 +165,300 @@ impl ShedulerCtxLayout {
             &[sh_ctx_ptr, init_cap, ptr_size, wait_cap_offset],
         );
 
+        // pid_table — generation-tagged 16-byte entries: { gen, proc_ctx }.
+        // Slot 0 is the null-pid sentinel (zero-init keeps gen=0).
+        // PID_TABLE_LEN starts at 1 so the first fresh slot allocation
+        // returns slot=1 (pid 0 is reserved).
+        let init_bytes = builder.ins().iconst(ptr_ty, Self::INITIAL_QUEUE_CAP * 16);
+        let call_pt = builder.ins().call(allocate_ref, &[init_bytes]);
+        let pid_table_ptr = builder.inst_results(call_pt)[0];
+        let pid_table_offset = builder.ins().iconst(ptr_ty, Self::PID_TABLE_FAT as i64);
+        builder.ins().call(
+            store_ref,
+            &[sh_ctx_ptr, pid_table_ptr, ptr_size, pid_table_offset],
+        );
+
+        let init_cap = builder.ins().iconst(ptr_ty, Self::INITIAL_QUEUE_CAP);
+        let pid_cap_offset = builder.ins().iconst(ptr_ty, Self::PID_TABLE_CAP as i64);
+        builder.ins().call(
+            store_ref,
+            &[sh_ctx_ptr, init_cap, ptr_size, pid_cap_offset],
+        );
+
+        let one = builder.ins().iconst(ptr_ty, 1);
+        let pid_len_offset = builder.ins().iconst(ptr_ty, Self::PID_TABLE_LEN as i64);
+        builder.ins().call(
+            store_ref,
+            &[sh_ctx_ptr, one, ptr_size, pid_len_offset],
+        );
+
+        // free_slots — stack of recycled slot indices (i64 each).
+        let init_bytes = builder.ins().iconst(ptr_ty, Self::INITIAL_QUEUE_CAP * 8);
+        let call_fs = builder.ins().call(allocate_ref, &[init_bytes]);
+        let free_slots_ptr = builder.inst_results(call_fs)[0];
+        let free_slots_offset = builder.ins().iconst(ptr_ty, Self::FREE_SLOTS_FAT as i64);
+        builder.ins().call(
+            store_ref,
+            &[sh_ctx_ptr, free_slots_ptr, ptr_size, free_slots_offset],
+        );
+
+        let init_cap = builder.ins().iconst(ptr_ty, Self::INITIAL_QUEUE_CAP);
+        let free_cap_offset = builder.ins().iconst(ptr_ty, Self::FREE_SLOTS_CAP as i64);
+        builder.ins().call(
+            store_ref,
+            &[sh_ctx_ptr, init_cap, ptr_size, free_cap_offset],
+        );
+        // FREE_SLOTS_LEN already 0 from zero-init.
+
         let var = builder.declare_var(ptr_ty);
         builder.def_var(var, sh_ctx_ptr);
         Ok(var)
+    }
+
+    /// Mask for the slot half of a packed pid `(gen << 32) | slot`.
+    pub const SLOT_MASK: i64 = 0xFFFF_FFFF;
+
+    /// Pop a slot index from `free_slots`, or fall back to a fresh slot
+    /// from the high-water mark if the stack is empty.  Internal helper
+    /// for [`assign_pid`].
+    fn emit_acquire_slot(
+        sh_ctx_ptr: Value,
+        ctx: &mut CompilerCtx,
+        builder: &mut FunctionBuilder,
+    ) -> Value {
+        let ptr_ty = ctx.module().target_config().pointer_type();
+        let rt_funcs = ctx.rt_funcs().clone();
+        let load_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
+        let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
+        let ptr_size = builder.ins().iconst(ptr_ty, ptr_ty.bytes() as i64);
+
+        let fs_len_off = builder.ins().iconst(ptr_ty, Self::FREE_SLOTS_LEN as i64);
+        let call_fs_len = builder.ins().call(load_ref, &[sh_ctx_ptr, fs_len_off]);
+        let fs_len = builder.inst_results(call_fs_len)[0];
+        let stack_empty = builder.ins().icmp_imm(IntCC::Equal, fs_len, 0);
+
+        let pop_block = builder.create_block();
+        let fresh_block = builder.create_block();
+        let merge_block = builder.create_block();
+        builder.append_block_param(merge_block, ptr_ty);
+
+        builder
+            .ins()
+            .brif(stack_empty, fresh_block, &[], pop_block, &[]);
+
+        // ── pop_block: slot = free_slots[len - 1]; len -= 1 ──────────────────
+        builder.switch_to_block(pop_block);
+        builder.seal_block(pop_block);
+        let fs_off = builder.ins().iconst(ptr_ty, Self::FREE_SLOTS_FAT as i64);
+        let call_fs = builder.ins().call(load_ref, &[sh_ctx_ptr, fs_off]);
+        let free_slots = builder.inst_results(call_fs)[0];
+        let new_len = builder.ins().iadd_imm(fs_len, -1);
+        let aligned = builder.ins().imul_imm(new_len, 8);
+        let call_slot = builder.ins().call(load_ref, &[free_slots, aligned]);
+        let popped = builder.inst_results(call_slot)[0];
+        builder.ins().call(
+            store_ref,
+            &[sh_ctx_ptr, new_len, ptr_size, fs_len_off],
+        );
+        builder
+            .ins()
+            .jump(merge_block, &[BlockArg::Value(popped)]);
+
+        // ── fresh_block: slot = pid_table_len++ ─────────────────────────────
+        builder.switch_to_block(fresh_block);
+        builder.seal_block(fresh_block);
+        let pt_len_off = builder.ins().iconst(ptr_ty, Self::PID_TABLE_LEN as i64);
+        let call_pt_len = builder.ins().call(load_ref, &[sh_ctx_ptr, pt_len_off]);
+        let cur_len = builder.inst_results(call_pt_len)[0];
+        let next_len = builder.ins().iadd_imm(cur_len, 1);
+        builder.ins().call(
+            store_ref,
+            &[sh_ctx_ptr, next_len, ptr_size, pt_len_off],
+        );
+        builder
+            .ins()
+            .jump(merge_block, &[BlockArg::Value(cur_len)]);
+
+        builder.switch_to_block(merge_block);
+        builder.seal_block(merge_block);
+        builder.block_params(merge_block)[0]
+    }
+
+    /// Acquire a slot, bump its generation, store `proc_ctx_fat_ptr`,
+    /// and return the packed pid `(gen << 32) | slot`.  The first
+    /// real pid has gen=1 (slot 0's gen=0 stays reserved as the null
+    /// sentinel).
+    pub fn assign_pid(
+        sh_ctx_ptr: Value,
+        proc_ctx_fat_ptr: Value,
+        ctx: &mut CompilerCtx,
+        builder: &mut FunctionBuilder,
+    ) -> Value {
+        let ptr_ty = ctx.module().target_config().pointer_type();
+        let rt_funcs = ctx.rt_funcs().clone();
+        let load_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
+        let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
+        let ptr_size = builder.ins().iconst(ptr_ty, ptr_ty.bytes() as i64);
+
+        let slot = Self::emit_acquire_slot(sh_ctx_ptr, ctx, builder);
+
+        // Grow pid_table so the entry at slot fits.  Stride 16 — pass
+        // log_stride=4 to the helper.  next_index = slot + 1 because
+        // the helper compares `>= cap`.
+        let next_index = builder.ins().iadd_imm(slot, 1);
+        let pid_table_fat = Self::emit_grow_array_if_full_strided(
+            sh_ctx_ptr,
+            Self::PID_TABLE_FAT,
+            Self::PID_TABLE_CAP,
+            next_index,
+            4,
+            ctx,
+            builder,
+        );
+        let pid_table = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), pid_table_fat, 0);
+
+        // entry_addr = pid_table[slot]; entry layout {gen: i64 @0, proc_ctx: i64 @8}
+        let entry_off = builder.ins().imul_imm(slot, 16);
+        let entry_addr = builder.ins().iadd(pid_table, entry_off);
+
+        // Read-modify-write entry.gen — bump on every reuse so stale
+        // pids (with the previous gen) fail the lookup.  Use raw
+        // load/store via trusted MemFlags now that we've computed the
+        // entry address — saves a fat-ptr deref per assign.
+        let cur_gen = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), entry_addr, 0);
+        let new_gen = builder.ins().iadd_imm(cur_gen, 1);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), new_gen, entry_addr, 0);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), proc_ctx_fat_ptr, entry_addr, 8);
+
+        // pid = (gen << 32) | slot.  Slot is small (≤ peak concurrent),
+        // gen fits 32 bits for any practical reuse rate.
+        let gen_high = builder.ins().ishl_imm(new_gen, 32);
+        let pid = builder.ins().bor(gen_high, slot);
+
+        let _ = ptr_size;
+        let _ = (load_ref, store_ref);
+        pid
+    }
+
+    /// Look up `proc_ctx_fat_ptr` for a given pid, or return 0 if the pid
+    /// is dead / null / out of range.  The generation half of the pid is
+    /// compared against `pid_table[slot].gen` — a mismatch (recycled
+    /// slot, stale pid from a dead actor) yields 0 so sends silently
+    /// drop instead of waking the wrong actor (#73).
+    pub fn lookup_proc_ctx(
+        sh_ctx_ptr: Value,
+        pid: Value,
+        ctx: &mut CompilerCtx,
+        builder: &mut FunctionBuilder,
+    ) -> Value {
+        let ptr_ty = ctx.module().target_config().pointer_type();
+        let rt_funcs = ctx.rt_funcs().clone();
+        let load_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
+
+        let pid_table_off = builder.ins().iconst(ptr_ty, Self::PID_TABLE_FAT as i64);
+        let call_pt = builder.ins().call(load_ref, &[sh_ctx_ptr, pid_table_off]);
+        let pid_table_fat = builder.inst_results(call_pt)[0];
+        let pid_table = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), pid_table_fat, 0);
+
+        let slot = builder.ins().band_imm(pid, Self::SLOT_MASK);
+        let gen_high = builder.ins().ushr_imm(pid, 32);
+        let entry_off = builder.ins().imul_imm(slot, 16);
+        let entry_addr = builder.ins().iadd(pid_table, entry_off);
+
+        let entry_gen = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), entry_addr, 0);
+        let entry_proc_ctx = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), entry_addr, 8);
+
+        let match_ = builder.ins().icmp(IntCC::Equal, entry_gen, gen_high);
+        let zero = builder.ins().iconst(ptr_ty, 0);
+        builder.ins().select(match_, entry_proc_ctx, zero)
+    }
+
+    /// Mark `pid` as dead and push its slot onto `free_slots` for reuse.
+    /// Idempotent against stale pids — the gen check guards against
+    /// double-free corrupting an already-recycled slot.  Called by
+    /// `free_process_resources` during reclamation.
+    pub fn clear_pid(
+        sh_ctx_ptr: Value,
+        pid: Value,
+        ctx: &mut CompilerCtx,
+        builder: &mut FunctionBuilder,
+    ) {
+        let ptr_ty = ctx.module().target_config().pointer_type();
+        let rt_funcs = ctx.rt_funcs().clone();
+        let load_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
+        let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
+        let ptr_size = builder.ins().iconst(ptr_ty, ptr_ty.bytes() as i64);
+
+        let slot = builder.ins().band_imm(pid, Self::SLOT_MASK);
+        let gen_high = builder.ins().ushr_imm(pid, 32);
+
+        let pid_table_off = builder.ins().iconst(ptr_ty, Self::PID_TABLE_FAT as i64);
+        let call_pt = builder.ins().call(load_ref, &[sh_ctx_ptr, pid_table_off]);
+        let pid_table_fat = builder.inst_results(call_pt)[0];
+        let pid_table = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), pid_table_fat, 0);
+
+        let entry_off = builder.ins().imul_imm(slot, 16);
+        let entry_addr = builder.ins().iadd(pid_table, entry_off);
+        let entry_gen = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), entry_addr, 0);
+        let live = builder.ins().icmp(IntCC::Equal, entry_gen, gen_high);
+
+        let do_clear = builder.create_block();
+        let after = builder.create_block();
+        builder.ins().brif(live, do_clear, &[], after, &[]);
+
+        builder.switch_to_block(do_clear);
+        builder.seal_block(do_clear);
+
+        // Zero proc_ctx so a concurrent in-flight send sees null.
+        let zero = builder.ins().iconst(ptr_ty, 0);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), zero, entry_addr, 8);
+
+        // Push slot onto free_slots.  Grow if at capacity.
+        let fs_len_off = builder.ins().iconst(ptr_ty, Self::FREE_SLOTS_LEN as i64);
+        let call_fs_len = builder.ins().call(load_ref, &[sh_ctx_ptr, fs_len_off]);
+        let fs_len = builder.inst_results(call_fs_len)[0];
+        let next_len = builder.ins().iadd_imm(fs_len, 1);
+        let free_slots = Self::emit_grow_array_if_full(
+            sh_ctx_ptr,
+            Self::FREE_SLOTS_FAT,
+            Self::FREE_SLOTS_CAP,
+            next_len,
+            ctx,
+            builder,
+        );
+        // free_slots is a fat-ptr; rt_store does the deref + bounds check.
+        let aligned = builder.ins().imul_imm(fs_len, 8);
+        builder
+            .ins()
+            .call(store_ref, &[free_slots, slot, ptr_size, aligned]);
+        builder.ins().call(
+            store_ref,
+            &[sh_ctx_ptr, next_len, ptr_size, fs_len_off],
+        );
+        builder.ins().jump(after, &[]);
+
+        builder.switch_to_block(after);
+        builder.seal_block(after);
     }
 
     pub fn init_main_process(
@@ -224,10 +539,12 @@ impl ShedulerCtxLayout {
 
         let process_ctx = ProcessCtxLayout::init_ctx(ctx, builder, "main", main_ctx_fat_ptr)?;
 
-        // Stash main's own pid (its proc_ctx fat-ptr address) for source-
-        // level `self` reads.  Spawned actors get the same treatment in
-        // `spawn_expr`.
-        ExecCtxLayout::store(builder, process_ctx, main_ctx_ptr, ExecCtxLayout::OWN_PID);
+        // Assign monotonic pid to main and stash it in OWN_PID.  Source-
+        // level `self` reads return this pid; sends look it up in the
+        // pid_table to find main's proc_ctx.
+        let sh_ctx_ptr_for_assign = builder.use_var(sh_ptr_var);
+        let main_pid = Self::assign_pid(sh_ctx_ptr_for_assign, process_ctx, ctx, builder);
+        ExecCtxLayout::store(builder, main_pid, main_ctx_ptr, ExecCtxLayout::OWN_PID);
 
         let rt_funcs = ctx.rt_funcs().clone();
         let load_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
@@ -306,6 +623,15 @@ impl ShedulerCtxLayout {
             .call(load_ref, &[process_ctx_fat_ptr, exec_ctx_offset]);
         let exec_ctx_fat_ptr = builder.inst_results(call_exec)[0];
 
+        // Read OWN_PID before any free so we can clear pid_table[pid]
+        // and prevent stale pids from resolving to a recycled proc_ctx
+        // (root cause of #73).
+        let own_pid_off = builder.ins().iconst(ptr_ty, ExecCtxLayout::OWN_PID as i64);
+        let call_pid = builder
+            .ins()
+            .call(load_ref, &[exec_ctx_fat_ptr, own_pid_off]);
+        let dead_pid = builder.inst_results(call_pid)[0];
+
         // Read the three nested fat-ptrs from the ExecCtx payload before any
         // free, since freeing them clobbers their start fields.
         let vars_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::VARIABLES as i64);
@@ -325,6 +651,21 @@ impl ShedulerCtxLayout {
             .ins()
             .call(load_ref, &[exec_ctx_fat_ptr, mb_offset]);
         let mailbox_fat_ptr = builder.inst_results(call_mb)[0];
+
+        // Mark the pid as dead in the table.  Future sends to this pid
+        // resolve to a 0 proc_ctx and silently drop, even after the
+        // free-list recycles the proc_ctx address into a new actor.
+        let sched_data_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
+            Some(cranelift::module::FuncOrDataId::Data(id)) => Some(id),
+            _ => None,
+        };
+        if let Some(id) = sched_data_id {
+            let sched_gv = ctx
+                .module_mut()
+                .declare_data_in_func(id, &mut builder.func);
+            let sh_ctx_ptr = builder.ins().global_value(ptr_ty, sched_gv);
+            Self::clear_pid(sh_ctx_ptr, dead_pid, ctx, builder);
+        }
 
         // Free leaf allocations first, then the containers.
         builder.ins().call(free_ref, &[vars_fat_ptr]);
@@ -492,6 +833,22 @@ impl ShedulerCtxLayout {
         let ptr_size = builder.ins().iconst(ptr_ty, ptr_ty.bytes() as i64);
         let sh_ctx_ptr = builder.use_var(sh_ptr_var);
 
+        // Resolve pid from proc_ctx.EXEC_CTX.OWN_PID — wait_arr stores
+        // pids (i64) so wake_process can match on the pid the sender
+        // passed, not on a recyclable proc_ctx address.
+        let exec_ctx_off = builder
+            .ins()
+            .iconst(ptr_ty, ProcessCtxLayout::EXEC_CTX as i64);
+        let call_exec = builder
+            .ins()
+            .call(load_ref, &[process_ctx_ptr, exec_ctx_off]);
+        let exec_ctx_fat = builder.inst_results(call_exec)[0];
+        let own_pid_off = builder
+            .ins()
+            .iconst(ptr_ty, ExecCtxLayout::OWN_PID as i64);
+        let call_pid = builder.ins().call(load_ref, &[exec_ctx_fat, own_pid_off]);
+        let pid = builder.inst_results(call_pid)[0];
+
         let offset_last_i = builder
             .ins()
             .iconst(ptr_ty, Self::LAST_WAITED_PROCESS_INDEX as i64);
@@ -513,7 +870,7 @@ impl ShedulerCtxLayout {
 
         builder.ins().call(
             store_ref,
-            &[wait_arr, process_ctx_ptr, ptr_size, aligned_index],
+            &[wait_arr, pid, ptr_size, aligned_index],
         );
 
         builder.ins().call(
@@ -552,6 +909,27 @@ impl ShedulerCtxLayout {
         fat_offset: i32,
         cap_offset: i32,
         next_index: Value,
+        ctx: &mut CompilerCtx,
+        builder: &mut FunctionBuilder,
+    ) -> Value {
+        // Default stride 8 bytes per slot — what process_arr / wait_arr /
+        // free_slots all use.  pid_table needs 16 → call the strided
+        // variant directly.
+        Self::emit_grow_array_if_full_strided(
+            sh_ctx_ptr, fat_offset, cap_offset, next_index, 3, ctx, builder,
+        )
+    }
+
+    /// Same growth contract as [`emit_grow_array_if_full`] but with a
+    /// caller-supplied `log_stride` so 16-byte (`log_stride=4`) entries
+    /// like `pid_table` get the right byte count when allocating /
+    /// copying.
+    fn emit_grow_array_if_full_strided(
+        sh_ctx_ptr: Value,
+        fat_offset: i32,
+        cap_offset: i32,
+        next_index: Value,
+        log_stride: i64,
         ctx: &mut CompilerCtx,
         builder: &mut FunctionBuilder,
     ) -> Value {
@@ -596,13 +974,18 @@ impl ShedulerCtxLayout {
         builder.seal_block(grow_block);
 
         let new_cap = builder.ins().ishl_imm(cap, 1);
-        let alloc_bytes = builder.ins().ishl_imm(new_cap, 3);
+        let alloc_bytes = builder.ins().ishl_imm(new_cap, log_stride);
         let call_alloc = builder.ins().call(allocate_ref, &[alloc_bytes]);
         let new_fat = builder.inst_results(call_alloc)[0];
 
-        // Copy first `next_index` slots (8 bytes each) old → new via inline loop.
+        // Copy `next_index` entries from old to new.  We copy in 8-byte
+        // chunks regardless of stride because both 8B and 16B slots
+        // align to 8 — `chunks = next_index << (log_stride - 3)`.
         let old_start = builder.ins().load(ptr_ty, MemFlags::trusted(), old_fat, 0);
         let new_start = builder.ins().load(ptr_ty, MemFlags::trusted(), new_fat, 0);
+        let chunks = builder
+            .ins()
+            .ishl_imm(next_index, log_stride - 3);
 
         let copy_header = builder.create_block();
         let copy_body = builder.create_block();
@@ -614,7 +997,7 @@ impl ShedulerCtxLayout {
 
         builder.switch_to_block(copy_header);
         let i = builder.block_params(copy_header)[0];
-        let cmp = builder.ins().icmp(IntCC::UnsignedLessThan, i, next_index);
+        let cmp = builder.ins().icmp(IntCC::UnsignedLessThan, i, chunks);
         builder.ins().brif(cmp, copy_body, &[], copy_done, &[]);
 
         builder.switch_to_block(copy_body);
@@ -939,9 +1322,25 @@ impl ShedulerCtxLayout {
             &[sh_ctx_ptr, new_wc, ptr_size, count_offset],
         );
 
-        // Add process back to active queue
-        Self::new_process(sh_ctx_ptr, pid_val, ctx, builder)?;
-
+        // pid_val is a monotonic pid; look up the live proc_ctx fat-ptr
+        // from the pid_table to enqueue into process_arr.  If the pid
+        // was already cleared (dead actor), the lookup returns 0 and we
+        // skip the enqueue — handled by the brif below.
+        let proc_ctx = Self::lookup_proc_ctx(sh_ctx_ptr, pid_val, ctx, builder);
+        let lookup_ok = builder
+            .ins()
+            .icmp_imm(IntCC::NotEqual, proc_ctx, 0);
+        let enqueue_block = builder.create_block();
+        builder.ins().brif(
+            lookup_ok,
+            enqueue_block,
+            &[],
+            after_block,
+            &[],
+        );
+        builder.switch_to_block(enqueue_block);
+        builder.seal_block(enqueue_block);
+        Self::new_process(sh_ctx_ptr, proc_ctx, ctx, builder)?;
         builder.ins().jump(after_block, &[]);
 
         // ── not_found_block: no-op, message is in mailbox ──────────────
