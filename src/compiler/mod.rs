@@ -309,7 +309,7 @@ fn count_expr_slots(expr: &Expr<'_>) -> usize {
 /// though the runtime cannot tell them apart.
 fn canon_arg_ty(s: &str) -> &str {
     match s {
-        "str" | "atom" | "pid" => "i64",
+        "str" | "atom" | "pid" | "buf" => "i64",
         other => other,
     }
 }

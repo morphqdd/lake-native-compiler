@@ -98,6 +98,7 @@ impl CompilerCtx {
                 ("i64".into(), CompilerType::Simple(Type::int(64).unwrap())),
                 ("i32".into(), CompilerType::Simple(Type::int(32).unwrap())),
                 ("str".into(), CompilerType::Simple(Type::int(64).unwrap())),
+                ("buf".into(), CompilerType::Simple(Type::int(64).unwrap())),
                 ("pid".into(), CompilerType::Simple(Type::int(64).unwrap())),
             ]),
             rt_funcs: None,
