@@ -145,9 +145,35 @@ pub fn define_allocate(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     builder
         .ins()
         .store(MemFlags::trusted(), next, head_addr, 0);
+
+    // Zero the recycled payload so callers see fresh memory (matches the
+    // bump-from-mmap path's implicit zero-init).  bucket_size is always a
+    // power of two ≥ 16, so 8-byte stride is exact.
+    let zero_hdr = builder.create_block();
+    let zero_body = builder.create_block();
+    builder.append_block_param(zero_hdr, ty);
+    let zero_start = builder.ins().iconst(ty, 0);
     builder
         .ins()
-        .jump(merge_block, &[BlockArg::Value(head)]);
+        .jump(zero_hdr, &[BlockArg::Value(zero_start)]);
+
+    builder.switch_to_block(zero_hdr);
+    let zi = builder.block_params(zero_hdr)[0];
+    let zcont = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, zi, bucket_size);
+    builder
+        .ins()
+        .brif(zcont, zero_body, &[], merge_block, &[BlockArg::Value(head)]);
+
+    builder.switch_to_block(zero_body);
+    builder.seal_block(zero_body);
+    let zaddr = builder.ins().iadd(payload_addr, zi);
+    let zero_w = builder.ins().iconst(ty, 0);
+    builder.ins().store(MemFlags::trusted(), zero_w, zaddr, 0);
+    let zi_next = builder.ins().iadd_imm(zi, 8);
+    builder.ins().jump(zero_hdr, &[BlockArg::Value(zi_next)]);
+    builder.seal_block(zero_hdr);
 
     // ── bump_block: classic bump allocation (in-range only) ─────────────────
     builder.switch_to_block(bump_block);
