@@ -207,6 +207,36 @@ pub fn compile_expr(
                 &inner,
             )
         }
+        Expr::Index { receiver, index } => {
+            // `buf[i]` lowers to a `rt_load_u8` call internally — the
+            // language exposes no first-class index op at codegen, but
+            // we avoid forcing the user to `@rt(rt_load_u8)`.  The
+            // runtime always emits rt_load_u8 regardless of directives;
+            // we synthesize a Jump and route through the standard
+            // jump_expr machinery so arg staging + return-via-TEMP_VAL
+            // work uniformly.
+            use lake_frontend::api::ast::{Ident, Type as AstType};
+            use chumsky::span::Spanned;
+            let span: chumsky::span::SimpleSpan = (0..0).into();
+            let callee = Expr::Var(
+                "rt_load_u8",
+                AstType::Named(Spanned {
+                    inner: Ident::new("rt_load_u8"),
+                    span,
+                }),
+            );
+            ctx.declare_rt_func_in_prog("rt_load_u8");
+            jump_expr::compile(
+                ctx,
+                builder,
+                machine_ctx_var,
+                block_id,
+                branch_switch,
+                state,
+                &callee,
+                &[receiver.inner.clone(), index.inner.clone()],
+            )
+        }
         _ => bail!("Unsupported expression type: {:?}", expr),
     }
 }

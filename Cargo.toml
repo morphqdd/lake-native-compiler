@@ -14,6 +14,7 @@ base64ct = {version = "1.8.2", features = ['alloc']}
 # blink = { git = "https://github.com/morphqdd/blink", version = "0.0.0" }
 cranelift = { version = "0.127.0", features = ["module", "native", "object"] }
 cranelift-wasm = "0.112.3"
+chumsky = { git = "https://github.com/zesterer/chumsky.git", features = ["pratt"] }
 lake-frontend = { path = "../lake-frontend" }
 num_cpus = "1.17.0"
 
