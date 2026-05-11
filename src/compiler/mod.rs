@@ -117,7 +117,11 @@ pub fn compile<SP: AsRef<Path>>(
         for item in &module.ast {
             if let Item::Machine(machine) = &item.inner {
                 info!("compiling machine '{}'", machine.inner.ident.to_string());
-                if let Err(err) = compile_machine(&mut ctx, &machine.inner, 256) {
+                let quantum: i64 = std::env::var("LAKE_QUANTUM")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(256);
+                if let Err(err) = compile_machine(&mut ctx, &machine.inner, quantum) {
                     error!("{}", err);
                     debug!("{:#?}", ctx.get_registry());
                 }
