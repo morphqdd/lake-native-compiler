@@ -63,6 +63,17 @@ pub fn build_scheduler(ctx: &mut CompilerCtx, builder: &mut FunctionBuilder) -> 
     let poll_cq_ref = ctx.get_func(builder, "rt_io_uring_poll_cq")?;
     builder.ins().call(poll_cq_ref, &[]);
 
+    // #83: flush any pending SQEs every tick so async I/O submissions
+    // (accept / send / recv) reach the kernel within ~1 quantum even
+    // when active actors keep the scheduler busy (CPU-bound + I/O mix).
+    // Before this fix `io_uring_enter` was only called from `wait_cqe`,
+    // which only runs when process_arr is empty — meaning a server with
+    // a background CPU worker never submitted its accept SQE to the
+    // kernel and connections piled up unserved.  Bails cheaply when
+    // SQE_PENDING == 0, so cost is one compare per tick on idle paths.
+    let flush_ref = ctx.get_func(builder, "rt_io_uring_flush")?;
+    builder.ins().call(flush_ref, &[]);
+
     let real_count = ShedulerCtxLayout::get_real_count_of_processes(sh_ptr_var, ctx, builder)?;
     let has_active = builder.ins().icmp_imm(IntCC::NotEqual, real_count, 0);
     builder
