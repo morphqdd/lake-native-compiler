@@ -1,6 +1,6 @@
 use anyhow::Result;
 use cranelift::{
-    codegen::ir::BlockArg,
+    codegen::ir::{Block, BlockArg},
     frontend::Switch,
     module::Module,
     prelude::{FunctionBuilder, InstBuilder, IntCC, MemFlags, Type, Value, Variable},
@@ -248,11 +248,24 @@ pub fn compile(
     branch_switch: &mut Switch,
     state: &BranchState,
     expr: &Expr,
+    entry: Option<Block>,
+    fall_through: Option<Block>,
 ) -> Result<StmtOutcome> {
     let ptr_ty = ctx.module().target_config().pointer_type();
 
-    let b = builder.create_block();
-    builder.switch_to_block(b);
+    // #80 Level 2: use the caller-provided entry block if available
+    // (chaining from a previous fast-path fall_through), else create our own.
+    let b = match entry {
+        Some(e) => {
+            builder.switch_to_block(e);
+            e
+        }
+        None => {
+            let b = builder.create_block();
+            builder.switch_to_block(b);
+            b
+        }
+    };
 
     let ctx_ptr = builder.use_var(machine_ctx_var);
     let exec_start = builder.ins().load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
@@ -288,11 +301,44 @@ pub fn compile(
         .ins()
         .store(MemFlags::trusted(), result, exec_start, ExecCtxLayout::TEMP_VAL);
 
-    let next = builder.ins().iconst(ptr_ty, block_id + 1);
-    let qb = ctx.quantum_block();
-    builder.ins().jump(qb, &[BlockArg::Value(next)]);
+    // #80 Level 2: fast-path exit emits inline quantum check + brif.
+    emit_continue(builder, ctx, ptr_ty, block_id, fall_through);
 
     branch_switch.set_entry(block_id as u128, b);
 
     Ok(StmtOutcome::Continue(block_id + 1))
+}
+
+/// #80 Level 2 — shared exit emitter.  When `fall_through` is `Some` and
+/// the machine has registered both `quantum_var` and `yield_block`, emit
+/// `dec quantum; brif zero, fast_yield[next], fall_through`; otherwise
+/// fall back to the legacy `jump quantum_block(next)` path.
+pub fn emit_continue(
+    builder: &mut FunctionBuilder,
+    ctx: &CompilerCtx,
+    ptr_ty: Type,
+    block_id: i64,
+    fall_through: Option<Block>,
+) {
+    let next = builder.ins().iconst(ptr_ty, block_id + 1);
+
+    if let Some(ft) = fall_through
+        && let (Some(qv), Some(yb)) = (ctx.quantum_var(), ctx.yield_block())
+    {
+        let remaining = builder.use_var(qv);
+        let new_remaining = builder.ins().iadd_imm(remaining, -1);
+        builder.def_var(qv, new_remaining);
+        let exhausted = builder.ins().icmp_imm(IntCC::Equal, new_remaining, 0);
+        builder.ins().brif(
+            exhausted,
+            yb,
+            &[BlockArg::Value(next)],
+            ft,
+            &[],
+        );
+        return;
+    }
+
+    let qb = ctx.quantum_block();
+    builder.ins().jump(qb, &[BlockArg::Value(next)]);
 }

@@ -13,7 +13,7 @@ use log::debug;
 
 use crate::compiler::{
     ctx::CompilerCtx,
-    pipeline::expr::{BranchState, StmtOutcome, compile_expr},
+    pipeline::expr::{BranchState, StmtOutcome, compile_expr, is_fast_chain_pair},
     rt::layout::ExecCtxLayout,
 };
 
@@ -91,8 +91,33 @@ pub fn compile_branch(
         state.insert_with_lake_type(ident_str, ptr_ty, lake_ty);
     }
 
-    for expr in branch.body.iter() {
-        match compile_expr(
+    // #80 Level 2 — fast-path chaining.
+    //
+    // For each pair of adjacent statements where BOTH are fast-path
+    // eligible (pure_expr or `let x = <pure>`), allocate a Cranelift
+    // entry block for the successor and pass it as `fall_through` to
+    // the current statement.  The fast handler emits
+    // `dec quantum; brif zero, fast_yield[next], fall_through` in place
+    // of `jump quantum_block(next)`, eliminating the machine_switch +
+    // branch_switch indirect Switches on the hot path.
+    //
+    // Non-fast-path statements stay on the legacy qb route — they're
+    // reached through branch_switch dispatch as normal.
+    let mut current_entry: Option<cranelift::codegen::ir::Block> = None;
+    for (i, expr) in branch.body.iter().enumerate() {
+        let chain_to_next = branch
+            .body
+            .get(i + 1)
+            .map(|next| is_fast_chain_pair(&expr.inner, &next.inner))
+            .unwrap_or(false);
+
+        let fall_through = if chain_to_next {
+            Some(builder.create_block())
+        } else {
+            None
+        };
+
+        let outcome = compile_expr(
             ctx,
             builder,
             machine_ctx_var,
@@ -100,13 +125,19 @@ pub fn compile_branch(
             &mut branch_switch,
             &mut state,
             &expr,
-        )? {
+            current_entry,
+            fall_through,
+        )?;
+
+        match outcome {
             StmtOutcome::Continue(id) => block_id = id,
-            outcome => {
-                block_id = outcome.next_available();
+            other => {
+                block_id = other.next_available();
                 break;
             }
         }
+
+        current_entry = fall_through;
     }
 
     // ── Emit the per-branch block switch ──────────────────────────────────────

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 use cranelift::{
+    codegen::ir::Block,
     frontend::Switch,
     prelude::{FunctionBuilder, Type, Variable},
 };
@@ -113,8 +114,63 @@ impl BranchState {
     }
 }
 
+/// #80 Level 2 — does `expr` accept a precreated entry block?
+///
+/// Only handlers that can fold the caller-supplied entry block into
+/// their own first-block emit can accept entry: pure_expr and the Level
+/// 1 pure-default let path.
+///
+/// Other handlers (non-pure let, when, wait, jump, spawn, self) create
+/// their own first block internally and can't be re-targeted.
+fn accepts_entry(expr: &Expr<'_>) -> bool {
+    if pure_expr::is_pure(expr) {
+        return true;
+    }
+    if let Expr::Let { default: Some(d), .. } = expr {
+        return pure_expr::is_pure(&d.inner);
+    }
+    false
+}
+
+/// #80 Level 2 — does `expr` emit a fall_through brif at its exit?
+///
+/// Broader than `accepts_entry`: any let (pure or impure default) can
+/// emit fall_through at its FINAL save block, even when its internal
+/// sub-blocks still go through qb.
+///
+/// We chain only when the current statement emits AND the next accepts.
+fn emits_fall_through(expr: &Expr<'_>) -> bool {
+    if pure_expr::is_pure(expr) {
+        return true;
+    }
+    matches!(expr, Expr::Let { .. })
+}
+
+/// Combined predicate: the (i, i+1) boundary is fast-path-chainable iff
+/// iter i emits fall_through AND iter i+1 accepts entry.  Used by
+/// branch.rs to decide whether to allocate a fall_through block.
+pub fn is_fast_chain_pair(this: &Expr<'_>, next: &Expr<'_>) -> bool {
+    emits_fall_through(this) && accepts_entry(next)
+}
+
+/// Backward-compatible single-expr predicate, retained for diagnostics.
+/// Reports true when the expression participates in any fast-path role
+/// (entry or exit).
+pub fn is_fast_path_eligible(expr: &Expr<'_>) -> bool {
+    emits_fall_through(expr) || accepts_entry(expr)
+}
+
 /// Compile a single expression, appending blocks to `builder` and entries to
 /// `branch_switch`. Returns a `StmtOutcome` describing control flow.
+///
+/// `entry` (#80 Level 2) — when `Some(b)`, the handler emits its first
+/// instructions into `b` instead of creating its own first block.
+/// Used by branch.rs to chain fast-path statements without an
+/// intermediate scheduler round-trip.
+///
+/// `fall_through` (#80 Level 2) — when `Some(b)`, a fast-path handler
+/// emits `dec quantum; brif zero, fast_yield[next], b` at its exit.
+/// Handlers that don't support fast-path ignore this.
 pub fn compile_expr(
     ctx: &mut CompilerCtx,
     builder: &mut FunctionBuilder,
@@ -123,6 +179,8 @@ pub fn compile_expr(
     branch_switch: &mut Switch,
     state: &mut BranchState,
     expr: &Expr<'_>,
+    entry: Option<Block>,
+    fall_through: Option<Block>,
 ) -> Result<StmtOutcome> {
     if pure_expr::is_pure(expr) {
         return pure_expr::compile(
@@ -133,6 +191,8 @@ pub fn compile_expr(
             branch_switch,
             state,
             expr,
+            entry,
+            fall_through,
         );
     }
 
@@ -149,6 +209,8 @@ pub fn compile_expr(
                 &ident_str,
                 &ty.inner,
                 default.as_ref().map(|b| &b.inner),
+                entry,
+                fall_through,
             )
         }
         Expr::String(s, _ty) => {

@@ -58,12 +58,18 @@ pub fn compile_machine(ctx: &mut CompilerCtx, machine: &Machine<'_>, quantum: i6
     let quantum_stop_park_block = builder.create_block();
     let quantum_check_wait_block = builder.create_block();
     let quantum_check_park_block = builder.create_block();
+    // #80 Level 2 — shared fast-path yield trampoline.  Fast-path expression
+    // handlers brif here with `next_id` when quantum hits zero, skipping the
+    // full qb → check_done → check_wait → check_park → loop → machine_switch
+    // → branch_switch chain.  Body: store BLOCK_ID = next_id; return STOP_LIMIT.
+    let fast_yield_block = builder.create_block();
 
     builder.append_block_param(entry, ptr_ty);
     builder.append_block_param(quantum_continue_block, ptr_ty); // next_block_id
     builder.append_block_param(quantum_check_wait_block, ptr_ty); // next_block_id
     builder.append_block_param(quantum_check_park_block, ptr_ty); // next_block_id
     builder.append_block_param(quantum_loop_block, ptr_ty); // next_block_id
+    builder.append_block_param(fast_yield_block, ptr_ty); // next_block_id (#80 Level 2)
 
     builder.switch_to_block(entry);
     builder.seal_block(entry);
@@ -89,6 +95,9 @@ pub fn compile_machine(ctx: &mut CompilerCtx, machine: &Machine<'_>, quantum: i6
 
     ctx.set_quantum_block(quantum_continue_block);
     ctx.set_exec_start_var(exec_start_var);
+    // #80 Level 2 — expose quantum counter + yield trampoline to expression
+    // handlers for the inline fast-path exit.
+    ctx.set_quantum_loop_inputs(quantum_var, fast_yield_block);
 
     let mut machine_switch = Switch::new();
     for (branch_id, item) in machine.items.iter().enumerate() {
@@ -196,6 +205,21 @@ pub fn compile_machine(ctx: &mut CompilerCtx, machine: &Machine<'_>, quantum: i6
 
     builder.switch_to_block(quantum_stop_park_block);
     let v = builder.ins().iconst(ptr_ty, STOP_PARK);
+    builder.ins().return_(&[v]);
+
+    // #80 Level 2 — fast-path yield trampoline.  Equivalent to the tail of
+    // quantum_loop_block minus the dec (caller already did it) and minus
+    // the re-dispatch through machine_switch (we yield, not continue).
+    builder.switch_to_block(fast_yield_block);
+    let next_id = builder.block_params(fast_yield_block)[0];
+    let exec_start = ctx.exec_start(&mut builder, machine_ctx_var);
+    builder.ins().store(
+        MemFlags::trusted(),
+        next_id,
+        exec_start,
+        ExecCtxLayout::BLOCK_ID,
+    );
+    let v = builder.ins().iconst(ptr_ty, STOP_LIMIT);
     builder.ins().return_(&[v]);
 
     builder.seal_all_blocks();

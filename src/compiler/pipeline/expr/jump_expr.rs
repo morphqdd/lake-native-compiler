@@ -82,6 +82,8 @@ pub fn compile(
             branch_switch,
             state,
             arg,
+            None,
+            None,
         )? {
             StmtOutcome::Continue(id) => id,
             other => bail!(

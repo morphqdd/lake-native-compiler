@@ -12,7 +12,7 @@ use lake_frontend::api::{
 
 use crate::compiler::{
     ctx::CompilerCtx,
-    pipeline::expr::{BranchState, StmtOutcome, compile_expr, pure_expr},
+    pipeline::expr::{BranchState, StmtOutcome, compile_expr, is_fast_chain_pair, pure_expr},
     rt::layout::ExecCtxLayout,
 };
 
@@ -126,8 +126,28 @@ pub(crate) fn compile<'a>(
 
     for handler in &collect {
         body_starts.push(current_id);
-        for expr in &handler.body {
-            match compile_expr(
+        // #80 Level 2: apply fast-path chaining inside wait-handler bodies.
+        // After ret-machine lowering, MOST of an actor's work lives here —
+        // the let-with-pure / let-with-rt-call chains that need coalescing
+        // are inside `wait __ret_N_pid { sender pid r ty -> <body> }`.
+        // Without this branch.rs-style orchestration, fast-path never
+        // triggers on the dominant code path of any program that uses
+        // ret-machines.
+        let mut current_entry: Option<cranelift::codegen::ir::Block> = None;
+        for (i, expr) in handler.body.iter().enumerate() {
+            let chain_to_next = handler
+                .body
+                .get(i + 1)
+                .map(|next| is_fast_chain_pair(&expr.inner, &next.inner))
+                .unwrap_or(false);
+
+            let fall_through = if chain_to_next {
+                Some(builder.create_block())
+            } else {
+                None
+            };
+
+            let outcome = compile_expr(
                 ctx,
                 builder,
                 machine_ctx_var,
@@ -135,13 +155,19 @@ pub(crate) fn compile<'a>(
                 branch_switch,
                 state,
                 &expr.inner,
-            )? {
+                current_entry,
+                fall_through,
+            )?;
+
+            match outcome {
                 StmtOutcome::Continue(id) => current_id = id,
-                outcome => {
-                    current_id = outcome.next_available();
+                other => {
+                    current_id = other.next_available();
                     break;
                 }
             }
+
+            current_entry = fall_through;
         }
     }
 

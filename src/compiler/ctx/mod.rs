@@ -47,6 +47,16 @@ pub struct CompilerCtx {
     /// Set by `compile_machine` after the entry block initializes the var;
     /// cleared by `begin_function`.  Use `Self::exec_start` for read access.
     current_exec_start_var: Option<Variable>,
+    /// #80 Level 2 — Cranelift Variable holding the quantum counter for
+    /// the current machine.  Fast-path expression handlers use it to
+    /// emit inline `dec; brif zero, fast_yield, fall_through` in place
+    /// of `jump quantum_block(next_id)`.  Set in compile_machine.
+    quantum_var: Option<Variable>,
+    /// #80 Level 2 — shared yield trampoline for the current machine.
+    /// Takes one block_param `next_id: i64`, stores `BLOCK_ID = next_id`,
+    /// returns `STOP_LIMIT`.  Fast-path handlers brif to this block when
+    /// quantum hits zero, skipping the full qb dispatch chain.
+    yield_block: Option<Block>,
     /// Monotonic counter handed out to `dispatch::emit_str_guard_select`
     /// callers so that each call site gets unique data-section names
     /// (`guard_disp_<n>`, `guard_keys_<n>`, …).
@@ -107,6 +117,8 @@ impl CompilerCtx {
             current_machine: None,
             quantum_block: None,
             current_exec_start_var: None,
+            quantum_var: None,
+            yield_block: None,
             next_dispatch_id: 0,
         }
     }
@@ -225,6 +237,8 @@ impl CompilerCtx {
         self.func_ref_cache.clear();
         self.quantum_block = None;
         self.current_exec_start_var = None;
+        self.quantum_var = None;
+        self.yield_block = None;
     }
 
     /// Set the quantum continuation block for the current machine function.
@@ -238,6 +252,22 @@ impl CompilerCtx {
     pub fn quantum_block(&self) -> Block {
         self.quantum_block
             .expect("quantum_block not set — call set_quantum_block before compiling branches")
+    }
+
+    /// #80 Level 2 — register the per-machine quantum counter Variable +
+    /// shared yield trampoline.  Set in `compile_machine` after the
+    /// fast_yield_block has been built.
+    pub fn set_quantum_loop_inputs(&mut self, quantum_var: Variable, yield_block: Block) {
+        self.quantum_var = Some(quantum_var);
+        self.yield_block = Some(yield_block);
+    }
+
+    pub fn quantum_var(&self) -> Option<Variable> {
+        self.quantum_var
+    }
+
+    pub fn yield_block(&self) -> Option<Block> {
+        self.yield_block
     }
 
     /// Register the Cranelift Variable that caches `*machine_ctx_var`

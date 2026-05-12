@@ -49,7 +49,7 @@ pub fn compile<'a>(
 
     // ── Step 1: Compile LHS → TEMP_VAL ───────────────────────────────────────
     let lhs_done_id = match compile_expr(
-        ctx, builder, machine_ctx_var, block_id, branch_switch, state, lhs,
+        ctx, builder, machine_ctx_var, block_id, branch_switch, state, lhs, None, None,
     )? {
         StmtOutcome::Continue(id) => id,
         other => bail!(
@@ -101,6 +101,8 @@ pub fn compile<'a>(
         branch_switch,
         state,
         rhs,
+        None,
+        None,
     )? {
         StmtOutcome::Continue(id) => id,
         other => bail!(

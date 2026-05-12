@@ -1,6 +1,6 @@
 use anyhow::Result;
 use cranelift::{
-    codegen::ir::BlockArg,
+    codegen::ir::{Block, BlockArg},
     frontend::Switch,
     module::Module,
     prelude::{FunctionBuilder, InstBuilder, MemFlags, Variable},
@@ -28,17 +28,24 @@ pub fn compile(
     ident: &str,
     ty: &Type<'_>,
     default: Option<&Expr<'_>>,
+    entry: Option<Block>,
+    fall_through: Option<Block>,
 ) -> Result<StmtOutcome> {
     let ptr_ty = ctx.module().target_config().pointer_type();
     let rt_funcs = ctx.rt_funcs().clone();
 
     // ── #80 Level 1: pure-default coalesce ────────────────────────────────────
-    // `let x = <pure>` currently burns two CPS blocks: pure_expr::compile
-    // emits one block that stashes the value in TEMP_VAL and dispatches
-    // to qb(block_id+1), then let's own block reads TEMP_VAL and writes
-    // it to vars[slot].  The TEMP_VAL round-trip is dead weight — we can
+    // `let x = <pure>` burns two CPS blocks: pure_expr::compile emits
+    // one block that stashes the value in TEMP_VAL and dispatches to
+    // qb(block_id+1), then let's own block reads TEMP_VAL and writes
+    // it to vars[slot].  The TEMP_VAL round-trip is dead weight — we
     // fold the pure expression inline and store the resulting Cranelift
     // Value directly into the variables slot in a single block.
+    //
+    // #80 Level 2 (slow path): when default is non-pure, the inner
+    // sub-blocks still go through qb (one per arg / sub-expr), but the
+    // FINAL save block can fall_through to the next statement, skipping
+    // a qb dispatch.  Saves ~5 ns per let-with-call.
     if let Some(d) = default {
         if pure_expr::is_pure(d) {
             return compile_pure_let(
@@ -51,13 +58,24 @@ pub fn compile(
                 ident,
                 ty,
                 d,
+                entry,
+                fall_through,
             );
         }
     }
 
-    // Compile the initialiser (if any) first; it leaves its result in TEMP_VAL.
+    // Slow path: non-pure default.  This path cannot accept `entry`
+    // because the default's compile_expr will create its own first
+    // block — branch.rs is responsible for routing fast-path chains
+    // only through statements whose `accepts_entry` predicate
+    // returns true (pure_expr / pure-let).
+    debug_assert!(
+        entry.is_none(),
+        "let_expr slow path cannot accept entry — branch.rs should not chain through non-pure lets"
+    );
+
     let next_id = match default {
-        Some(d) => match compile_expr(ctx, builder, machine_ctx_var, block_id, branch_switch, state, d)? {
+        Some(d) => match compile_expr(ctx, builder, machine_ctx_var, block_id, branch_switch, state, d, None, None)? {
             StmtOutcome::Continue(id) => id,
             // A terminal default is unusual but we propagate it.
             terminal => return Ok(terminal),
@@ -108,9 +126,10 @@ pub fn compile(
         .ins()
         .call(store_ref, &[vars_ptr, temp_val, size, var_offset]);
 
-    let next_block_id = builder.ins().iconst(ptr_ty, next_id + 1);
-    let qb = ctx.quantum_block();
-    builder.ins().jump(qb, &[BlockArg::Value(next_block_id)]);
+    // #80 Level 2: slow path exit — fall_through if eligible, else qb.
+    // The internal sub-blocks (default compilation) still go through qb;
+    // only the FINAL save block can fall_through to the next statement.
+    pure_expr::emit_continue(builder, ctx, ptr_ty, next_id, fall_through);
 
     branch_switch.set_entry(next_id as u128, b);
     Ok(StmtOutcome::Continue(next_id + 1))
@@ -139,11 +158,24 @@ fn compile_pure_let(
     ident: &str,
     ty: &Type<'_>,
     default: &Expr<'_>,
+    entry: Option<Block>,
+    fall_through: Option<Block>,
 ) -> Result<StmtOutcome> {
     let ptr_ty = ctx.module().target_config().pointer_type();
 
-    let b = builder.create_block();
-    builder.switch_to_block(b);
+    // #80 Level 2: caller-supplied entry block (chained from prev stmt's
+    // fall_through), else create our own.
+    let b = match entry {
+        Some(e) => {
+            builder.switch_to_block(e);
+            e
+        }
+        None => {
+            let b = builder.create_block();
+            builder.switch_to_block(b);
+            b
+        }
+    };
 
     // Load exec_start (cached on the machine but we still need to
     // reach the variables pointer + own_pid through it).
@@ -220,9 +252,8 @@ fn compile_pure_let(
         .ins()
         .call(store_ref, &[vars_ptr, val, size, var_offset]);
 
-    let next_block_id = builder.ins().iconst(ptr_ty, block_id + 1);
-    let qb = ctx.quantum_block();
-    builder.ins().jump(qb, &[BlockArg::Value(next_block_id)]);
+    // #80 Level 2: fast-path exit (or legacy qb if fall_through is None).
+    pure_expr::emit_continue(builder, ctx, ptr_ty, block_id, fall_through);
 
     branch_switch.set_entry(block_id as u128, b);
     Ok(StmtOutcome::Continue(block_id + 1))
