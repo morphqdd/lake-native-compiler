@@ -69,10 +69,37 @@ pub fn build_scheduler(ctx: &mut CompilerCtx, builder: &mut FunctionBuilder) -> 
     // Before this fix `io_uring_enter` was only called from `wait_cqe`,
     // which only runs when process_arr is empty — meaning a server with
     // a background CPU worker never submitted its accept SQE to the
-    // kernel and connections piled up unserved.  Bails cheaply when
-    // SQE_PENDING == 0, so cost is one compare per tick on idle paths.
+    // kernel and connections piled up unserved.
+    //
+    // Originally this was an unconditional call to `rt_io_uring_flush`,
+    // but the function-call overhead added ~3.5× to spawn/msg
+    // microbenchmarks (no async I/O ever, but the call still happens
+    // every tick).  Inline the SQE_PENDING == 0 bailout so the common
+    // case (no pending submissions) skips the call entirely — single
+    // load + compare + brif on the hot path.
+    let sh_use_flush = builder.use_var(sh_ptr_var);
+    let sh_data_flush = builder.ins().load(ptr_ty, MemFlags::trusted(), sh_use_flush, 0);
+    let pending = builder.ins().load(
+        ptr_ty,
+        MemFlags::trusted(),
+        sh_data_flush,
+        ShedulerCtxLayout::SQE_PENDING,
+    );
+    let has_pending = builder.ins().icmp_imm(IntCC::NotEqual, pending, 0);
+    let do_flush_block = builder.create_block();
+    let after_flush_block = builder.create_block();
+    builder
+        .ins()
+        .brif(has_pending, do_flush_block, &[], after_flush_block, &[]);
+
+    builder.switch_to_block(do_flush_block);
+    builder.seal_block(do_flush_block);
     let flush_ref = ctx.get_func(builder, "rt_io_uring_flush")?;
     builder.ins().call(flush_ref, &[]);
+    builder.ins().jump(after_flush_block, &[]);
+
+    builder.switch_to_block(after_flush_block);
+    builder.seal_block(after_flush_block);
 
     let real_count = ShedulerCtxLayout::get_real_count_of_processes(sh_ptr_var, ctx, builder)?;
     let has_active = builder.ins().icmp_imm(IntCC::NotEqual, real_count, 0);

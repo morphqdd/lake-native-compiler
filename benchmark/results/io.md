@@ -1,6 +1,6 @@
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `lake (cooperative, direct syscalls)` | 27.3 ± 1.5 | 25.5 | 36.7 | 1.10 ± 0.08 |
-| `rust (tokio current_thread)` | 77.7 ± 1.6 | 76.0 | 83.1 | 3.12 ± 0.17 |
-| `c++ (coroutines, manual scheduler)` | 24.9 ± 1.3 | 23.3 | 31.8 | 1.00 |
-| `go (goroutines, GOMAXPROCS=1)` | 79.1 ± 2.0 | 76.9 | 88.7 | 3.18 ± 0.18 |
+| `lake (cooperative, direct syscalls)` | 25.9 ± 0.4 | 25.2 | 27.1 | 1.17 ± 0.03 |
+| `rust (tokio current_thread)` | 35.9 ± 0.8 | 34.8 | 40.3 | 1.62 ± 0.05 |
+| `c++ (coroutines, manual scheduler)` | 22.1 ± 0.5 | 21.4 | 23.5 | 1.00 |
+| `go (goroutines, GOMAXPROCS=1)` | 42.1 ± 0.9 | 40.4 | 46.1 | 1.91 ± 0.06 |
