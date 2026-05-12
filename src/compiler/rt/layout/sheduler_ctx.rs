@@ -745,65 +745,79 @@ impl ShedulerCtxLayout {
         loop_block: Block,
     ) -> Result<()> {
         let ptr_ty = ctx.module().target_config().pointer_type();
-        let ptr_size = builder.ins().iconst(ptr_ty, ptr_ty.bytes() as i64);
-        let rt_func = ctx.rt_funcs().clone();
-        let load_ref = rt_func.load_u64_ref(ctx.module_mut(), builder);
-        let store_ref = rt_func.store_ref(ctx.module_mut(), builder);
         let sh_ctx_ptr = builder.use_var(sh_ptr_var);
+        // Inlined fat-ptr deref + field accesses.  Each rt_load_u64 / rt_store
+        // call replaced with a direct load / store.  Called per actor death,
+        // common on msg/spawn microbenches.
+        let sh_data = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), sh_ctx_ptr, 0);
 
-        // ── Load indices ─────────────────────────────────────────────────────
-        let current_offset = builder.ins().iconst(ptr_ty, Self::CURRENT_PROCESS as i64);
-        let call_current = builder.ins().call(load_ref, &[sh_ctx_ptr, current_offset]);
-        let current_idx = builder.inst_results(call_current)[0];
+        let current_idx = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            sh_data,
+            Self::CURRENT_PROCESS,
+        );
         let current_aligned = builder.ins().imul_imm(current_idx, 8);
 
-        let last_offset = builder
-            .ins()
-            .iconst(ptr_ty, Self::LAST_PROCESS_INDEX as i64);
-        let call_last = builder.ins().call(load_ref, &[sh_ctx_ptr, last_offset]);
-        let last_idx = builder.inst_results(call_last)[0];
+        let last_idx = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            sh_data,
+            Self::LAST_PROCESS_INDEX,
+        );
         let last_aligned = builder.ins().imul_imm(last_idx, 8);
 
-        // ── Load process array ────────────────────────────────────────────────
-        let arr_offset = builder.ins().iconst(ptr_ty, Self::PROCESS_ARR_FAT as i64);
-        let call_arr = builder.ins().call(load_ref, &[sh_ctx_ptr, arr_offset]);
-        let process_arr = builder.inst_results(call_arr)[0];
-
-        // ── Swap-and-pop: copy last → current, zero last ──────────────────────
-        let call_last_proc = builder.ins().call(load_ref, &[process_arr, last_aligned]);
-        let last_proc = builder.inst_results(call_last_proc)[0];
-        builder.ins().call(
-            store_ref,
-            &[process_arr, last_proc, ptr_size, current_aligned],
+        let process_arr_fat = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            sh_data,
+            Self::PROCESS_ARR_FAT,
         );
+        let process_arr = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), process_arr_fat, 0);
+
+        // Swap-and-pop: copy last → current, zero last.
+        let last_proc_addr = builder.ins().iadd(process_arr, last_aligned);
+        let last_proc = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), last_proc_addr, 0);
+        let current_proc_addr = builder.ins().iadd(process_arr, current_aligned);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), last_proc, current_proc_addr, 0);
         let zero = builder.ins().iconst(ptr_ty, 0);
         builder
             .ins()
-            .call(store_ref, &[process_arr, zero, ptr_size, last_aligned]);
+            .store(MemFlags::trusted(), zero, last_proc_addr, 0);
 
-        // ── Shrink the array ──────────────────────────────────────────────────
+        // Shrink the array.
         let new_last = builder.ins().iadd_imm(last_idx, -1);
-        builder
-            .ins()
-            .call(store_ref, &[sh_ctx_ptr, new_last, ptr_size, last_offset]);
-
-        // ── Decrement active count ────────────────────────────────────────────
-        let real_count_offset = builder
-            .ins()
-            .iconst(ptr_ty, Self::REAL_COUNT_OF_PROCESSES as i64);
-        let call_count = builder
-            .ins()
-            .call(load_ref, &[sh_ctx_ptr, real_count_offset]);
-        let real_count = builder.inst_results(call_count)[0];
-        let new_count = builder.ins().iadd_imm(real_count, -1);
-        builder.ins().call(
-            store_ref,
-            &[sh_ctx_ptr, new_count, ptr_size, real_count_offset],
+        builder.ins().store(
+            MemFlags::trusted(),
+            new_last,
+            sh_data,
+            Self::LAST_PROCESS_INDEX,
         );
 
-        // ── Fix CURRENT_PROCESS if we just removed the last slot ──────────────
-        // After swap-and-pop, if current == last, the slot is now zeroed and
-        // CURRENT_PROCESS would point past the valid range. Reset it to 0.
+        // Decrement active count.
+        let real_count = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            sh_data,
+            Self::REAL_COUNT_OF_PROCESSES,
+        );
+        let new_count = builder.ins().iadd_imm(real_count, -1);
+        builder.ins().store(
+            MemFlags::trusted(),
+            new_count,
+            sh_data,
+            Self::REAL_COUNT_OF_PROCESSES,
+        );
+
+        // Fix CURRENT_PROCESS if we just removed the last slot.
         let reset_block = builder.create_block();
         let done_block = builder.create_block();
 
@@ -813,18 +827,25 @@ impl ShedulerCtxLayout {
             .brif(was_last, reset_block, &[], done_block, &[]);
 
         builder.switch_to_block(reset_block);
-        let sh_ctx_ptr = builder.use_var(sh_ptr_var);
-        let zero = builder.ins().iconst(ptr_ty, 0);
-        let ptr_size = builder.ins().iconst(ptr_ty, ptr_ty.bytes() as i64);
-        let current_offset = builder.ins().iconst(ptr_ty, Self::CURRENT_PROCESS as i64);
-        builder
+        // Re-load sh_data in case scheduler ctx moved; defensive though
+        // currently sheduler_ctx_fat_ptr is stable.
+        let sh_ctx_ptr2 = builder.use_var(sh_ptr_var);
+        let sh_data2 = builder
             .ins()
-            .call(store_ref, &[sh_ctx_ptr, zero, ptr_size, current_offset]);
+            .load(ptr_ty, MemFlags::trusted(), sh_ctx_ptr2, 0);
+        let zero = builder.ins().iconst(ptr_ty, 0);
+        builder.ins().store(
+            MemFlags::trusted(),
+            zero,
+            sh_data2,
+            Self::CURRENT_PROCESS,
+        );
         builder.ins().jump(loop_block, &[]);
 
         builder.switch_to_block(done_block);
         builder.ins().jump(loop_block, &[]);
 
+        let _ = ctx;
         Ok(())
     }
 
@@ -835,39 +856,51 @@ impl ShedulerCtxLayout {
         builder: &mut FunctionBuilder,
     ) -> Result<()> {
         let ptr_ty = ctx.module().target_config().pointer_type();
-        let rt_funcs = ctx.rt_funcs().clone();
-        let load_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
-        let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
-        let ptr_size = builder.ins().iconst(ptr_ty, ptr_ty.bytes() as i64);
         let sh_ctx_ptr = builder.use_var(sh_ptr_var);
+        // Inlined fat-ptr deref chain.  Called per `wait` yield —
+        // ping_pong hits this 200k times.
+        let sh_data = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), sh_ctx_ptr, 0);
 
         // Resolve pid from proc_ctx.EXEC_CTX.OWN_PID — wait_arr stores
         // pids (i64) so wake_process can match on the pid the sender
         // passed, not on a recyclable proc_ctx address.
-        let exec_ctx_off = builder
+        //
+        // process_ctx_ptr is a FAT-PTR ADDRESS, not the raw proc_ctx
+        // start.  Deref it first to get the actual ProcessCtx layout
+        // bytes.  Same pattern for exec_ctx_fat → exec_start.
+        let proc_ctx_start = builder
             .ins()
-            .iconst(ptr_ty, ProcessCtxLayout::EXEC_CTX as i64);
-        let call_exec = builder
+            .load(ptr_ty, MemFlags::trusted(), process_ctx_ptr, 0);
+        let exec_ctx_fat = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            proc_ctx_start,
+            ProcessCtxLayout::EXEC_CTX,
+        );
+        let exec_start = builder
             .ins()
-            .call(load_ref, &[process_ctx_ptr, exec_ctx_off]);
-        let exec_ctx_fat = builder.inst_results(call_exec)[0];
-        let own_pid_off = builder
-            .ins()
-            .iconst(ptr_ty, ExecCtxLayout::OWN_PID as i64);
-        let call_pid = builder.ins().call(load_ref, &[exec_ctx_fat, own_pid_off]);
-        let pid = builder.inst_results(call_pid)[0];
+            .load(ptr_ty, MemFlags::trusted(), exec_ctx_fat, 0);
+        let pid = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            exec_start,
+            ExecCtxLayout::OWN_PID,
+        );
 
-        let offset_last_i = builder
-            .ins()
-            .iconst(ptr_ty, Self::LAST_WAITED_PROCESS_INDEX as i64);
-        let call_last_index = builder.ins().call(load_ref, &[sh_ctx_ptr, offset_last_i]);
-        let last_process_index = builder.inst_results(call_last_index)[0];
+        let last_process_index = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            sh_data,
+            Self::LAST_WAITED_PROCESS_INDEX,
+        );
         let next_process_index = builder.ins().iadd_imm(last_process_index, 1);
         let aligned_index = builder.ins().imul_imm(next_process_index, 8);
 
         // Grow wait_arr if next_index would exceed cap; use the (possibly
         // new) fat-ptr returned for the store below.
-        let wait_arr = Self::emit_grow_array_if_full(
+        let wait_arr_fat = Self::emit_grow_array_if_full(
             sh_ctx_ptr,
             Self::WAIT_ARR_FAT,
             Self::WAIT_ARR_CAP,
@@ -875,29 +908,34 @@ impl ShedulerCtxLayout {
             ctx,
             builder,
         );
+        let wait_arr_start = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), wait_arr_fat, 0);
+        let slot_addr = builder.ins().iadd(wait_arr_start, aligned_index);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), pid, slot_addr, 0);
 
-        builder.ins().call(
-            store_ref,
-            &[wait_arr, pid, ptr_size, aligned_index],
-        );
-
-        builder.ins().call(
-            store_ref,
-            &[sh_ctx_ptr, next_process_index, ptr_size, offset_last_i],
+        builder.ins().store(
+            MemFlags::trusted(),
+            next_process_index,
+            sh_data,
+            Self::LAST_WAITED_PROCESS_INDEX,
         );
 
         // Increment WAITED_PROCESS_COUNT
-        let count_offset = builder
-            .ins()
-            .iconst(ptr_ty, Self::WAITED_PROCESS_COUNT as i64);
-        let call_count = builder
-            .ins()
-            .call(load_ref, &[sh_ctx_ptr, count_offset]);
-        let waited_count = builder.inst_results(call_count)[0];
+        let waited_count = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            sh_data,
+            Self::WAITED_PROCESS_COUNT,
+        );
         let new_count = builder.ins().iadd_imm(waited_count, 1);
-        builder.ins().call(
-            store_ref,
-            &[sh_ctx_ptr, new_count, ptr_size, count_offset],
+        builder.ins().store(
+            MemFlags::trusted(),
+            new_count,
+            sh_data,
+            Self::WAITED_PROCESS_COUNT,
         );
 
         Ok(())
@@ -1195,17 +1233,27 @@ impl ShedulerCtxLayout {
         let ptr_size = builder.ins().iconst(ptr_ty, ptr_ty.bytes() as i64);
 
         let sh_ctx_ptr = builder.use_var(sh_ptr_var);
-
-        // Load wait_arr pointer and LAST_WAITED_PROCESS_INDEX
-        let wait_arr_offset = builder.ins().iconst(ptr_ty, Self::WAIT_ARR_FAT as i64);
-        let call_wait_arr = builder.ins().call(load_ref, &[sh_ctx_ptr, wait_arr_offset]);
-        let wait_arr = builder.inst_results(call_wait_arr)[0];
-
-        let last_idx_offset = builder
+        // Inlined fat-ptr deref: scheduler ctx is well-known trusted memory.
+        // Each rt_load_u64 call replaced with two direct loads (fat-ptr deref
+        // + field load) saves a function-call frame per send.  Ping_pong with
+        // 200k sends amortizes the savings into ~3-5 ms.
+        let sh_data = builder
             .ins()
-            .iconst(ptr_ty, Self::LAST_WAITED_PROCESS_INDEX as i64);
-        let call_last_idx = builder.ins().call(load_ref, &[sh_ctx_ptr, last_idx_offset]);
-        let last_waited_idx = builder.inst_results(call_last_idx)[0];
+            .load(ptr_ty, MemFlags::trusted(), sh_ctx_ptr, 0);
+
+        let wait_arr = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            sh_data,
+            Self::WAIT_ARR_FAT,
+        );
+
+        let last_waited_idx = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            sh_data,
+            Self::LAST_WAITED_PROCESS_INDEX,
+        );
 
         // Check if wait_arr is empty (last_waited < 0 means no entries).
         // LAST_WAITED_PROCESS_INDEX starts at 0 and increments per entry,
@@ -1235,16 +1283,19 @@ impl ShedulerCtxLayout {
         // ── scan_block(i): compare wait_arr[i] with pid ────────────────
         builder.switch_to_block(scan_block);
         let i = builder.block_params(scan_block)[0];
-        let sh_ctx_ptr = builder.use_var(sh_ptr_var);
 
-        // Reload wait_arr (need fresh refs after block switch)
-        let wait_arr_offset = builder.ins().iconst(ptr_ty, Self::WAIT_ARR_FAT as i64);
-        let call_wait_arr = builder.ins().call(load_ref, &[sh_ctx_ptr, wait_arr_offset]);
-        let wait_arr = builder.inst_results(call_wait_arr)[0];
-
+        // wait_arr was defined in the entry block before the brif —
+        // SSA values are visible in dominated successors so the reload
+        // is redundant.  Inline the wait_arr fat-ptr deref + indexed
+        // load to skip two rt_load_u64 function calls per scan step.
+        let wait_arr_start = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), wait_arr, 0);
         let aligned_i = builder.ins().imul_imm(i, 8);
-        let call_entry = builder.ins().call(load_ref, &[wait_arr, aligned_i]);
-        let entry = builder.inst_results(call_entry)[0];
+        let entry_addr = builder.ins().iadd(wait_arr_start, aligned_i);
+        let entry = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), entry_addr, 0);
 
         let is_match = builder.ins().icmp(IntCC::Equal, entry, pid_val);
 
@@ -1261,15 +1312,10 @@ impl ShedulerCtxLayout {
         builder.switch_to_block(next_scan_block);
         let next_i = builder.ins().iadd_imm(i, 1);
 
-        // Reload last_waited_idx
-        let sh_ctx_ptr = builder.use_var(sh_ptr_var);
-        let last_idx_offset = builder
+        // last_waited_idx defined in entry block — SSA visible here.
+        let past_end = builder
             .ins()
-            .iconst(ptr_ty, Self::LAST_WAITED_PROCESS_INDEX as i64);
-        let call_last = builder.ins().call(load_ref, &[sh_ctx_ptr, last_idx_offset]);
-        let last_idx = builder.inst_results(call_last)[0];
-
-        let past_end = builder.ins().icmp(IntCC::SignedGreaterThan, next_i, last_idx);
+            .icmp(IntCC::SignedGreaterThan, next_i, last_waited_idx);
         builder.ins().brif(
             past_end,
             not_found_block,

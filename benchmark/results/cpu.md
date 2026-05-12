@@ -1,7 +1,7 @@
 | Command | Mean [µs] | Min [µs] | Max [µs] | Relative |
 |:---|---:|---:|---:|---:|
-| `c sequential (baseline)` | 934.4 ± 272.3 | 633.8 | 1658.9 | 1.00 |
-| `lake (cooperative, quantum=256)` | 6982.4 ± 512.4 | 6028.7 | 9370.1 | 7.47 ± 2.25 |
-| `c++ (coroutines)` | 2860.0 ± 422.4 | 2081.7 | 4409.3 | 3.06 ± 1.00 |
-| `rust (tokio current_thread)` | 3954.2 ± 485.8 | 3161.5 | 5503.7 | 4.23 ± 1.34 |
-| `go (goroutines, GOMAXPROCS=1)` | 2195.0 ± 430.7 | 1552.8 | 7213.9 | 2.35 ± 0.83 |
+| `c sequential (baseline)` | 819.6 ± 203.1 | 624.2 | 2968.1 | 1.00 |
+| `lake (cooperative, quantum=256)` | 6764.6 ± 477.6 | 5950.7 | 9435.9 | 8.25 ± 2.13 |
+| `c++ (coroutines)` | 2636.8 ± 385.1 | 1972.0 | 4116.5 | 3.22 ± 0.93 |
+| `rust (tokio current_thread)` | 3913.1 ± 431.2 | 3211.1 | 5756.3 | 4.77 ± 1.29 |
+| `go (goroutines, GOMAXPROCS=1)` | 2220.2 ± 317.9 | 1660.1 | 3815.1 | 2.71 ± 0.78 |
