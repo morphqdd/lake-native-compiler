@@ -28,7 +28,9 @@ impl ProcessCtxLayout {
         let ptr_size = builder.ins().iconst(ptr_ty, ptr_ty.bytes() as i64);
         let rt_funcs = ctx.rt_funcs().clone();
         let process_func = ctx.get_func(builder, name)?;
-        let allocate_ref = rt_funcs.allocate_ref(ctx.module_mut(), builder);
+        // ProcessCtx fields (func_ptr, exec_ctx, io_parked_idx) are
+        // explicitly written below — no need for zero-init.
+        let allocate_ref = rt_funcs.allocate_raw_ref(ctx.module_mut(), builder);
         let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
 
         let func_addr = builder.ins().func_addr(ptr_ty, process_func);
@@ -48,6 +50,18 @@ impl ProcessCtxLayout {
         builder.ins().call(
             store_ref,
             &[process_ctx_ptr, exec_ctx, ptr_size, exec_ctx_offset],
+        );
+
+        // Explicitly clear IO_PARKED_IDX — would normally be zero-init'd by
+        // rt_allocate's free-list pop, but `_raw` skips that.  The io_uring
+        // park path reads this field on unpark routing, so a stale value
+        // (e.g. from a previously-died actor that was parked) would
+        // mis-route the wake-up.
+        let zero = builder.ins().iconst(ptr_ty, 0);
+        let io_idx_offset = builder.ins().iconst(ptr_ty, Self::IO_PARKED_IDX as i64);
+        builder.ins().call(
+            store_ref,
+            &[process_ctx_ptr, zero, ptr_size, io_idx_offset],
         );
 
         Ok(process_ctx_ptr)

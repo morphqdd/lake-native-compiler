@@ -18,6 +18,7 @@ pub struct RtFuncs {
     pub exit: FuncId,
     pub mmap: FuncId,
     pub allocate: FuncId,
+    pub allocate_raw: FuncId,
     pub free: FuncId,
 }
 
@@ -33,6 +34,7 @@ impl RtFuncs {
             exit: resolve_func(module, "rt_exit")?,
             mmap: resolve_func(module, "rt_mmap")?,
             allocate: resolve_func(module, "rt_allocate")?,
+            allocate_raw: resolve_func(module, "rt_allocate_raw")?,
             free: resolve_func(module, "rt_free")?,
         })
     }
@@ -72,6 +74,16 @@ impl RtFuncs {
         builder: &mut FunctionBuilder,
     ) -> FuncRef {
         module.declare_func_in_func(self.allocate, builder.func)
+    }
+
+    /// Scheduler-internal allocation that skips the free-list zero-init.
+    /// All callers must overwrite every payload byte before any read.
+    pub fn allocate_raw_ref(
+        &self,
+        module: &mut ObjectModule,
+        builder: &mut FunctionBuilder,
+    ) -> FuncRef {
+        module.declare_func_in_func(self.allocate_raw, builder.func)
     }
 
     pub fn free_ref(

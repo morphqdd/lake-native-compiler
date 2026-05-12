@@ -22,7 +22,30 @@ use crate::compiler::{ctx::CompilerCtx, rt::layout::FatPtrLayout};
 ///   * **Huge (> 16 MiB):** call `rt_mmap` directly for the payload, then
 ///     allocate a 16 B fat-pointer header from bucket 0.  Returned to the
 ///     kernel via `rt_munmap` on free — cannot leak.
-pub fn define_allocate(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
+pub fn define_allocate(ctx: CompilerCtx) -> Result<CompilerCtx> {
+    define_allocate_impl(ctx, "rt_allocate", true)
+}
+
+/// Build `rt_allocate_raw(size: i64) -> i64`.
+///
+/// Identical to `rt_allocate` except the free-list pop path does NOT
+/// zero the recycled payload.  Used by scheduler internals that
+/// allocate buffers (exec_ctx, jump_args, mailbox, process_ctx, …)
+/// whose every byte is overwritten by initialization code before any
+/// read — making the zero-init wasted bandwidth.
+///
+/// User-facing `rt_allocate` keeps the zero-init guarantee that stdlib
+/// helpers like `build_padded` rely on; only the scheduler's
+/// well-known-size internal allocations route through `_raw`.
+pub fn define_allocate_raw(ctx: CompilerCtx) -> Result<CompilerCtx> {
+    define_allocate_impl(ctx, "rt_allocate_raw", false)
+}
+
+fn define_allocate_impl(
+    mut ctx: CompilerCtx,
+    func_name: &str,
+    zero_on_pop: bool,
+) -> Result<CompilerCtx> {
     let ty = ctx.module().target_config().pointer_type();
 
     let (heap_curr_id, heap_end_id, free_list_id) = match (
@@ -146,42 +169,61 @@ pub fn define_allocate(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .ins()
         .store(MemFlags::trusted(), next, head_addr, 0);
 
-    // Zero the recycled payload so callers see fresh memory (matches the
-    // bump-from-mmap path's implicit zero-init).  We only need to clear the
-    // bytes the caller actually requested (`user_size`, rounded up to the
-    // 8-byte store stride) — anything beyond is outside their requested
-    // range and they have no business reading it.  Previously we zeroed
-    // the full `bucket_size`, which on spawn-heavy workloads (where the
-    // free-list is hot and each actor recycles ~5 KB of bookkeeping) cost
-    // ~30 ms / 100k iterations of pure memory bandwidth.
-    let user_size_aligned = builder.ins().iadd_imm(user_size, 7);
-    let zero_limit = builder.ins().band_imm(user_size_aligned, -8);
+    if zero_on_pop {
+        // Zero the recycled payload so callers see fresh memory (matches the
+        // bump-from-mmap path's implicit zero-init).  We only need to clear the
+        // bytes the caller actually requested (`user_size`, rounded up to the
+        // 8-byte store stride) — anything beyond is outside their requested
+        // range and they have no business reading it.  Previously we zeroed
+        // the full `bucket_size`, which on spawn-heavy workloads (where the
+        // free-list is hot and each actor recycles ~5 KB of bookkeeping) cost
+        // ~30 ms / 100k iterations of pure memory bandwidth.
+        let user_size_aligned = builder.ins().iadd_imm(user_size, 7);
+        let zero_limit = builder.ins().band_imm(user_size_aligned, -8);
 
-    let zero_hdr = builder.create_block();
-    let zero_body = builder.create_block();
-    builder.append_block_param(zero_hdr, ty);
-    let zero_start = builder.ins().iconst(ty, 0);
-    builder
-        .ins()
-        .jump(zero_hdr, &[BlockArg::Value(zero_start)]);
+        let zero_hdr = builder.create_block();
+        let zero_body = builder.create_block();
+        builder.append_block_param(zero_hdr, ty);
+        let zero_start = builder.ins().iconst(ty, 0);
+        builder
+            .ins()
+            .jump(zero_hdr, &[BlockArg::Value(zero_start)]);
 
-    builder.switch_to_block(zero_hdr);
-    let zi = builder.block_params(zero_hdr)[0];
-    let zcont = builder
-        .ins()
-        .icmp(IntCC::UnsignedLessThan, zi, zero_limit);
-    builder
-        .ins()
-        .brif(zcont, zero_body, &[], merge_block, &[BlockArg::Value(head)]);
+        builder.switch_to_block(zero_hdr);
+        let zi = builder.block_params(zero_hdr)[0];
+        let zcont = builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, zi, zero_limit);
+        builder
+            .ins()
+            .brif(zcont, zero_body, &[], merge_block, &[BlockArg::Value(head)]);
 
-    builder.switch_to_block(zero_body);
-    builder.seal_block(zero_body);
-    let zaddr = builder.ins().iadd(payload_addr, zi);
-    let zero_w = builder.ins().iconst(ty, 0);
-    builder.ins().store(MemFlags::trusted(), zero_w, zaddr, 0);
-    let zi_next = builder.ins().iadd_imm(zi, 8);
-    builder.ins().jump(zero_hdr, &[BlockArg::Value(zi_next)]);
-    builder.seal_block(zero_hdr);
+        builder.switch_to_block(zero_body);
+        builder.seal_block(zero_body);
+        let zaddr = builder.ins().iadd(payload_addr, zi);
+        let zero_w = builder.ins().iconst(ty, 0);
+        builder.ins().store(MemFlags::trusted(), zero_w, zaddr, 0);
+        let zi_next = builder.ins().iadd_imm(zi, 8);
+        builder.ins().jump(zero_hdr, &[BlockArg::Value(zi_next)]);
+        builder.seal_block(zero_hdr);
+    } else {
+        // `_raw` variant: callers overwrite every byte before read, so the
+        // zero loop is dead bandwidth.  Skip straight to merge.  Note that
+        // we DO still need to clear at least the chain pointer (offset 0)
+        // because the caller may read it as "zero" — but the scheduler's
+        // internal callers all write their layout's first word
+        // immediately (BRANCH_ID, func_ptr, …), so even that's redundant.
+        // Defensive: store one zero at offset 0 to wipe the stale chain
+        // pointer.  Single-cycle, no loop.
+        let zero_w = builder.ins().iconst(ty, 0);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), zero_w, payload_addr, 0);
+        builder
+            .ins()
+            .jump(merge_block, &[BlockArg::Value(head)]);
+    }
+    let _ = user_size;
 
     // ── bump_block: classic bump allocation (in-range only) ─────────────────
     builder.switch_to_block(bump_block);
@@ -278,7 +320,7 @@ pub fn define_allocate(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let sig = builder.func.signature.clone();
     let id = ctx
         .module_mut()
-        .declare_function("rt_allocate", Linkage::Export, &sig)?;
+        .declare_function(func_name, Linkage::Export, &sig)?;
     ctx.module_mut().define_function(id, &mut module_ctx)?;
     ctx.module_mut().clear_context(&mut module_ctx);
     Ok(ctx)

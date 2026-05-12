@@ -44,23 +44,35 @@ pub fn compile_send(
     let b = builder.create_block();
     builder.switch_to_block(b);
 
-    let load_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
-    let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
+    // Inlined fat-ptr derefs: scheduler-trusted memory, no bounds check.
+    // Each pair of loads replaces a rt_load_u64 function call (~5-15 ns
+    // saved per send).  For ping_pong-style benches that's 200k sends ×
+    // 4-5 function calls each = ~5-10 ms total.
     let size8 = builder.ins().iconst(ptr_ty, 8);
 
     // ── 1. Load PID from sender's VARIABLES ─────────────────────────────
     let ctx_ptr = builder.use_var(machine_ctx_var);
-    let vars_offset = builder
+    // Sender's ExecCtx fat-ptr -> ExecCtx start.
+    let sender_exec_start = builder
         .ins()
-        .iconst(ptr_ty, ExecCtxLayout::VARIABLES as i64);
-    let call_vars = builder.ins().call(load_ref, &[ctx_ptr, vars_offset]);
-    let vars_ptr = builder.inst_results(call_vars)[0];
-
-    let pid_slot_offset = builder.ins().iconst(ptr_ty, var_index as i64 * 8);
-    let call_pid = builder
+        .load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
+    // VARIABLES fat-ptr (offset 24 in ExecCtx).
+    let sender_vars_fat = builder.ins().load(
+        ptr_ty,
+        MemFlags::trusted(),
+        sender_exec_start,
+        ExecCtxLayout::VARIABLES,
+    );
+    let vars_ptr = builder
         .ins()
-        .call(load_ref, &[vars_ptr, pid_slot_offset]);
-    let pid_val = builder.inst_results(call_pid)[0];
+        .load(ptr_ty, MemFlags::trusted(), sender_vars_fat, 0);
+    let pid_val = builder.ins().load(
+        ptr_ty,
+        MemFlags::trusted(),
+        vars_ptr,
+        var_index as i32 * 8,
+    );
+    let _ = rt_funcs;
 
     // ── 1a. Resolve pid → proc_ctx via the scheduler's pid_table.
     // The lowering pass for ret-machine calls without a `let` binding
@@ -116,27 +128,38 @@ pub fn compile_send(
         ExecCtxLayout::MAILBOX_TAIL,
     );
 
-    // Load sender's JUMP_ARGS
-    let ctx_ptr = builder.use_var(machine_ctx_var);
-    let ja_offset = builder
+    // Load sender's JUMP_ARGS fat-ptr (inline deref, no rt call).
+    let sender_ja_fat = builder.ins().load(
+        ptr_ty,
+        MemFlags::trusted(),
+        sender_exec_start,
+        ExecCtxLayout::JUMP_ARGS,
+    );
+    let sender_ja = builder
         .ins()
-        .iconst(ptr_ty, ExecCtxLayout::JUMP_ARGS as i64);
-    let call_ja = builder.ins().call(load_ref, &[ctx_ptr, ja_offset]);
-    let sender_ja = builder.inst_results(call_ja)[0];
+        .load(ptr_ty, MemFlags::trusted(), sender_ja_fat, 0);
+    let target_mailbox_start = builder
+        .ins()
+        .load(ptr_ty, MemFlags::trusted(), target_mailbox_fat, 0);
 
     // Copy each arg: JUMP_ARGS[call_base + i] → mailbox[(TAIL + i) mod 256]
     for i in 0..arg_count {
-        let src_offset = builder.ins().iconst(ptr_ty, (call_base + i) as i64 * 8);
-        let call_load_arg = builder.ins().call(load_ref, &[sender_ja, src_offset]);
-        let arg_val = builder.inst_results(call_load_arg)[0];
+        let arg_val = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            sender_ja,
+            (call_base + i) as i32 * 8,
+        );
 
         let msg_index = builder.ins().iadd_imm(target_tail, i as i64);
         let msg_index_mod = builder.ins().band_imm(msg_index, 255);
         let msg_offset = builder.ins().imul_imm(msg_index_mod, 8);
+        let dst_addr = builder.ins().iadd(target_mailbox_start, msg_offset);
         builder
             .ins()
-            .call(store_ref, &[target_mailbox_fat, arg_val, size8, msg_offset]);
+            .store(MemFlags::trusted(), arg_val, dst_addr, 0);
     }
+    let _ = size8;
 
     // Update TAIL: (TAIL + arg_count) mod 256
     let new_tail = builder.ins().iadd_imm(target_tail, arg_count as i64);

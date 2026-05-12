@@ -192,28 +192,38 @@ pub(crate) fn compile<'a>(
         let ctx_ptr = builder.use_var(machine_ctx_var);
         let exec_start = builder.ins().load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
 
-        let load_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
-        let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
-
         let mailbox_fat = ExecCtxLayout::load(builder, ptr_ty, exec_start, ExecCtxLayout::MAILBOX_FAT);
         let head = ExecCtxLayout::load(builder, ptr_ty, exec_start, ExecCtxLayout::MAILBOX_HEAD);
+        // Inlined fat-ptr deref: scheduler-owned mailbox, no bounds check.
+        let mailbox_start = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), mailbox_fat, 0);
 
         // Load discriminant (first mailbox arg) — needed both for guard
         // dispatch and for the optional sender-pid filter check below.
         discriminant = if (has_guards || !filter.is_empty()) && dequeue_arg_count > 0 {
             let msg_index_mod = builder.ins().band_imm(head, 255);
             let msg_offset = builder.ins().imul_imm(msg_index_mod, 8);
-            let call = builder.ins().call(load_ref, &[mailbox_fat, msg_offset]);
-            Some(builder.inst_results(call)[0])
+            let addr = builder.ins().iadd(mailbox_start, msg_offset);
+            Some(
+                builder
+                    .ins()
+                    .load(ptr_ty, MemFlags::trusted(), addr, 0),
+            )
         } else {
             None
         };
 
-        // Dequeue args into VARIABLES
-        let vars_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::VARIABLES as i64);
-        let call_vars = builder.ins().call(load_ref, &[ctx_ptr, vars_offset]);
-        let vars_ptr = builder.inst_results(call_vars)[0];
-        let size8 = builder.ins().iconst(ptr_ty, 8);
+        // Dequeue args into VARIABLES (inlined deref).
+        let vars_fat = ExecCtxLayout::load(
+            builder,
+            ptr_ty,
+            exec_start,
+            ExecCtxLayout::VARIABLES,
+        );
+        let vars_ptr = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), vars_fat, 0);
 
         // Use the wildcard handler's var_base for dequeue destination
         let dequeue_var_base = handlers
@@ -226,14 +236,19 @@ pub(crate) fn compile<'a>(
             let msg_index = builder.ins().iadd_imm(head, i as i64);
             let msg_index_mod = builder.ins().band_imm(msg_index, 255);
             let msg_offset = builder.ins().imul_imm(msg_index_mod, 8);
-            let call_load = builder.ins().call(load_ref, &[mailbox_fat, msg_offset]);
-            let msg_val = builder.inst_results(call_load)[0];
-
-            let var_slot_offset = builder
+            let src_addr = builder.ins().iadd(mailbox_start, msg_offset);
+            let msg_val = builder
                 .ins()
-                .iconst(ptr_ty, (dequeue_var_base + i) as i64 * 8);
-            builder.ins().call(store_ref, &[vars_ptr, msg_val, size8, var_slot_offset]);
+                .load(ptr_ty, MemFlags::trusted(), src_addr, 0);
+
+            builder.ins().store(
+                MemFlags::trusted(),
+                msg_val,
+                vars_ptr,
+                (dequeue_var_base + i) as i32 * 8,
+            );
         }
+        let _ = rt_funcs;
 
         // Advance HEAD
         let new_head = builder.ins().iadd_imm(head, dequeue_arg_count as i64);
@@ -251,10 +266,12 @@ pub(crate) fn compile<'a>(
         // convention).  Any match → dispatch; no match → drop_block.
         if !filter.is_empty() {
             let disc = discriminant.expect("filter requires a non-empty message");
-            // pure_expr::fold expects the *start* of the variables
-            // buffer, not the fat-pointer address.  Dereference once.
-            let vars_ptr_for_filter =
-                builder.ins().load(ptr_ty, MemFlags::trusted(), vars_ptr, 0);
+            // `vars_ptr` is already the dereferenced START of the variables
+            // buffer (we inlined the fat-ptr deref above, replacing the
+            // rt_load_u64 call).  Pass it through to fold as-is — an extra
+            // load(vars_ptr, 0) here would read slot 0 instead of the
+            // fat-ptr start and segfault.
+            let vars_ptr_for_filter = vars_ptr;
             // OR-chain: each check goes to dispatch_block on hit, falls
             // through to next check on miss.  Final miss → drop_block.
             for (idx, filter_expr) in filter.iter().enumerate() {

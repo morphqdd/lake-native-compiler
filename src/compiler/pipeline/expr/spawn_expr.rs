@@ -58,7 +58,11 @@ pub fn compile_spawn(
     let b = builder.create_block();
     builder.switch_to_block(b);
 
-    let allocate_ref = rt_funcs.allocate_ref(ctx.module_mut(), builder);
+    // Scheduler-internal allocations: exec_ctx, vars, jump_args, mailbox,
+    // process_ctx — every byte is overwritten before the callee reads it,
+    // so the free-list zero-init in `rt_allocate` is wasted bandwidth.
+    // Route through `rt_allocate_raw` instead.
+    let allocate_ref = rt_funcs.allocate_raw_ref(ctx.module_mut(), builder);
     let load_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
 
     let exec_ctx_size = builder.ins().iconst(ptr_ty, ExecCtxLayout::SIZE as i64);
