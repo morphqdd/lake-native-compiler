@@ -30,6 +30,7 @@ pub fn compile(
     default: Option<&Expr<'_>>,
     entry: Option<Block>,
     fall_through: Option<Block>,
+    omit_exit: bool,
 ) -> Result<StmtOutcome> {
     let ptr_ty = ctx.module().target_config().pointer_type();
     let rt_funcs = ctx.rt_funcs().clone();
@@ -60,22 +61,23 @@ pub fn compile(
                 d,
                 entry,
                 fall_through,
+                omit_exit,
             );
         }
     }
 
     // Slow path: non-pure default.  This path cannot accept `entry`
-    // because the default's compile_expr will create its own first
-    // block — branch.rs is responsible for routing fast-path chains
-    // only through statements whose `accepts_entry` predicate
-    // returns true (pure_expr / pure-let).
+    // or `omit_exit` because the default's compile_expr will create
+    // its own first block — branch.rs is responsible for routing
+    // fast-path / super-block runs only through statements whose
+    // `accepts_entry` predicate returns true (pure_expr / pure-let).
     debug_assert!(
-        entry.is_none(),
-        "let_expr slow path cannot accept entry — branch.rs should not chain through non-pure lets"
+        entry.is_none() && !omit_exit,
+        "let_expr slow path cannot participate in super-block runs — branch.rs/wait_expr should only chain through pure / pure-let stmts"
     );
 
     let next_id = match default {
-        Some(d) => match compile_expr(ctx, builder, machine_ctx_var, block_id, branch_switch, state, d, None, None)? {
+        Some(d) => match compile_expr(ctx, builder, machine_ctx_var, block_id, branch_switch, state, d, None, None, false)? {
             StmtOutcome::Continue(id) => id,
             // A terminal default is unusual but we propagate it.
             terminal => return Ok(terminal),
@@ -103,28 +105,34 @@ pub fn compile(
         .unwrap_simple();
     let var_index = state.insert_with_lake_type(ident.to_string(), cranelift_ty, ty.to_string());
 
-    // Read TEMP_VAL (the initialiser result) and write it into vars[var_index].
+    // #81 — Inline rt_load_u64 / rt_store for TEMP_VAL → vars[var_index].
+    // Scheduler-trusted memory.
     let ctx_ptr = builder.use_var(machine_ctx_var);
-    let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
-    let load_u64_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
-
-    let temp_val_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::TEMP_VAL as i64);
-    let temp_val = builder
+    let exec_start = builder
         .ins()
-        .call(load_u64_ref, &[ctx_ptr, temp_val_offset]);
-    let temp_val = builder.inst_results(temp_val)[0];
-
-    let vars_offset = builder
+        .load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
+    let temp_val = builder.ins().load(
+        ptr_ty,
+        MemFlags::trusted(),
+        exec_start,
+        ExecCtxLayout::TEMP_VAL,
+    );
+    let vars_fat = builder.ins().load(
+        ptr_ty,
+        MemFlags::trusted(),
+        exec_start,
+        ExecCtxLayout::VARIABLES,
+    );
+    let vars_start = builder
         .ins()
-        .iconst(ptr_ty, ExecCtxLayout::VARIABLES as i64);
-    let vars_ptr_call = builder.ins().call(load_u64_ref, &[ctx_ptr, vars_offset]);
-    let vars_ptr = builder.inst_results(vars_ptr_call)[0];
-
-    let var_offset = builder.ins().iconst(ptr_ty, var_index as i64 * 8);
-    let size = builder.ins().iconst(ptr_ty, 8);
-    builder
-        .ins()
-        .call(store_ref, &[vars_ptr, temp_val, size, var_offset]);
+        .load(ptr_ty, MemFlags::trusted(), vars_fat, 0);
+    builder.ins().store(
+        MemFlags::trusted(),
+        temp_val,
+        vars_start,
+        var_index as i32 * 8,
+    );
+    let _ = rt_funcs;
 
     // #80 Level 2: slow path exit — fall_through if eligible, else qb.
     // The internal sub-blocks (default compilation) still go through qb;
@@ -160,6 +168,7 @@ fn compile_pure_let(
     default: &Expr<'_>,
     entry: Option<Block>,
     fall_through: Option<Block>,
+    omit_exit: bool,
 ) -> Result<StmtOutcome> {
     let ptr_ty = ctx.module().target_config().pointer_type();
 
@@ -236,24 +245,38 @@ fn compile_pure_let(
 
     let var_index = state.insert_with_lake_type(ident.to_string(), cranelift_ty, ty.to_string());
 
-    // Store directly into vars[var_index] — no TEMP_VAL detour.
-    let rt_funcs = ctx.rt_funcs().clone();
-    let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
-    let load_u64_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
+    // #81 — Inline rt_store for val → vars[var_index] (scheduler-trusted).
+    // Use the exec_start we already loaded above when computing
+    // vars_start for fold (avoid double-loading the fat-ptr deref chain).
+    let vars_target = match vars_start {
+        Some(s) => s,
+        None => {
+            // The folded expr didn't read any vars, so we never loaded
+            // vars_start.  Load it now.
+            let ctx_ptr = builder.use_var(machine_ctx_var);
+            let exec_start = builder
+                .ins()
+                .load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
+            let vars_fat = builder.ins().load(
+                ptr_ty,
+                MemFlags::trusted(),
+                exec_start,
+                ExecCtxLayout::VARIABLES,
+            );
+            builder.ins().load(ptr_ty, MemFlags::trusted(), vars_fat, 0)
+        }
+    };
+    builder.ins().store(
+        MemFlags::trusted(),
+        val,
+        vars_target,
+        var_index as i32 * 8,
+    );
 
-    let ctx_ptr = builder.use_var(machine_ctx_var);
-    let vars_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::VARIABLES as i64);
-    let vars_ptr_call = builder.ins().call(load_u64_ref, &[ctx_ptr, vars_offset]);
-    let vars_ptr = builder.inst_results(vars_ptr_call)[0];
-
-    let var_offset = builder.ins().iconst(ptr_ty, var_index as i64 * 8);
-    let size = builder.ins().iconst(ptr_ty, 8);
-    builder
-        .ins()
-        .call(store_ref, &[vars_ptr, val, size, var_offset]);
-
-    // #80 Level 2: fast-path exit (or legacy qb if fall_through is None).
-    pure_expr::emit_continue(builder, ctx, ptr_ty, block_id, fall_through);
+    // #80 Level 2/3: emit exit unless we're mid-super-block.
+    if !omit_exit {
+        pure_expr::emit_continue(builder, ctx, ptr_ty, block_id, fall_through);
+    }
 
     branch_switch.set_entry(block_id as u128, b);
     Ok(StmtOutcome::Continue(block_id + 1))

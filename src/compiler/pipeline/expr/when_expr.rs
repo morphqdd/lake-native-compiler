@@ -75,6 +75,7 @@ pub fn compile<'a>(
         cond_expr,
         None,
         None,
+        false,
     )? {
         StmtOutcome::Continue(id) => id,
         other => bail!("`when` discriminant cannot be a terminal: {:?}", other),
@@ -100,6 +101,7 @@ pub fn compile<'a>(
                 expr_span,
                 None,
                 None,
+                false,
             )?;
             if branch_outcome.is_terminal() {
                 break;

@@ -3,7 +3,7 @@ use cranelift::{
     codegen::ir::BlockArg,
     frontend::Switch,
     module::Module,
-    prelude::{FunctionBuilder, InstBuilder, IntCC, Variable},
+    prelude::{FunctionBuilder, InstBuilder, IntCC, MemFlags, Variable},
 };
 use lake_frontend::api::expr::Expr;
 
@@ -49,7 +49,7 @@ pub fn compile<'a>(
 
     // ── Step 1: Compile LHS → TEMP_VAL ───────────────────────────────────────
     let lhs_done_id = match compile_expr(
-        ctx, builder, machine_ctx_var, block_id, branch_switch, state, lhs, None, None,
+        ctx, builder, machine_ctx_var, block_id, branch_switch, state, lhs, None, None, false,
     )? {
         StmtOutcome::Continue(id) => id,
         other => bail!(
@@ -66,25 +66,36 @@ pub fn compile<'a>(
     let save_block = builder.create_block();
     builder.switch_to_block(save_block);
     {
-        let rt_funcs = ctx.rt_funcs().clone();
-        let load_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
-        let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
+        // #81 — Inline all rt_load_u64 / rt_store calls.  These are
+        // scheduler-trusted accesses (exec_ctx + vars buffer) — bounds
+        // check skipped.  Profile showed rt_store at ~48% of SHA-256
+        // runtime; eliminating its function-call overhead is the
+        // single biggest opt available.
         let ctx_ptr = builder.use_var(machine_ctx_var);
-
-        // Load TEMP_VAL (LHS result).
-        let temp_off = builder.ins().iconst(ptr_ty, ExecCtxLayout::TEMP_VAL as i64);
-        let call = builder.ins().call(load_ref, &[ctx_ptr, temp_off]);
-        let lhs_val = builder.inst_results(call)[0];
-
-        // Load the variables fat ptr.
-        let vars_off = builder.ins().iconst(ptr_ty, ExecCtxLayout::VARIABLES as i64);
-        let vars_call = builder.ins().call(load_ref, &[ctx_ptr, vars_off]);
-        let vars_fat_ptr = builder.inst_results(vars_call)[0];
-
-        // Store LHS into vars[tmp_slot] via rt_store (writes to vars.start + slot*8).
-        let tmp_slot_off = builder.ins().iconst(ptr_ty, tmp_slot as i64 * 8);
-        let size = builder.ins().iconst(ptr_ty, 8);
-        builder.ins().call(store_ref, &[vars_fat_ptr, lhs_val, size, tmp_slot_off]);
+        let exec_start = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
+        let lhs_val = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            exec_start,
+            ExecCtxLayout::TEMP_VAL,
+        );
+        let vars_fat = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            exec_start,
+            ExecCtxLayout::VARIABLES,
+        );
+        let vars_start = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), vars_fat, 0);
+        builder.ins().store(
+            MemFlags::trusted(),
+            lhs_val,
+            vars_start,
+            tmp_slot as i32 * 8,
+        );
 
         let next = builder.ins().iconst(ptr_ty, lhs_done_id + 1);
         let qb = ctx.quantum_block();
@@ -103,6 +114,7 @@ pub fn compile<'a>(
         rhs,
         None,
         None,
+        false,
     )? {
         StmtOutcome::Continue(id) => id,
         other => bail!(
@@ -115,26 +127,35 @@ pub fn compile<'a>(
     let compute_block = builder.create_block();
     builder.switch_to_block(compute_block);
     {
-        let rt_funcs = ctx.rt_funcs().clone();
-        let load_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
-        let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
+        // #81 — inline all rt loads/stores (scheduler-trusted).
         let ctx_ptr = builder.use_var(machine_ctx_var);
-
-        // Load variables fat ptr.
-        let vars_off = builder.ins().iconst(ptr_ty, ExecCtxLayout::VARIABLES as i64);
-        let vars_call = builder.ins().call(load_ref, &[ctx_ptr, vars_off]);
-        let vars_fat_ptr = builder.inst_results(vars_call)[0];
-
+        let exec_start = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
+        // Load variables fat ptr → start.
+        let vars_fat = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            exec_start,
+            ExecCtxLayout::VARIABLES,
+        );
+        let vars_start = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), vars_fat, 0);
         // Load saved LHS from vars[tmp_slot].
-        let tmp_slot_off = builder.ins().iconst(ptr_ty, tmp_slot as i64 * 8);
-        let lhs_load = builder.ins().call(load_ref, &[vars_fat_ptr, tmp_slot_off]);
-        let lhs_val = builder.inst_results(lhs_load)[0];
-
+        let lhs_val = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            vars_start,
+            tmp_slot as i32 * 8,
+        );
         // Load RHS from TEMP_VAL.
-        let ctx_ptr = builder.use_var(machine_ctx_var);
-        let temp_off = builder.ins().iconst(ptr_ty, ExecCtxLayout::TEMP_VAL as i64);
-        let rhs_call = builder.ins().call(load_ref, &[ctx_ptr, temp_off]);
-        let rhs_val = builder.inst_results(rhs_call)[0];
+        let rhs_val = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            exec_start,
+            ExecCtxLayout::TEMP_VAL,
+        );
 
         // Compute result.
         let result = match op {
@@ -164,11 +185,13 @@ pub fn compile<'a>(
             }
         };
 
-        // Store result to TEMP_VAL.
-        let ctx_ptr = builder.use_var(machine_ctx_var);
-        let temp_off = builder.ins().iconst(ptr_ty, ExecCtxLayout::TEMP_VAL as i64);
-        let size = builder.ins().iconst(ptr_ty, 8);
-        builder.ins().call(store_ref, &[ctx_ptr, result, size, temp_off]);
+        // Store result to TEMP_VAL (inlined).
+        builder.ins().store(
+            MemFlags::trusted(),
+            result,
+            exec_start,
+            ExecCtxLayout::TEMP_VAL,
+        );
 
         let next = builder.ins().iconst(ptr_ty, rhs_done_id + 1);
         let qb = ctx.quantum_block();

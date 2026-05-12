@@ -132,6 +132,11 @@ fn accepts_entry(expr: &Expr<'_>) -> bool {
     false
 }
 
+/// Public wrapper for use by branch.rs / wait_expr's super-block grouping.
+pub fn accepts_entry_pub(expr: &Expr<'_>) -> bool {
+    accepts_entry(expr)
+}
+
 /// #80 Level 2 — does `expr` emit a fall_through brif at its exit?
 ///
 /// Broader than `accepts_entry`: any let (pure or impure default) can
@@ -181,6 +186,7 @@ pub fn compile_expr(
     expr: &Expr<'_>,
     entry: Option<Block>,
     fall_through: Option<Block>,
+    omit_exit: bool,
 ) -> Result<StmtOutcome> {
     if pure_expr::is_pure(expr) {
         return pure_expr::compile(
@@ -193,6 +199,7 @@ pub fn compile_expr(
             expr,
             entry,
             fall_through,
+            omit_exit,
         );
     }
 
@@ -211,6 +218,7 @@ pub fn compile_expr(
                 default.as_ref().map(|b| &b.inner),
                 entry,
                 fall_through,
+                omit_exit,
             )
         }
         Expr::String(s, _ty) => {

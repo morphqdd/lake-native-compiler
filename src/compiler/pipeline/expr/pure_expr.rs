@@ -32,7 +32,53 @@ pub fn is_pure(expr: &Expr) -> bool {
         | Expr::BXor(l, r)
         | Expr::Shl(l, r)
         | Expr::Shr(l, r) => is_pure(&l.inner) && is_pure(&r.inner),
+        // #81 — Calls to scheduler-safe rt-functions are pure from the
+        // scheduling standpoint: they run synchronously, never yield,
+        // and complete in bounded time.  Pure_expr::fold knows how to
+        // emit them inline (direct rt-fn call with folded arg Values,
+        // bypassing the JUMP_ARGS staging machinery).
+        //
+        // Note: rt_store / rt_copy_bytes / rt_free have side effects
+        // on memory state but no scheduler interaction, so they're
+        // still safe to coalesce into a super-block.
+        Expr::Jump { ident, args } => {
+            if let Expr::Var(callee, _) = ident.inner {
+                if is_scheduler_safe_rt_fn(callee) {
+                    return args.iter().all(|a| is_pure(&a.inner));
+                }
+            }
+            false
+        }
         _ => false,
+    }
+}
+
+/// Whitelist of rt-functions whose body is small enough to be folded
+/// inline as a pure expression value.  Currently restricted to
+/// VALUE-returning bounded reads (rt_load_u*), since fold_with_self
+/// doesn't have CompilerCtx access to emit FuncRef calls for the
+/// larger rt-fns (rt_allocate, rt_copy_bytes, rt_store), and those
+/// still go through jump_expr's staging path.
+///
+/// rt_load_u8 etc are 3-instruction inlines: fat-ptr deref, indexed
+/// load, zero-extend.  Far cheaper than the staging + call sequence.
+fn is_scheduler_safe_rt_fn(name: &str) -> bool {
+    matches!(
+        name,
+        "rt_load_u8" | "rt_load_u16" | "rt_load_u32" | "rt_load_u64"
+    )
+}
+
+/// Cranelift integer type for a `rt_load_u*` size.  Used when emitting
+/// the load width before zero-extending to ptr_ty.
+fn rt_load_size_ty(name: &str) -> Option<cranelift::prelude::Type> {
+    use cranelift::prelude::types;
+    match name {
+        "rt_load_u8" => Some(types::I8),
+        "rt_load_u16" => Some(types::I16),
+        "rt_load_u32" => Some(types::I32),
+        "rt_load_u64" => Some(types::I64),
+        _ => None,
     }
 }
 
@@ -70,6 +116,7 @@ fn has_self(expr: &Expr) -> bool {
         | Expr::BXor(l, r)
         | Expr::Shl(l, r)
         | Expr::Shr(l, r) => has_self(&l.inner) || has_self(&r.inner),
+        Expr::Jump { args, .. } => args.iter().any(|a| has_self(&a.inner)),
         _ => false,
     }
 }
@@ -97,6 +144,7 @@ fn has_var(expr: &Expr) -> bool {
         | Expr::BXor(l, r)
         | Expr::Shl(l, r)
         | Expr::Shr(l, r) => has_var(&l.inner) || has_var(&r.inner),
+        Expr::Jump { args, .. } => args.iter().any(|a| has_var(&a.inner)),
         _ => false,
     }
 }
@@ -236,6 +284,47 @@ pub fn fold_with_self(
             // Logical / unsigned right shift — what crypto code expects.
             builder.ins().ushr(lv, rv)
         }
+        // #81 — Inline `rt_load_u*(fat_ptr, offset)` as Cranelift loads.
+        //
+        // Original rt-fn body:
+        //   load fat_ptr.start, then load(size) at start+offset,
+        //   uextend to ptr_ty.
+        //
+        // Inlining saves a function-call frame + JUMP_ARGS staging
+        // (which would emit multiple sub-blocks via jump_expr).  On
+        // SHA-256-style code that does thousands of byte-level loads
+        // per round, this is a major win.
+        Expr::Jump { ident, args } => {
+            let callee = match ident.inner {
+                Expr::Var(name, _) => name,
+                _ => unreachable!("Jump in fold must have Var callee — is_pure should have rejected otherwise"),
+            };
+            let size_ty = rt_load_size_ty(callee).unwrap_or_else(|| {
+                unreachable!("fold called on non-pure Jump to '{}'; is_pure mismatch", callee)
+            });
+
+            // Two args: fat_ptr_addr, offset.
+            debug_assert_eq!(args.len(), 2, "{} takes 2 args (fat_ptr, offset)", callee);
+            let fp_val = fold_with_self(&args[0].inner, builder, ptr_ty, vars_start, self_pid, state);
+            let off_val = fold_with_self(&args[1].inner, builder, ptr_ty, vars_start, self_pid, state);
+
+            // Fat-ptr deref: start = *fat_ptr_addr.  Trusted because
+            // we've already type-checked the buf type via the language
+            // layer.  Note: we skip the rt-fn's bounds check (which
+            // compared offset against fat_ptr.end) — caller code in
+            // stdlib has been audited to stay in range.  See trade-off
+            // discussion in docs/lowering.md.
+            let start = builder.ins().load(ptr_ty, MemFlags::trusted(), fp_val, 0);
+            let addr = builder.ins().iadd(start, off_val);
+            let raw = builder.ins().load(size_ty, MemFlags::trusted(), addr, 0);
+            // Zero-extend if narrower than ptr_ty (the i64 ABI for
+            // Lake's variable slots).
+            if size_ty == ptr_ty {
+                raw
+            } else {
+                builder.ins().uextend(ptr_ty, raw)
+            }
+        }
         _ => unreachable!("fold called on non-pure expr: {:?}", expr),
     }
 }
@@ -250,11 +339,15 @@ pub fn compile(
     expr: &Expr,
     entry: Option<Block>,
     fall_through: Option<Block>,
+    omit_exit: bool,
 ) -> Result<StmtOutcome> {
     let ptr_ty = ctx.module().target_config().pointer_type();
 
-    // #80 Level 2: use the caller-provided entry block if available
-    // (chaining from a previous fast-path fall_through), else create our own.
+    // #80 Level 3: when `omit_exit=true` AND `entry=Some(super_b)`, this
+    // statement is in the middle of a super-block run.  Skip the exit
+    // brif so subsequent statements emit into the same Cranelift block.
+    // The driver (branch.rs / wait_expr) supplies the final exit at the
+    // end of the run.
     let b = match entry {
         Some(e) => {
             builder.switch_to_block(e);
@@ -301,9 +394,17 @@ pub fn compile(
         .ins()
         .store(MemFlags::trusted(), result, exec_start, ExecCtxLayout::TEMP_VAL);
 
-    // #80 Level 2: fast-path exit emits inline quantum check + brif.
-    emit_continue(builder, ctx, ptr_ty, block_id, fall_through);
+    // #80 Level 2/3: emit exit unless we're mid-super-block.
+    if !omit_exit {
+        emit_continue(builder, ctx, ptr_ty, block_id, fall_through);
+    }
 
+    // Register this statement's block_id for re-entry.  In super-block mode
+    // multiple statements alias the same `b`, which is fine — branch_switch
+    // accepts multiple cases pointing at the same target.  Resume from any
+    // mid-super-block id re-runs the whole super-block from `b`; since
+    // all super-block-eligible statements are pure (no side effects beyond
+    // idempotent writes to vars), the re-run is harmless.
     branch_switch.set_entry(block_id as u128, b);
 
     Ok(StmtOutcome::Continue(block_id + 1))

@@ -12,7 +12,7 @@ use lake_frontend::api::{
 
 use crate::compiler::{
     ctx::CompilerCtx,
-    pipeline::expr::{BranchState, StmtOutcome, compile_expr, is_fast_chain_pair, pure_expr},
+    pipeline::expr::{BranchState, StmtOutcome, accepts_entry_pub, compile_expr, pure_expr},
     rt::layout::ExecCtxLayout,
 };
 
@@ -126,26 +126,35 @@ pub(crate) fn compile<'a>(
 
     for handler in &collect {
         body_starts.push(current_id);
-        // #80 Level 2: apply fast-path chaining inside wait-handler bodies.
-        // After ret-machine lowering, MOST of an actor's work lives here —
-        // the let-with-pure / let-with-rt-call chains that need coalescing
-        // are inside `wait __ret_N_pid { sender pid r ty -> <body> }`.
-        // Without this branch.rs-style orchestration, fast-path never
-        // triggers on the dominant code path of any program that uses
-        // ret-machines.
-        let mut current_entry: Option<cranelift::codegen::ir::Block> = None;
+        // #80 Level 3: super-block merging inside wait-handler bodies.
+        // After ret-machine lowering, the dominant code path of any
+        // program that uses ret-machines lives here, not at the branch
+        // top level.  Same orchestration as branch.rs — see comment
+        // there for details.
+        let mut super_b: Option<cranelift::codegen::ir::Block> = None;
         for (i, expr) in handler.body.iter().enumerate() {
-            let chain_to_next = handler
+            let this_fast = accepts_entry_pub(&expr.inner);
+            let next_fast = handler
                 .body
                 .get(i + 1)
-                .map(|next| is_fast_chain_pair(&expr.inner, &next.inner))
+                .map(|e| accepts_entry_pub(&e.inner))
                 .unwrap_or(false);
 
-            let fall_through = if chain_to_next {
-                Some(builder.create_block())
+            let entry = if this_fast {
+                if let Some(b) = super_b {
+                    Some(b)
+                } else if next_fast {
+                    let b = builder.create_block();
+                    super_b = Some(b);
+                    Some(b)
+                } else {
+                    None
+                }
             } else {
                 None
             };
+
+            let omit_exit = this_fast && next_fast;
 
             let outcome = compile_expr(
                 ctx,
@@ -155,8 +164,9 @@ pub(crate) fn compile<'a>(
                 branch_switch,
                 state,
                 &expr.inner,
-                current_entry,
-                fall_through,
+                entry,
+                None,
+                omit_exit,
             )?;
 
             match outcome {
@@ -167,7 +177,9 @@ pub(crate) fn compile<'a>(
                 }
             }
 
-            current_entry = fall_through;
+            if !omit_exit {
+                super_b = None;
+            }
         }
     }
 

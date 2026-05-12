@@ -84,6 +84,7 @@ pub fn compile(
             arg,
             None,
             None,
+            false,
         )? {
             StmtOutcome::Continue(id) => id,
             other => bail!(
@@ -100,27 +101,32 @@ pub fn compile(
         let b = builder.create_block();
         builder.switch_to_block(b);
 
+        // #81 — inline rt_load_u64 / rt_store (scheduler-trusted).
         let ctx_ptr = builder.use_var(machine_ctx_var);
-        let load_u64_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
-        let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
-
-        let temp_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::TEMP_VAL as i64);
-        let temp_call = builder.ins().call(load_u64_ref, &[ctx_ptr, temp_offset]);
-        let arg_val = builder.inst_results(temp_call)[0];
-
-        let jump_args_offset = builder
+        let exec_start = builder
             .ins()
-            .iconst(ptr_ty, ExecCtxLayout::JUMP_ARGS as i64);
-        let args_call = builder
+            .load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
+        let arg_val = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            exec_start,
+            ExecCtxLayout::TEMP_VAL,
+        );
+        let ja_fat = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            exec_start,
+            ExecCtxLayout::JUMP_ARGS,
+        );
+        let ja_start = builder
             .ins()
-            .call(load_u64_ref, &[ctx_ptr, jump_args_offset]);
-        let args_ptr = builder.inst_results(args_call)[0];
-
-        let slot_offset = builder.ins().iconst(ptr_ty, (call_base + i) as i64 * 8);
-        let size = builder.ins().iconst(ptr_ty, 8);
-        builder
-            .ins()
-            .call(store_ref, &[args_ptr, arg_val, size, slot_offset]);
+            .load(ptr_ty, MemFlags::trusted(), ja_fat, 0);
+        builder.ins().store(
+            MemFlags::trusted(),
+            arg_val,
+            ja_start,
+            (call_base + i) as i32 * 8,
+        );
 
         let next_block_val = builder.ins().iconst(ptr_ty, after_arg_id + 1);
         let qb = ctx.quantum_block();
@@ -134,38 +140,43 @@ pub fn compile(
         let b = builder.create_block();
         builder.switch_to_block(b);
 
+        // #81 — inline rt_load_u64 / rt_store (scheduler-trusted JUMP_ARGS).
         let ctx_ptr = builder.use_var(machine_ctx_var);
-        let load_u64_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
-
-        let jump_args_offset = builder
+        let exec_start = builder
             .ins()
-            .iconst(ptr_ty, ExecCtxLayout::JUMP_ARGS as i64);
-        let args_call = builder
+            .load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
+        let ja_fat = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            exec_start,
+            ExecCtxLayout::JUMP_ARGS,
+        );
+        let ja_start = builder
             .ins()
-            .call(load_u64_ref, &[ctx_ptr, jump_args_offset]);
-        let args_ptr = builder.inst_results(args_call)[0];
+            .load(ptr_ty, MemFlags::trusted(), ja_fat, 0);
 
         let mut arg_vals = Vec::with_capacity(args.len());
         for i in 0..args.len() {
-            let slot_offset = builder.ins().iconst(ptr_ty, (call_base + i) as i64 * 8);
-            let val_call = builder.ins().call(load_u64_ref, &[args_ptr, slot_offset]);
-            arg_vals.push(builder.inst_results(val_call)[0]);
+            arg_vals.push(builder.ins().load(
+                ptr_ty,
+                MemFlags::trusted(),
+                ja_start,
+                (call_base + i) as i32 * 8,
+            ));
         }
 
-        let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
         let func_ref = ctx.get_func(builder, callee_name)?;
         let call = builder.ins().call(func_ref, &arg_vals);
 
-        // If the rt function returns a value, store it in TEMP_VAL so that
-        // the caller can stage it as an argument for a subsequent spawn.
+        // If the rt function returns a value, store it in TEMP_VAL.
         let ret_val = builder.inst_results(call).first().copied();
         if let Some(val) = ret_val {
-            let ctx_ptr = builder.use_var(machine_ctx_var);
-            let temp_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::TEMP_VAL as i64);
-            let size = builder.ins().iconst(ptr_ty, 8);
-            builder
-                .ins()
-                .call(store_ref, &[ctx_ptr, val, size, temp_offset]);
+            builder.ins().store(
+                MemFlags::trusted(),
+                val,
+                exec_start,
+                ExecCtxLayout::TEMP_VAL,
+            );
         }
 
         // Park-aware rt fns: each one swaps the running actor out of
