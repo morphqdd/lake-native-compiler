@@ -39,33 +39,47 @@ pub fn compile(
     let b = builder.create_block();
     builder.switch_to_block(b);
 
-    let load_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
-
+    // #81 — Inline rt_load_u64 / rt_store at use sites. `self()` is called
+    // on every loop iteration of self-recursive ret-machines (fill_w/compress
+    // in SHA-256), so eliminating function-call overhead here matters.
     let spawning_ctx_ptr = builder.use_var(machine_ctx_var);
+    let exec_start = builder
+        .ins()
+        .load(ptr_ty, MemFlags::trusted(), spawning_ctx_ptr, 0);
 
     let spawning_ja_start = if arg_count > 0 || needs_guard_dispatch {
-        let jump_args_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::JUMP_ARGS as i64);
-        let call_ja = builder.ins().call(load_ref, &[spawning_ctx_ptr, jump_args_offset]);
-        let spawning_jump_args = builder.inst_results(call_ja)[0];
-        Some(FatPtrLayout::load_start(builder, ptr_ty, spawning_jump_args))
+        let ja_fat = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            exec_start,
+            ExecCtxLayout::JUMP_ARGS,
+        );
+        Some(builder.ins().load(ptr_ty, MemFlags::trusted(), ja_fat, 0))
     } else {
         None
     };
 
     if arg_count > 0 {
-        let vars_ptr_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::VARIABLES as i64);
-        let call_load_vars_fat_ptr = builder.ins().call(load_ref, &[spawning_ctx_ptr, vars_ptr_offset]);
-        let vars_fat_ptr = builder.inst_results(call_load_vars_fat_ptr)[0];
+        let vars_fat = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            exec_start,
+            ExecCtxLayout::VARIABLES,
+        );
+        let vars_start = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), vars_fat, 0);
         let ja_start = spawning_ja_start.unwrap();
-        let vars_start = FatPtrLayout::load_start(builder, ptr_ty, vars_fat_ptr);
         for i in 0..arg_count {
             let val = builder.ins().load(
                 ptr_ty,
-                MemFlags::new(),
+                MemFlags::trusted(),
                 ja_start,
                 (jump_args_base + i) as i32 * 8,
             );
-            builder.ins().store(MemFlags::new(), val, vars_start, i as i32 * 8);
+            builder
+                .ins()
+                .store(MemFlags::trusted(), val, vars_start, i as i32 * 8);
         }
     }
 
@@ -73,7 +87,7 @@ pub fn compile(
         let disc_pos = dispatch::find_first_guard_pos(&candidates);
         let disc = builder.ins().load(
             ptr_ty,
-            MemFlags::new(),
+            MemFlags::trusted(),
             spawning_ja_start.unwrap(),
             (jump_args_base + disc_pos) as i32 * 8,
         );
@@ -82,17 +96,14 @@ pub fn compile(
     } else {
         builder.ins().iconst(ptr_ty, candidates[0].branch_id as i64)
     };
-    let ptr_size = builder.ins().iconst(ptr_ty, ptr_ty.bytes() as i64);
-    let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
 
-    let branch_id_offset = builder
-        .ins()
-        .iconst(ptr_ty, ExecCtxLayout::BRANCH_ID as i64);
-
-    builder.ins().call(
-        store_ref,
-        &[spawning_ctx_ptr, branch_id_val, ptr_size, branch_id_offset],
+    builder.ins().store(
+        MemFlags::trusted(),
+        branch_id_val,
+        exec_start,
+        ExecCtxLayout::BRANCH_ID,
     );
+    let _ = rt_funcs;
 
     let next_id = 0;
     let next_id_val = builder.ins().iconst(ptr_ty, next_id);
