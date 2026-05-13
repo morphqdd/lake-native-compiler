@@ -292,6 +292,10 @@ fn pure_expr_uses_vars(expr: &Expr) -> bool {
         Expr::Var(..) => true,
         Expr::Neg(inner) => pure_expr_uses_vars(&inner.inner),
         Expr::TupleIndex { receiver, .. } => pure_expr_uses_vars(&receiver.inner),
+        Expr::Index { receiver, index } => {
+            pure_expr_uses_vars(&receiver.inner) || pure_expr_uses_vars(&index.inner)
+        }
+        Expr::Jump { args, .. } => args.iter().any(|a| pure_expr_uses_vars(&a.inner)),
         Expr::Add(l, r)
         | Expr::Sub(l, r)
         | Expr::Mul(l, r)

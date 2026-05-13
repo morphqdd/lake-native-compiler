@@ -59,12 +59,36 @@ enum ArmKey {
     Wildcard,
 }
 
+/// A statement that may appear *before* the terminating `self(...)`
+/// call inside a self-recursive arm body.  Only the two shapes that
+/// don't yield the scheduler are accepted; everything else (a
+/// nested `when`, a `wait`, a non-pure helper call) makes the
+/// detector bail out.
+pub enum PreStmt<'src> {
+    /// `let X = <pure expr>` — fold the default to a single Cranelift
+    /// value, declare a per-iter local binding so subsequent pre-stmts
+    /// and the self-args fold can see it by name.
+    Let { name: &'src str, default: Expr<'src> },
+    /// Bare scheduler-safe rt-call (e.g. `rt_store(...)`).  After #78
+    /// inlines pure stdlib helpers like `set_be32` and `set`, the
+    /// expanded body lands here as top-level `rt_store` / `rt_load_*`
+    /// / `rt_copy_bytes` invocations.  Args must all be pure.
+    SideEffect { callee: &'src str, args: Vec<Expr<'src>> },
+}
+
 /// Information captured from a detected tail-self loop.
 ///
 /// All fields are owned clones so the caller can drive the rest of
 /// compilation without holding `&branch.body` borrows.
 pub struct TailLoopInfo<'src> {
     pub cond: Expr<'src>,
+    /// Statements that run before the terminating `self(...)` call at
+    /// each unrolled iteration.  Empty for simple "one-stmt self-arm"
+    /// loops like counter / cpu-bench worker; populated for
+    /// SHA-256's `fill_w` / `compress` style bodies where the self-
+    /// arm has let bindings + bare rt-calls before the recursive
+    /// continuation.
+    pub pre_stmts: Vec<PreStmt<'src>>,
     pub self_args: Vec<Expr<'src>>,
     pub exit_body: Vec<Expr<'src>>,
     /// `true` if the self-recurring arm's key is `true` (continue iff
@@ -73,6 +97,56 @@ pub struct TailLoopInfo<'src> {
     /// and the CPU-bench worker (self on `true`) share the same loop
     /// shape; this flag lets the emitter pick the right brif polarity.
     pub continue_when_truthy: bool,
+}
+
+/// Whitelist of rt-fns that may appear bare (not let-bound) inside
+/// a self-arm body.  These are side-effecting but bounded — they
+/// don't yield the scheduler, don't allocate new actors, and can be
+/// safely interleaved with the unrolled iterations.
+fn is_unroll_safe_side_effect(name: &str) -> bool {
+    matches!(
+        name,
+        "rt_store"
+            | "rt_copy_bytes"
+            | "rt_load_u8"
+            | "rt_load_u16"
+            | "rt_load_u32"
+            | "rt_load_u64"
+    )
+}
+
+/// Classify a single statement that appears before the final
+/// `self(...)` in a self-arm body.  Returns `Some(PreStmt)` when the
+/// shape is unroll-safe; otherwise the detector should bail out.
+fn classify_pre_stmt<'src>(expr: &Expr<'src>) -> Option<PreStmt<'src>> {
+    match expr {
+        Expr::Let { ident, default: Some(d), .. } => {
+            if pure_expr::is_pure(&d.inner) {
+                Some(PreStmt::Let {
+                    name: ident.inner.0,
+                    default: d.inner.clone(),
+                })
+            } else {
+                None
+            }
+        }
+        Expr::Jump { ident, args } => {
+            let Expr::Var(name, _) = ident.inner else {
+                return None;
+            };
+            if !is_unroll_safe_side_effect(name) {
+                return None;
+            }
+            if !args.iter().all(|a| pure_expr::is_pure(&a.inner)) {
+                return None;
+            }
+            Some(PreStmt::SideEffect {
+                callee: name,
+                args: args.iter().map(|a| a.inner.clone()).collect(),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Returns `Some(info)` when `body` matches the supported tail-self loop
@@ -96,8 +170,32 @@ pub fn detect_tail_loop<'src>(
     if body.len() != 1 {
         return None;
     }
-    let Expr::When { cond, branches } = &body[0].inner else {
-        return None;
+
+    // After the ret-machine lowering pass, a `-> ret T { when ... }`
+    // body is rewritten as `__caller(self, when ...)`, where the
+    // `when` becomes the LAST argument of the synthetic `__caller`
+    // send.  Peel that wrap so the rest of the detector can pretend
+    // the source still has a bare `when` at the top level.  Lake
+    // source written without a `ret` annotation (or pre-lowering ASTs)
+    // already lands here as a plain `When`.
+    let when_expr: &Expr<'src> = match &body[0].inner {
+        Expr::When { .. } => &body[0].inner,
+        Expr::Jump { ident, args } => {
+            let Expr::Var(callee, _) = ident.inner else {
+                return None;
+            };
+            if callee != "__caller" || args.is_empty() {
+                return None;
+            }
+            match &args.last().unwrap().inner {
+                w @ Expr::When { .. } => w,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let Expr::When { cond, branches } = when_expr else {
+        unreachable!()
     };
     if !pure_expr::is_pure(&cond.inner) {
         return None;
@@ -122,19 +220,29 @@ pub fn detect_tail_loop<'src>(
     let mut self_arm_idx: Option<usize> = None;
     let mut self_arm_key: Option<ArmKey> = None;
 
+    // Recognise self-arm candidates: the arm body's LAST stmt must be
+    // a `self(pure_args)` Jump, and every earlier stmt must classify
+    // as a safe `PreStmt` (let with pure default, or a bare
+    // scheduler-safe rt-call).  This is what lets SHA-256's
+    // `fill_w` / `compress` bodies — which carry several pre-self
+    // let bindings + inlined `rt_store` calls (from #78-inlined
+    // `set_be32`) — qualify for unroll alongside the trivial
+    // counter / cpu-bench shapes.
     for (i, (key, arm_body)) in branches.iter().enumerate() {
         let Some(k) = arm_key_kind(&key.inner) else {
             return None;
         };
 
-        if arm_body.len() == 1 {
-            if let Expr::Jump { ident, args } = &arm_body[0].inner {
+        if let Some(last) = arm_body.last() {
+            if let Expr::Jump { ident, args } = &last.inner {
                 if let Expr::Var(name, _) = ident.inner {
-                    if (name == "self" || name == machine_ident)
+                    let is_self_call = (name == "self" || name == machine_ident)
                         && args.len() == expected_arg_count
-                        && args.iter().all(|a| pure_expr::is_pure(&a.inner))
-                        && self_arm_idx.is_none()
-                    {
+                        && args.iter().all(|a| pure_expr::is_pure(&a.inner));
+                    let pre_ok = arm_body[..arm_body.len() - 1]
+                        .iter()
+                        .all(|s| classify_pre_stmt(&s.inner).is_some());
+                    if is_self_call && pre_ok && self_arm_idx.is_none() {
                         self_arm_idx = Some(i);
                         self_arm_key = Some(k);
                         continue;
@@ -169,15 +277,26 @@ pub fn detect_tail_loop<'src>(
     let self_arm_body = &branches[self_idx].1;
     let exit_arm_body = &branches[exit_idx].1;
 
-    let Expr::Jump { args, .. } = &self_arm_body[0].inner else {
-        unreachable!("self_arm shape was already verified")
+    let last_idx = self_arm_body.len() - 1;
+    let Expr::Jump { args, .. } = &self_arm_body[last_idx].inner else {
+        unreachable!("self-arm last-stmt shape was already verified")
     };
     let self_args: Vec<Expr<'src>> = args.iter().map(|a| a.inner.clone()).collect();
+
+    // Reclassify pre-stmts now that we know they're all valid; the
+    // detect loop above ran the `is_some()` check, so unwraps here
+    // can never fail.
+    let pre_stmts: Vec<PreStmt<'src>> = self_arm_body[..last_idx]
+        .iter()
+        .map(|s| classify_pre_stmt(&s.inner).expect("pre-stmt was already classified"))
+        .collect();
+
     let cond_expr = cond.inner.clone();
     let exit_body: Vec<Expr<'src>> = exit_arm_body.iter().map(|e| e.inner.clone()).collect();
 
     Some(TailLoopInfo {
         cond: cond_expr,
+        pre_stmts,
         self_args,
         exit_body,
         continue_when_truthy: self_key_truthy,
@@ -309,6 +428,36 @@ pub fn compile_unrolled_branch<'src>(
             .brif(take_iter, body_block, &[], exit_bridge, &[]);
         builder.switch_to_block(body_block);
 
+        // ── pre-stmts: let-bindings + bare scheduler-safe rt-calls
+        //    that appear before the final `self(...)` in the source
+        //    arm body.  Each Let introduces a per-iter binding so
+        //    subsequent reads (and the self-args fold) see it by
+        //    name through `state.cached_vars`.  After this iter
+        //    finishes we drop those bindings so the next iter's
+        //    redeclaration of the same name gets a fresh Cranelift
+        //    Variable.
+        let mut iter_locals: Vec<&str> = Vec::new();
+        for pre in &info.pre_stmts {
+            match pre {
+                PreStmt::Let { name, default } => {
+                    let val = pure_expr::fold(default, builder, ptr_ty, Some(vars_start), state);
+                    let v = builder.declare_var(ptr_ty);
+                    builder.def_var(v, val);
+                    let slot = state.insert(name.to_string(), ptr_ty);
+                    state.cache_slot(slot, v);
+                    iter_locals.push(name);
+                }
+                PreStmt::SideEffect { callee, args } => {
+                    let func_ref = ctx.get_func(builder, callee)?;
+                    let arg_vals: Vec<_> = args
+                        .iter()
+                        .map(|a| pure_expr::fold(a, builder, ptr_ty, Some(vars_start), state))
+                        .collect();
+                    builder.ins().call(func_ref, &arg_vals);
+                }
+            }
+        }
+
         // Fold all self() args first (don't write any var slot until ALL
         // reads are done — `self(steps-1 acc2 acc1+acc2)` must read the
         // original acc2 before overwriting it).
@@ -322,6 +471,11 @@ pub fn compile_unrolled_branch<'src>(
             if let Some(&v) = slot_vars.get(&i) {
                 builder.def_var(v, *val);
             }
+        }
+
+        // Drop per-iter locals before the next chunk redefines them.
+        for name in iter_locals {
+            state.remove(name);
         }
     }
 

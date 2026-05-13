@@ -144,6 +144,24 @@ impl BranchState {
     pub fn clear_var_cache(&mut self) {
         self.cached_vars.clear();
     }
+
+    /// Drop the slot bound to `name` if any.  Used by `unroll.rs` to
+    /// scope let-bindings introduced inside an unrolled iteration —
+    /// each iter declares a fresh `let s1 = ...`, processes its
+    /// dependents, and then removes the binding before the next iter
+    /// re-introduces the same name (with a different Cranelift
+    /// Variable).
+    ///
+    /// Does NOT renumber surviving slots; the freed slot id remains
+    /// unused for the rest of the branch.  Callers that care about
+    /// dense slot allocation must arrange their inserts in stable
+    /// order outside the scoped region.
+    pub fn remove(&mut self, name: &str) {
+        if let Some((_, slot)) = self.vars.remove(name) {
+            self.cached_vars.remove(&slot);
+        }
+        self.lake_types.remove(name);
+    }
 }
 
 /// #80 Level 2 — does `expr` accept a precreated entry block?

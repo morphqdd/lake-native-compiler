@@ -18,6 +18,14 @@ pub fn is_pure(expr: &Expr) -> bool {
         Expr::Num(..) | Expr::Bool(..) | Expr::Var(..) | Expr::Atom(..) => true,
         Expr::Neg(inner) => is_pure(&inner.inner),
         Expr::TupleIndex { receiver, .. } => is_pure(&receiver.inner),
+        // `buf[i]` desugars to a bounds-checked byte load — the
+        // Index expr is the source-level form of `rt_load_u8(buf, i)`
+        // and is already a "scheduler-safe rt-call" by the same
+        // argument that admits `rt_load_u8` to `is_scheduler_safe_rt_fn`
+        // below.  Treat it as pure as long as both operands are pure
+        // so the unroll detector accepts SHA-256's `fill_w` body
+        // (which uses `b0 = buf[off]` after Phase 2a's `be32` inline).
+        Expr::Index { receiver, index } => is_pure(&receiver.inner) && is_pure(&index.inner),
         Expr::Add(l, r)
         | Expr::Sub(l, r)
         | Expr::Mul(l, r)
@@ -130,6 +138,7 @@ fn has_var(expr: &Expr) -> bool {
         Expr::Var(..) => true,
         Expr::Neg(inner) => has_var(&inner.inner),
         Expr::TupleIndex { receiver, .. } => has_var(&receiver.inner),
+        Expr::Index { receiver, index } => has_var(&receiver.inner) || has_var(&index.inner),
         Expr::Add(l, r)
         | Expr::Sub(l, r)
         | Expr::Mul(l, r)
@@ -193,6 +202,20 @@ pub fn fold_with_self(
             builder
                 .ins()
                 .load(ptr_ty, MemFlags::trusted(), start, (*index as i32) * 8)
+        }
+        // `buf[i]` — single byte load.  Match `rt_load_u8`'s shape:
+        // deref the fat-ptr to get `start`, add the index, load one
+        // byte, zero-extend to ptr_ty.  Bounds check is intentionally
+        // skipped (same trade-off as the `rt_load_u8` inline in the
+        // Jump arm below).
+        Expr::Index { receiver, index } => {
+            use cranelift::prelude::types;
+            let recv_val = fold_with_self(&receiver.inner, builder, ptr_ty, vars_start, self_pid, state);
+            let idx_val = fold_with_self(&index.inner, builder, ptr_ty, vars_start, self_pid, state);
+            let start = builder.ins().load(ptr_ty, MemFlags::trusted(), recv_val, 0);
+            let addr = builder.ins().iadd(start, idx_val);
+            let raw = builder.ins().load(types::I8, MemFlags::trusted(), addr, 0);
+            builder.ins().uextend(ptr_ty, raw)
         }
         Expr::Var("self", _) => self_pid.expect(
             "self used as a value but no self_pid supplied — call \
