@@ -13,7 +13,7 @@ use log::debug;
 
 use crate::compiler::{
     ctx::CompilerCtx,
-    pipeline::expr::{BranchState, StmtOutcome, accepts_entry_pub, compile_expr},
+    pipeline::expr::{BranchState, StmtOutcome, accepts_entry_pub, compile_expr, unroll},
     rt::layout::ExecCtxLayout,
 };
 
@@ -86,6 +86,93 @@ pub fn compile_branch(
         let lake_ty = Clean::<Type<'_>>::clean(pattern).to_string();
         let slot = state.insert_with_lake_type(ident_str, ptr_ty, lake_ty);
         named_slots.push(slot);
+    }
+
+    // ── #85 — Tail-self loop unroll (LAKE_UNROLL env var) ────────────────────
+    //
+    // When the branch matches the canonical actor-loop shape
+    //   [When pure_cond { true → [self(pure_args)], false → [exit] }]
+    // and LAKE_UNROLL > 1, emit U body copies in a single Cranelift
+    // basic block.  Skips the inter-iter dispatch chain and lets
+    // Cranelift's regalloc / CSE operate across the whole chunk.
+    //
+    // The detector also requires:
+    //   * all pattern positions are named (no guards / wildcards),
+    //   * self() arg count matches param count,
+    //   * cond + every self() arg is pure (no jumps to non-rt-load fns).
+    let unroll_factor: usize = std::env::var("LAKE_UNROLL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+
+    let all_named = named_slots.len() == patterns.len();
+    let unroll_info = if unroll_factor > 1 && all_named {
+        unroll::detect_tail_loop(&branch.body, machine_ident, patterns.len())
+    } else {
+        None
+    };
+
+    if let Some(info) = unroll_info {
+        let (mut switch, mut next_block_id) = unroll::compile_unrolled_branch(
+            ctx,
+            builder,
+            machine_ctx_var,
+            branch_entry_block,
+            branch_switch_block,
+            &info,
+            unroll_factor,
+            &mut state,
+            &named_slots,
+        )?;
+
+        // Emit exit-arm body using the standard compile_expr pipeline.
+        // Each stmt registers itself with `switch` at BLOCK_ID = next_block_id.
+        for expr_inner in info.exit_body.iter() {
+            // Build a one-off Spanned wrapper isn't needed — compile_expr
+            // takes &Expr directly.  Wrap with a dummy Spanned span only
+            // when callers (e.g. let_expr) need it; current API accepts
+            // &Expr, so pass it through.
+            let dummy_span: chumsky::span::SimpleSpan = (0..0).into();
+            let spanned = chumsky::span::Spanned {
+                inner: expr_inner.clone(),
+                span: dummy_span,
+            };
+            let outcome = compile_expr(
+                ctx,
+                builder,
+                machine_ctx_var,
+                next_block_id,
+                &mut switch,
+                &mut state,
+                &spanned.inner,
+                None,
+                None,
+                false,
+            )?;
+            match outcome {
+                StmtOutcome::Continue(id) => next_block_id = id,
+                other => {
+                    next_block_id = other.next_available();
+                    break;
+                }
+            }
+        }
+
+        // Emit the per-branch switch.
+        builder.switch_to_block(branch_switch_block);
+        let block_id_val = builder.block_params(branch_switch_block)[0];
+        switch.emit(builder, block_id_val, default_branch_block);
+
+        debug!(
+            "  branch[{}] UNROLLED x{}: hash={:#018x}, vars={}, blocks={}",
+            branch_id,
+            unroll_factor,
+            hash,
+            state.len(),
+            next_block_id,
+        );
+        ctx.update_branch_var_count(machine_ident, branch_id, state.len());
+        return Ok(());
     }
 
     // ── Branch entry: read BLOCK_ID and jump to the block switch ─────────────

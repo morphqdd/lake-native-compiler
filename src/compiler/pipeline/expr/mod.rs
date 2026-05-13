@@ -53,6 +53,7 @@ pub mod send_expr;
 pub mod spawn_expr;
 pub mod string_expr;
 pub mod tuple_expr;
+pub mod unroll;
 pub mod var_expr;
 pub mod wait_expr;
 pub mod when_expr;
@@ -135,6 +136,13 @@ impl BranchState {
     /// Look up the cached Cranelift Variable for `slot`, if any.
     pub fn cached_var(&self, slot: usize) -> Option<Variable> {
         self.cached_vars.get(&slot).copied()
+    }
+
+    /// Drop all cached_var entries.  Used by the unroll path after
+    /// committing register-resident vars back to memory, so subsequent
+    /// compile_expr calls (e.g. exit-arm body) revert to memory loads.
+    pub fn clear_var_cache(&mut self) {
+        self.cached_vars.clear();
     }
 }
 

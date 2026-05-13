@@ -14,8 +14,20 @@ build_lake() {
     local bench_dir="$1"
     local src="$bench_dir/lake.lake"
     [ -f "$src" ] || return 2  # not present = skip
+    # Per-bench compile-time env (LAKE_UNROLL, LAKE_QUANTUM, …) lives in
+    # <bench_dir>/lake.env so each bench captures its own tuning knobs.
+    local env_file="$bench_dir/lake.env"
     # lakec resolves embedded syscall.o relative to CWD — must run from REPO_ROOT
-    (cd "$REPO_ROOT" && "$LAKEC" -r "$src") >/dev/null 2>&1 || return 1
+    (
+        cd "$REPO_ROOT"
+        if [ -f "$env_file" ]; then
+            set -a
+            # shellcheck disable=SC1090
+            . "$env_file"
+            set +a
+        fi
+        "$LAKEC" -r "$src"
+    ) >/dev/null 2>&1 || return 1
     # lakec writes to <src_dir>/build/<stem>; our stem is "lake".
     [ -x "$bench_dir/build/lake" ] || return 1
     return 0
