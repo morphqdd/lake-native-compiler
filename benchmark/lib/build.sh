@@ -17,9 +17,17 @@ build_lake() {
     # Per-bench compile-time env (LAKE_UNROLL, LAKE_QUANTUM, …) lives in
     # <bench_dir>/lake.env so each bench captures its own tuning knobs.
     local env_file="$bench_dir/lake.env"
+    # `+std.foo.{ … }` imports resolve via LAKE_PATH; default to the
+    # sibling `lake-stdlib` checkout next to the compiler repo.  Bench
+    # authors can override by exporting LAKE_PATH or by setting a
+    # bench-local `lake.env`.
+    local default_lake_path="$REPO_ROOT/../lake-stdlib"
     # lakec resolves embedded syscall.o relative to CWD — must run from REPO_ROOT
     (
         cd "$REPO_ROOT"
+        if [ -z "${LAKE_PATH:-}" ] && [ -d "$default_lake_path" ]; then
+            export LAKE_PATH="$default_lake_path"
+        fi
         if [ -f "$env_file" ]; then
             set -a
             # shellcheck disable=SC1090

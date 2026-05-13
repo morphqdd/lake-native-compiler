@@ -1,5 +1,5 @@
 NAME="sha256"
-DESC="SHA-256 of 64 KiB zeroed buffer — single-thread, byte-validated"
+DESC="SHA-256 of 1 MiB zeroed buffer — single-thread, byte-validated"
 WARMUP=5
 LANGS="seq lake cpp rust go"
 LABELS=(

@@ -50,6 +50,15 @@ use crate::compiler::{
     rt::layout::ExecCtxLayout,
 };
 
+/// Shape of an arm key — the literal pattern in a `when` arm head.
+/// Only the two shapes that combine into an exhaustive 2-arm dispatch
+/// are recognised; everything else makes the detector bail out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArmKey {
+    Bool(bool),
+    Wildcard,
+}
+
 /// Information captured from a detected tail-self loop.
 ///
 /// All fields are owned clones so the caller can drive the rest of
@@ -97,17 +106,25 @@ pub fn detect_tail_loop<'src>(
         return None;
     }
 
-    // Identify which arm is the self-tail-call.  Accept either arm key as
-    // long as it's a Bool literal — `counter` uses `false -> self`,
-    // CPU-bench's worker uses `true -> self`.  The other arm key must
-    // be the complementary Bool so the dispatch is total.
+    // Identify which arm is the self-tail-call.  The supported arm key
+    // shapes are Bool literals (`true` / `false`) or the wildcard `_`.
+    // SHA-256's `fill_w` and `compress` use `when i == 64 { true ->
+    // exit; _ -> self(...) }` — wildcard for the non-self side — so we
+    // need to recognise that as the complementary case to `true`.
+    let arm_key_kind = |e: &Expr<'_>| -> Option<ArmKey> {
+        match e {
+            Expr::Bool(b) => Some(ArmKey::Bool(*b)),
+            Expr::Var("_", _) => Some(ArmKey::Wildcard),
+            _ => None,
+        }
+    };
+
     let mut self_arm_idx: Option<usize> = None;
-    let mut self_arm_key_truthy: Option<bool> = None;
+    let mut self_arm_key: Option<ArmKey> = None;
 
     for (i, (key, arm_body)) in branches.iter().enumerate() {
-        let key_truthy = match key.inner {
-            Expr::Bool(b) => b,
-            _ => return None,
+        let Some(k) = arm_key_kind(&key.inner) else {
+            return None;
         };
 
         if arm_body.len() == 1 {
@@ -119,7 +136,7 @@ pub fn detect_tail_loop<'src>(
                         && self_arm_idx.is_none()
                     {
                         self_arm_idx = Some(i);
-                        self_arm_key_truthy = Some(key_truthy);
+                        self_arm_key = Some(k);
                         continue;
                     }
                 }
@@ -129,15 +146,22 @@ pub fn detect_tail_loop<'src>(
     }
 
     let self_idx = self_arm_idx?;
-    let self_key_truthy = self_arm_key_truthy?;
+    let self_key = self_arm_key?;
     let exit_idx = 1 - self_idx;
+    let exit_key = arm_key_kind(&branches[exit_idx].0.inner)?;
 
-    // The exit-arm key must be the complementary Bool so the two arms
-    // cover the discriminant exhaustively.
-    let exit_key_ok = matches!(
-        branches[exit_idx].0.inner,
-        Expr::Bool(b) if b != self_key_truthy
-    );
+    // The (self_key, exit_key) pair must cover the discriminant
+    // exhaustively.  Accepted shapes:
+    //   (Bool(true),  Bool(false))   ← counter / cpu-bench worker
+    //   (Bool(false), Bool(true))    ← sum
+    //   (Bool(b),     Wildcard)      ← sha256 fill_w / compress
+    //   (Wildcard,    Bool(b))       ← (theoretical mirror — covered)
+    let (self_key_truthy, exit_key_ok) = match (self_key, exit_key) {
+        (ArmKey::Bool(b), ArmKey::Bool(c)) if b != c => (b, true),
+        (ArmKey::Bool(b), ArmKey::Wildcard) => (b, true),
+        (ArmKey::Wildcard, ArmKey::Bool(b)) => (!b, true),
+        _ => (false, false),
+    };
     if !exit_key_ok {
         return None;
     }

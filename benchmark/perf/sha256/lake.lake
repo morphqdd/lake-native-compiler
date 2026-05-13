@@ -2,17 +2,17 @@
 @rt(rt_allocate)
 @rt(rt_write)
 
-// SHA-256 of a 64 KiB zeroed buffer.  rt_allocate's mmap-backed
+// SHA-256 of a 1 MiB zeroed buffer.  rt_allocate's mmap-backed
 // payload is zero-initialised on first touch, so the input is well-
 // defined without any prefill step.  Writes the raw 32-byte digest
 // to stdout so the bench harness can verify it byte-for-byte against
 // the C reference (`./lake | sha256sum` of the digest).
 main is {
   _ -> {
-    let r = rt_allocate(65536)
+    let r = rt_allocate(1048576)
     when r.0 {
       :ok -> {
-        let h = sha256(r.1 65536)
+        let h = sha256(r.1 1048576)
         rt_write(1 h 32)
       }
       _ -> { rt_write(1 "alloc failed\n" 13) }

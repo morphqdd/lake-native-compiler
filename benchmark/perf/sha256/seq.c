@@ -71,9 +71,9 @@ static void sha256(const uint8_t *msg, size_t len, uint8_t out[32]) {
 }
 
 int main(void) {
-    uint8_t *buf = calloc(65536, 1);
+    uint8_t *buf = calloc(1048576, 1);
     uint8_t out[32];
-    sha256(buf, 65536, out);
+    sha256(buf, 1048576, out);
     fwrite(out, 1, 32, stdout);
     free(buf);
     return 0;

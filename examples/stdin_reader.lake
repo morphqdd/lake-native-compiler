@@ -1,9 +1,10 @@
 @rt(rt_read)
 @rt(rt_write)
 @rt(rt_allocate)
++std.process.{ die }
 
 stdreader is {
-  id pid buf i64 size i64 -> {
+  id pid buf buf size i64 -> {
         rt_write(1 "Before read\n" 12)
         rt_read(0 buf size)
         rt_write(1 "After read\n" 11)
@@ -13,7 +14,7 @@ stdreader is {
 }
 
 stdwriter is {
-  buf i64 size i64 -> {
+  buf buf size i64 -> {
     rt_write(1 buf size)
   }
   buf str size i64 -> {
@@ -28,12 +29,18 @@ process is {
     }
   }
   self_id pid -> {
-    let buf i64 = rt_allocate(32)
-    stdreader(self_id buf 32)
-    wait {
-      _ -> {
-        stdwriter(buf 32)
+    let r = rt_allocate(32)
+    when r.0 {
+      :ok -> {
+        let buf = r.1
+        stdreader(self_id buf 32)
+        wait {
+          _ -> {
+            stdwriter(buf 32)
+          }
+        }
       }
+      _ -> { die() }
     }
   }
 }
