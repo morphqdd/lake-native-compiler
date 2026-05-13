@@ -13,6 +13,7 @@ use crate::compiler::{
                 define_allocate, define_allocate_raw, define_copy_bytes, define_free, define_loads,
                 define_store,
             },
+            die::define_die_actor,
             exit::define_exit,
             io_uring::{
                 define_accept_async, define_close, define_io_park_current,
@@ -58,10 +59,15 @@ impl RuntimeBuilder {
         let ctx = define_munmap(ctx)?;
         debug!("rt: rt_init_heap");
         let ctx = define_init_heap(ctx)?;
-        debug!("rt: rt_allocate");
-        let ctx = define_allocate(ctx)?;
+        // `rt_allocate_raw` first so the user-facing `rt_allocate`
+        // (which returns the tuple `{atom buf}`) can call into the raw
+        // variant for its 16-byte tuple wrapper without forward refs.
         debug!("rt: rt_allocate_raw");
         let ctx = define_allocate_raw(ctx)?;
+        debug!("rt: rt_allocate");
+        let ctx = define_allocate(ctx)?;
+        debug!("rt: rt_die_actor");
+        let ctx = define_die_actor(ctx)?;
         debug!("rt: rt_free");
         let ctx = define_free(ctx)?;
         debug!("rt: rt_store");

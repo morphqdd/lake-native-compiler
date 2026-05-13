@@ -10,6 +10,7 @@ use cranelift::{
 
 use crate::compiler::{
     ctx::CompilerCtx,
+    pipeline::expr::pure_expr::atom_id,
     rt::layout::{
         ExecCtxLayout, FatPtrLayout, process_ctx::ProcessCtxLayout,
         sheduler_ctx::ShedulerCtxLayout,
@@ -275,18 +276,52 @@ fn define_allocate_impl(
         .ins()
         .brif(in_bounds, cont_block, &[], oom_block, &[]);
 
-    // ── oom_block: try to mark the current actor :dying.  Falls back to
-    //    process-exit when there's no actor yet — true for the very early
-    //    allocations during scheduler bootstrap (ShedulerCtxLayout::init,
-    //    init_main_process) that run before `sheduler_ctx_fat_ptr` is
-    //    populated or before any process is registered.
+    // ── oom_block: behaviour depends on which entry point this is.
+    //    `rt_allocate` is the user-facing tuple-ABI variant: return
+    //    `{:err :nomem}` and let the lowering pass's bare-call wrapper
+    //    (or an explicit user `when r.0 { :err -> ... }`) decide whether
+    //    the actor dies.  `rt_allocate_raw` is the scheduler-internal
+    //    path used by spawn / tuple_expr / io_uring init; mark IS_DYING
+    //    (or process-exit at init time) and return null.
     builder.switch_to_block(oom_block);
     builder.seal_block(oom_block);
 
-    // Resolve the scheduler context's address.  When the global value
-    // (= the fat-ptr stored in the static) is still zero we're inside
-    // very early init; take the process-exit branch.
-    let sched_data_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
+    let is_tuple_abi = func_name == "rt_allocate";
+
+    if is_tuple_abi {
+        // Allocate the 2-slot tuple `{atom buf}` via the raw allocator
+        // (already defined, courtesy of the init-order swap).  Write
+        // `:err :nomem`, return the tuple's fat-ptr.  No IS_DYING set
+        // here — the lowering pass injects `rt_die_actor()` at bare
+        // call sites; let-bound callers can recover.
+        let alloc_raw_id = match ctx.module().get_name("rt_allocate_raw") {
+            Some(FuncOrDataId::Func(id)) => id,
+            _ => {
+                return Err(anyhow!(
+                    "rt_allocate_raw must be defined before rt_allocate (tuple ABI)"
+                ));
+            }
+        };
+        let alloc_raw_ref = ctx
+            .module_mut()
+            .declare_func_in_func(alloc_raw_id, &mut builder.func);
+        let sixteen = builder.ins().iconst(ty, 16);
+        let call = builder.ins().call(alloc_raw_ref, &[sixteen]);
+        let tuple_fp = builder.inst_results(call)[0];
+        let tuple_start = builder.ins().load(ty, MemFlags::trusted(), tuple_fp, 0);
+        let err_a = builder.ins().iconst(ty, atom_id("err"));
+        let nomem_a = builder.ins().iconst(ty, atom_id("nomem"));
+        builder.ins().store(MemFlags::trusted(), err_a, tuple_start, 0);
+        builder.ins().store(MemFlags::trusted(), nomem_a, tuple_start, 8);
+        builder.ins().return_(&[tuple_fp]);
+
+        // Move to cont_block so the shared happy-path emission below
+        // can write the fat-pointer header straight into it.
+        builder.switch_to_block(cont_block);
+        builder.seal_block(cont_block);
+        let _ = TrapCode::HEAP_OUT_OF_BOUNDS;
+    } else {
+        let sched_data_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
         Some(FuncOrDataId::Data(id)) => id,
         _ => return Err(anyhow!("sheduler_ctx_fat_ptr global not found for OOM die path")),
     };
@@ -468,6 +503,7 @@ fn define_allocate_impl(
 
     builder.switch_to_block(cont_block);
     builder.seal_block(cont_block);
+    } // end of raw OOM `else` branch — builder is now on cont_block.
     // Suppress unused-import warning when no other site references TrapCode.
     let _ = TrapCode::HEAP_OUT_OF_BOUNDS;
 
@@ -527,7 +563,30 @@ fn define_allocate_impl(
     builder.switch_to_block(merge_block);
     builder.seal_block(merge_block);
     let result = builder.block_params(merge_block)[0];
-    builder.ins().return_(&[result]);
+
+    if is_tuple_abi {
+        // Wrap the buf fat-ptr in a 2-slot tuple `{:ok buf}`.  The
+        // 16-byte tuple itself is allocated via the raw allocator so
+        // user code can `let r = rt_allocate(N); when r.0 { :ok -> r.1
+        // _ -> ... }` without an extra layer of unwrapping.
+        let alloc_raw_id = match ctx.module().get_name("rt_allocate_raw") {
+            Some(FuncOrDataId::Func(id)) => id,
+            _ => return Err(anyhow!("rt_allocate_raw missing for rt_allocate tuple wrap")),
+        };
+        let alloc_raw_ref = ctx
+            .module_mut()
+            .declare_func_in_func(alloc_raw_id, &mut builder.func);
+        let sixteen = builder.ins().iconst(ty, 16);
+        let call = builder.ins().call(alloc_raw_ref, &[sixteen]);
+        let tuple_fp = builder.inst_results(call)[0];
+        let tuple_start = builder.ins().load(ty, MemFlags::trusted(), tuple_fp, 0);
+        let ok_a = builder.ins().iconst(ty, atom_id("ok"));
+        builder.ins().store(MemFlags::trusted(), ok_a, tuple_start, 0);
+        builder.ins().store(MemFlags::trusted(), result, tuple_start, 8);
+        builder.ins().return_(&[tuple_fp]);
+    } else {
+        builder.ins().return_(&[result]);
+    }
 
     let sig = builder.func.signature.clone();
     let id = ctx
