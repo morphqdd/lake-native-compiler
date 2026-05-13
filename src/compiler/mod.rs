@@ -376,6 +376,21 @@ pub(crate) fn hash_call_args(
                 Expr::Var(_, ty) => ty.to_string(),
                 _ => continue,
             },
+            // `tuple.idx` argument: read the element type from the
+            // receiver's `Struct(fields)` annotation.  Lets Go-style
+            // error pipelines (`call(prev.1)`) compute a stable call
+            // hash that matches the callee's branch sig.
+            Expr::TupleIndex { receiver, index } => {
+                if let Expr::Var(_, Type::Struct(fields)) = &receiver.inner {
+                    if let Some(field) = fields.get(*index) {
+                        field.inner.to_string()
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
             // Arithmetic, negation, and comparison ops produce i64.
             Expr::Add(_, _)
             | Expr::Sub(_, _)
