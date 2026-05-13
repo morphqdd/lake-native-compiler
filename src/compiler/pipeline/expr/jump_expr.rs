@@ -371,22 +371,57 @@ fn compile_fused_self_call(
             .store(MemFlags::trusted(), bid, exec_start, ExecCtxLayout::BRANCH_ID);
     }
 
-    // 5. Jump to quantum_continue with block_id = 0.
+    // 5. Tail-self loop optimization: when self() loops back to the
+    //    same branch, BRANCH_ID didn't change — we don't need
+    //    machine_switch's "load BRANCH_ID + Switch" indirect dispatch.
+    //    Store BLOCK_ID=0 (for STOP_LIMIT correctness on quantum
+    //    exhaustion), dec quantum, brif zero → fast_yield, else →
+    //    branch_entry_block.  Skips qb's 3 stop-code brifs +
+    //    machine_switch's load + indirect Switch.
     //
-    //    A "true tail-self loop" optimization (skip qb + machine_switch
-    //    and brif directly back into the body) needs a Cranelift handle
-    //    to body[0]'s block.  Branch_switch_block could in theory accept
-    //    an iconst(0) block_id and dispatch to body[0], but Cranelift's
-    //    Switch lookup doesn't fold the constant when the same block has
-    //    multiple callers with dynamic ids — so attempting that
-    //    regressed SHA-256 by ~2x.  Future work: pre-create body[0] in
-    //    branch.rs and expose it via CompilerCtx; then this jump becomes
-    //    `dec quantum; brif zero, fast_yield, body_block_0`.  For now we
-    //    take the legacy qb path but still benefit from the BRANCH_ID
-    //    store skip above.
-    let next_id = builder.ins().iconst(ptr_ty, 0);
-    let qb = ctx.quantum_block();
-    builder.ins().jump(qb, &[BlockArg::Value(next_id)]);
+    //    Concurrency preserved: each iter decrements quantum exactly
+    //    once, same as the qb path.  When quantum hits 0 we store
+    //    BLOCK_ID=0 and return STOP_LIMIT — scheduler resumes via
+    //    branch_switch[0] correctly.  No latency regression: we
+    //    yield no less frequently than before.
+    if same_branch
+        && let (Some(qv), Some(yb), Some(bb)) = (
+            ctx.quantum_var(),
+            ctx.yield_block(),
+            ctx.current_branch_entry_block(),
+        )
+    {
+        // BLOCK_ID = 0 (so re-entry after STOP_LIMIT lands at body start).
+        let zero = builder.ins().iconst(ptr_ty, 0);
+        builder.ins().store(
+            MemFlags::trusted(),
+            zero,
+            exec_start,
+            ExecCtxLayout::BLOCK_ID,
+        );
+
+        let remaining = builder.use_var(qv);
+        let new_remaining = builder.ins().iadd_imm(remaining, -1);
+        builder.def_var(qv, new_remaining);
+        let exhausted = builder
+            .ins()
+            .icmp_imm(cranelift::prelude::IntCC::Equal, new_remaining, 0);
+
+        // fast_yield expects next_id as block_param.
+        builder.ins().brif(
+            exhausted,
+            yb,
+            &[BlockArg::Value(zero)],
+            bb,
+            &[],
+        );
+    } else {
+        // Fallback: branch transition (different BRANCH_ID) or pre-Level-2
+        // build — go through the full qb dispatch chain.
+        let next_id = builder.ins().iconst(ptr_ty, 0);
+        let qb = ctx.quantum_block();
+        builder.ins().jump(qb, &[BlockArg::Value(next_id)]);
+    }
 
     branch_switch.set_entry(block_id as u128, b);
     Ok(StmtOutcome::StateChange {

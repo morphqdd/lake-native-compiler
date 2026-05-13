@@ -59,7 +59,7 @@ pub fn compile_branch(
     // id so change_state_expr can short-circuit `self(...)` calls into
     // a single-indirect-jump loop back-edge, skipping qb + machine_switch
     // dispatch.
-    ctx.set_current_branch(branch_id, branch_switch_block);
+    ctx.set_current_branch(branch_id, branch_entry_block, branch_switch_block);
 
     // ── Branch entry: read BLOCK_ID and jump to the block switch ─────────────
     builder.switch_to_block(branch_entry_block);

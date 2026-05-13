@@ -63,6 +63,12 @@ pub struct CompilerCtx {
     /// to emit a single-indirect-jump loop back-edge for `self(...)`
     /// calls with pure args, skipping the full qb → machine_switch chain.
     current_branch_switch_block: Option<Block>,
+    /// Tail-self loop — the branch_entry_block for the currently-compiling
+    /// branch.  Loads BLOCK_ID from ExecCtx and dispatches via the
+    /// per-branch Switch.  Tail-self skips machine_switch by jumping
+    /// directly here (BRANCH_ID didn't change, so we know the right
+    /// branch_entry_block to go to).
+    current_branch_entry_block: Option<Block>,
     /// Tail-self loop — the branch_id of the currently-compiling branch.
     /// change_state_expr compares the target branch_id from candidates to
     /// this to decide whether self(...) stays in the same branch
@@ -132,6 +138,7 @@ impl CompilerCtx {
             quantum_var: None,
             yield_block: None,
             current_branch_switch_block: None,
+            current_branch_entry_block: None,
             current_branch_id: None,
             next_dispatch_id: 0,
         }
@@ -254,6 +261,7 @@ impl CompilerCtx {
         self.quantum_var = None;
         self.yield_block = None;
         self.current_branch_switch_block = None;
+        self.current_branch_entry_block = None;
         self.current_branch_id = None;
     }
 
@@ -286,17 +294,28 @@ impl CompilerCtx {
         self.yield_block
     }
 
-    /// Tail-self loop — register the branch_switch_block + branch_id for
-    /// the currently-compiling branch.  Used by change_state_expr to
-    /// detect `self(...)` calls back into the same branch and emit a
-    /// short-circuit loop back-edge (skip qb + machine_switch dispatch).
-    pub fn set_current_branch(&mut self, branch_id: u128, branch_switch_block: Block) {
+    /// Tail-self loop — register the branch_id + branch_entry_block +
+    /// branch_switch_block for the currently-compiling branch.  Used
+    /// by change_state_expr to detect `self(...)` calls back into the
+    /// same branch and emit a short-circuit loop back-edge that skips
+    /// qb + machine_switch dispatch.
+    pub fn set_current_branch(
+        &mut self,
+        branch_id: u128,
+        branch_entry_block: Block,
+        branch_switch_block: Block,
+    ) {
         self.current_branch_id = Some(branch_id);
+        self.current_branch_entry_block = Some(branch_entry_block);
         self.current_branch_switch_block = Some(branch_switch_block);
     }
 
     pub fn current_branch_id(&self) -> Option<u128> {
         self.current_branch_id
+    }
+
+    pub fn current_branch_entry_block(&self) -> Option<Block> {
+        self.current_branch_entry_block
     }
 
     pub fn current_branch_switch_block(&self) -> Option<Block> {
