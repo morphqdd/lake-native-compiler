@@ -96,9 +96,12 @@ pub fn define_io_uring_setup(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         Some(FuncOrDataId::Func(id)) => id,
         _ => return Err(anyhow!("rt_syscall must be declared before rt_io_uring_setup")),
     };
-    let allocate_id = match ctx.module().get_name("rt_allocate") {
+    // Use `_raw` — io_uring's params struct is fully overwritten right
+    // after allocation, and user-facing `rt_allocate` now returns a
+    // tuple `{atom buf}` which this internal site cannot consume.
+    let allocate_id = match ctx.module().get_name("rt_allocate_raw") {
         Some(FuncOrDataId::Func(id)) => id,
-        _ => return Err(anyhow!("rt_allocate must be declared before rt_io_uring_setup")),
+        _ => return Err(anyhow!("rt_allocate_raw must be declared before rt_io_uring_setup")),
     };
     let free_id = match ctx.module().get_name("rt_free") {
         Some(FuncOrDataId::Func(id)) => id,

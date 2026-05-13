@@ -129,7 +129,7 @@ impl ShedulerCtxLayout {
         let ptr_size = builder.ins().iconst(ptr_ty, ptr_ty.bytes() as i64);
         let rt_funcs = ctx.rt_funcs().clone();
         let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
-        let allocate_ref = rt_funcs.allocate_ref(ctx.module_mut(), builder);
+        let allocate_ref = rt_funcs.allocate_raw_ref(ctx.module_mut(), builder);
 
         let (_, sh_ctx_ptr) = get_static_buffer(
             ctx,
@@ -478,7 +478,7 @@ impl ShedulerCtxLayout {
         // call rt_free on every fat-ptr regardless of who owns the process.
         // Future opt-in `@static main` will trade reclamation for zero alloc.
         let rt_funcs = ctx.rt_funcs().clone();
-        let allocate_ref = rt_funcs.allocate_ref(ctx.module_mut(), builder);
+        let allocate_ref = rt_funcs.allocate_raw_ref(ctx.module_mut(), builder);
 
         let vars_size = builder.ins().iconst(ptr_ty, (max_vars * 8) as i64);
         let call_vars = builder.ins().call(allocate_ref, &[vars_size]);

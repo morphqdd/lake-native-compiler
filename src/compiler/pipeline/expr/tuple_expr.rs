@@ -86,9 +86,13 @@ pub fn compile(
         None
     };
 
-    // Allocate the payload region (N * 8 bytes).  rt_allocate returns a
-    // fat-ptr address — load .start for element stores.
-    let alloc_ref = ctx.get_func(builder, "rt_allocate")?;
+    // Allocate the payload region (N * 8 bytes).  Use the `_raw` variant
+    // for two reasons: (a) every slot is overwritten by the element
+    // stores below, so the free-list zero-init in `rt_allocate` is
+    // wasted bandwidth; (b) since the tuple-ABI refactor `rt_allocate`
+    // returns `{atom buf}` and the codegen path needs a plain buf
+    // address.  Tuple literals never escape this allocator.
+    let alloc_ref = ctx.get_func(builder, "rt_allocate_raw")?;
     let payload_size = builder.ins().iconst(ptr_ty, (elems.len() as i64) * 8);
     let call_alloc = builder.ins().call(alloc_ref, &[payload_size]);
     let fat_ptr = builder.inst_results(call_alloc)[0];
