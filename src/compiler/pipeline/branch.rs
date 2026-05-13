@@ -61,18 +61,7 @@ pub fn compile_branch(
     // dispatch.
     ctx.set_current_branch(branch_id, branch_entry_block, branch_switch_block);
 
-    // ── Branch entry: read BLOCK_ID and jump to the block switch ─────────────
-    builder.switch_to_block(branch_entry_block);
-    // Use cached exec_start (compile_machine init'ed it) instead of re-loading.
-    let exec_start = ctx.exec_start(builder, machine_ctx_var);
-    let block_id = builder
-        .ins()
-        .load(ptr_ty, MemFlags::trusted(), exec_start, ExecCtxLayout::BLOCK_ID);
-    builder
-        .ins()
-        .jump(branch_switch_block, &[BlockArg::Value(block_id)]);
-
-    // ── Pre-allocate variable slots then compile body ─────────────────────
+    // ── Pre-allocate variable slots ───────────────────────────────────────
     let mut state = BranchState::default();
     let mut branch_switch = Switch::new();
     let mut block_id: i64 = 0;
@@ -85,6 +74,7 @@ pub fn compile_branch(
     //
     // Wildcards and literal guards still consume a slot so subsequent named
     // params line up; they just don't get a binding name.
+    let mut named_slots: Vec<usize> = Vec::new();
     for (pos, pattern) in patterns.iter().enumerate() {
         if pattern.is_wildcard() || pattern.is_literal_guard() {
             // Reserve the slot under an anonymous key so the index counter
@@ -94,8 +84,25 @@ pub fn compile_branch(
         }
         let ident_str = Clean::<Ident<'_>>::clean(pattern).to_string();
         let lake_ty = Clean::<Type<'_>>::clean(pattern).to_string();
-        state.insert_with_lake_type(ident_str, ptr_ty, lake_ty);
+        let slot = state.insert_with_lake_type(ident_str, ptr_ty, lake_ty);
+        named_slots.push(slot);
     }
+
+    // ── Branch entry: read BLOCK_ID and jump to the block switch ─────────────
+    //
+    // (Variable caching was attempted but caused phi-resolution overhead
+    // that wiped out the memory-load savings — net +9M instructions on
+    // CPU bench worker.  Cranelift's regalloc handles repeated mem loads
+    // from trusted memory well enough on its own.)
+    builder.switch_to_block(branch_entry_block);
+    let exec_start = ctx.exec_start(builder, machine_ctx_var);
+    let _ = named_slots;
+    let block_id_load = builder
+        .ins()
+        .load(ptr_ty, MemFlags::trusted(), exec_start, ExecCtxLayout::BLOCK_ID);
+    builder
+        .ins()
+        .jump(branch_switch_block, &[BlockArg::Value(block_id_load)]);
 
     // #80 Level 3 — super-block merging.
     //

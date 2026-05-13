@@ -407,7 +407,8 @@ fn compile_fused_self_call(
             .ins()
             .icmp_imm(cranelift::prelude::IntCC::Equal, new_remaining, 0);
 
-        // fast_yield expects next_id as block_param.
+        // brif → branch_entry (skips machine_switch).
+        // branch_entry reloads var-cache + dispatches via branch_switch.
         builder.ins().brif(
             exhausted,
             yb,

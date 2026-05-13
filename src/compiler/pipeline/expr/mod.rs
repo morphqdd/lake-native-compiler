@@ -73,6 +73,17 @@ pub struct BranchState {
     /// write to a disjoint range and never overwrite already-staged args.
     /// This is a compile-time constant captured into `iconst` instructions.
     pub jump_args_base: usize,
+    /// Variable cache: maps slot → Cranelift Variable holding the latest
+    /// value of that named variable.  Populated by `branch.rs` at branch
+    /// entry (loaded from VARIABLES memory) and updated by writes via
+    /// `def_var`.  Reads via `pure_expr::fold` check this cache and use
+    /// `use_var` (register-resident, no memory load) when present.
+    ///
+    /// Memory in `VARIABLES[slot*8]` is kept in sync with `def_var`
+    /// updates so STOP_LIMIT / STOP_WAIT / STOP_PARK yields don't need
+    /// an explicit spill pass — the scheduler resumes correctly via
+    /// the existing branch_entry reload.
+    cached_vars: HashMap<usize, Variable>,
 }
 
 impl BranchState {
@@ -111,6 +122,19 @@ impl BranchState {
 
     fn next_index(&self) -> usize {
         self.vars.values().map(|(_, i)| i + 1).max().unwrap_or(0)
+    }
+
+    /// Register a Cranelift Variable as the cache for `slot`.  Called by
+    /// `branch.rs` after loading initial values from VARIABLES memory at
+    /// branch_entry.  Subsequent reads through `pure_expr::fold` use this
+    /// Variable instead of re-loading from memory each time.
+    pub fn cache_slot(&mut self, slot: usize, var: Variable) {
+        self.cached_vars.insert(slot, var);
+    }
+
+    /// Look up the cached Cranelift Variable for `slot`, if any.
+    pub fn cached_var(&self, slot: usize) -> Option<Variable> {
+        self.cached_vars.get(&slot).copied()
     }
 }
 

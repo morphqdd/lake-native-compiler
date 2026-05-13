@@ -201,8 +201,17 @@ pub fn fold_with_self(
         Expr::Var(name, _) => {
             let (_, slot) = state.get(name).expect("variable not found in state");
             debug_assert!(slot < state.len(), "slot {slot} out of range {}", state.len());
-            let vs = vars_start.expect("vars_start missing for Var node");
-            builder.ins().load(ptr_ty, MemFlags::trusted(), vs, slot as i32 * 8)
+            // Variable cache: if branch.rs already loaded this slot into
+            // a Cranelift Variable at branch_entry, use_var picks it up
+            // from a register instead of re-loading from memory.  For
+            // tight self-loops (CPU bench worker reading steps/acc1/acc2
+            // each iter) this drops ~3 memory loads per iteration.
+            if let Some(var) = state.cached_var(slot) {
+                builder.use_var(var)
+            } else {
+                let vs = vars_start.expect("vars_start missing for Var node");
+                builder.ins().load(ptr_ty, MemFlags::trusted(), vs, slot as i32 * 8)
+            }
         }
         Expr::Add(l, r) => {
             let lv = fold_with_self(&l.inner, builder, ptr_ty, vars_start, self_pid, state);
