@@ -156,32 +156,35 @@ pub fn define_die_actor(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     builder.ins().return_(&[]);
 
     // ── init_exit: no actor yet — exit process cleanly with diagnostic.
+    //    Init-time failures are rare and unrecoverable; always log so
+    //    "exit 137 with no message" never happens in the wild.  The
+    //    LAKE_DEATH_LOG knob only gates the per-actor crash log, which
+    //    can be noisy on workloads that tolerate occasional death.
     builder.switch_to_block(init_exit_block);
     builder.seal_block(init_exit_block);
     let syscall_ref_exit = ctx
         .module_mut()
         .declare_func_in_func(syscall_id, &mut builder.func);
-    if want_log {
-        const MSG_INIT: &str = "lake: init failed — rt_die_actor with no scheduler\n";
-        let msg_init_id =
-            ctx.module_mut()
-                .declare_data("__lake_die_actor_init_msg", Linkage::Local, false, false)?;
-        let mut desc = DataDescription::new();
-        desc.define(MSG_INIT.as_bytes().to_vec().into_boxed_slice());
-        ctx.module_mut().define_data(msg_init_id, &desc)?;
-        let msg_gv = ctx
-            .module_mut()
-            .declare_data_in_func(msg_init_id, &mut builder.func);
-        let msg_ptr = builder.ins().global_value(ty, msg_gv);
-        let msg_len = builder.ins().iconst(ty, MSG_INIT.len() as i64);
-        let sys_write = builder.ins().iconst(ty, 1);
-        let stderr_fd = builder.ins().iconst(ty, 2);
-        let zero_arg = builder.ins().iconst(ty, 0);
-        builder.ins().call(
-            syscall_ref_exit,
-            &[sys_write, stderr_fd, msg_ptr, msg_len, zero_arg, zero_arg, zero_arg],
-        );
-    }
+    const MSG_INIT: &str =
+        "lake: init failed — rt-fn aborted before scheduler ready (likely io_uring_setup or early rt_allocate)\n";
+    let msg_init_id =
+        ctx.module_mut()
+            .declare_data("__lake_die_actor_init_msg", Linkage::Local, false, false)?;
+    let mut desc = DataDescription::new();
+    desc.define(MSG_INIT.as_bytes().to_vec().into_boxed_slice());
+    ctx.module_mut().define_data(msg_init_id, &desc)?;
+    let msg_gv = ctx
+        .module_mut()
+        .declare_data_in_func(msg_init_id, &mut builder.func);
+    let msg_ptr = builder.ins().global_value(ty, msg_gv);
+    let msg_len = builder.ins().iconst(ty, MSG_INIT.len() as i64);
+    let sys_write = builder.ins().iconst(ty, 1);
+    let stderr_fd = builder.ins().iconst(ty, 2);
+    let zero_arg = builder.ins().iconst(ty, 0);
+    builder.ins().call(
+        syscall_ref_exit,
+        &[sys_write, stderr_fd, msg_ptr, msg_len, zero_arg, zero_arg, zero_arg],
+    );
     let sys_exit = builder.ins().iconst(ty, 60);
     let code = builder.ins().iconst(ty, 137);
     let zero = builder.ins().iconst(ty, 0);

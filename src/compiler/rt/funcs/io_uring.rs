@@ -155,15 +155,108 @@ pub fn define_io_uring_setup(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     }
 
     // ── 3. io_uring_setup(RING_ENTRIES, params) ─────────────────────────────
+    //
+    // The kernel rejects io_uring_setup with -EBUSY / -ENOMEM during
+    // rapid process churn (hyperfine running hundreds of iterations
+    // per second, container churn, etc).  These are transient — the
+    // kernel reclaims its ring quota within a few ms.  Retry inline
+    // with a short nanosleep instead of trapping; only after
+    // `MAX_RETRIES` consecutive failures do we hand off to
+    // rt_die_actor's init-exit path (stderr diagnostic + exit 137).
+    //
+    // Loop layout:
+    //   try_block(remaining):
+    //     fd = syscall(io_uring_setup, RING_ENTRIES, params, 0, 0, 0, 0)
+    //     if fd >= 0 -> ok_block(fd)
+    //     else      -> retry_block(remaining)
+    //   retry_block(remaining):
+    //     if remaining == 0 -> die_block
+    //     syscall(nanosleep, &tv, 0)  // 5 ms
+    //     try_block(remaining - 1)
+    //   die_block:
+    //     rt_die_actor()
+    //     trap (unreachable)
+    //   ok_block(fd):
+    //     ... rest of setup ...
+    const MAX_RETRIES: i64 = 5;
+    const SYS_NANOSLEEP: i64 = 35;
+    const RETRY_DELAY_NS: i64 = 5_000_000; // 5 ms
+
+    // Stack-allocated timespec { tv_sec=0, tv_nsec=5_000_000 } for nanosleep.
+    let ts_slot = builder.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        16,
+        4,
+    ));
+    let ts_addr = builder.ins().stack_addr(ty, ts_slot, 0);
+    builder.ins().store(MemFlags::trusted(), zero64, ts_addr, 0);
+    let nsec_val = builder.ins().iconst(ty, RETRY_DELAY_NS);
+    builder.ins().store(MemFlags::trusted(), nsec_val, ts_addr, 8);
+
+    let try_block = builder.create_block();
+    builder.append_block_param(try_block, ty); // remaining retries
+    let retry_block = builder.create_block();
+    builder.append_block_param(retry_block, ty);
+    let die_block = builder.create_block();
+    let ok_block = builder.create_block();
+    builder.append_block_param(ok_block, ty); // fd
+
+    let max_retries = builder.ins().iconst(ty, MAX_RETRIES);
+    builder.ins().jump(try_block, &[BlockArg::Value(max_retries)]);
+
+    builder.switch_to_block(try_block);
+    let remaining = builder.block_params(try_block)[0];
     let nr = builder.ins().iconst(ty, SYS_IO_URING_SETUP);
     let entries = builder.ins().iconst(ty, RING_ENTRIES);
     let call_setup = builder.ins().call(
         syscall_ref,
         &[nr, entries, params_start, zero64, zero64, zero64, zero64],
     );
-    let fd = builder.inst_results(call_setup)[0];
-    let fd_ok = builder.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, fd, 0);
-    builder.ins().trapz(fd_ok, TrapCode::unwrap_user(40));
+    let fd_attempt = builder.inst_results(call_setup)[0];
+    let fd_ok = builder
+        .ins()
+        .icmp_imm(IntCC::SignedGreaterThanOrEqual, fd_attempt, 0);
+    builder.ins().brif(
+        fd_ok,
+        ok_block,
+        &[BlockArg::Value(fd_attempt)],
+        retry_block,
+        &[BlockArg::Value(remaining)],
+    );
+
+    builder.switch_to_block(retry_block);
+    let remaining_rb = builder.block_params(retry_block)[0];
+    let has_retries = builder.ins().icmp_imm(IntCC::SignedGreaterThan, remaining_rb, 0);
+    let do_sleep_block = builder.create_block();
+    builder
+        .ins()
+        .brif(has_retries, do_sleep_block, &[], die_block, &[]);
+
+    builder.switch_to_block(do_sleep_block);
+    builder.seal_block(do_sleep_block);
+    let nano_nr = builder.ins().iconst(ty, SYS_NANOSLEEP);
+    builder.ins().call(
+        syscall_ref,
+        &[nano_nr, ts_addr, zero64, zero64, zero64, zero64, zero64],
+    );
+    let dec = builder.ins().iadd_imm(remaining_rb, -1);
+    builder.ins().jump(try_block, &[BlockArg::Value(dec)]);
+
+    builder.switch_to_block(die_block);
+    builder.seal_block(die_block);
+    if let Some(FuncOrDataId::Func(die_id)) = ctx.module().get_name("rt_die_actor") {
+        let die_ref = ctx
+            .module_mut()
+            .declare_func_in_func(die_id, &mut builder.func);
+        builder.ins().call(die_ref, &[]);
+    }
+    builder.ins().trap(TrapCode::user(40).unwrap());
+
+    builder.seal_block(try_block);
+    builder.seal_block(retry_block);
+    builder.switch_to_block(ok_block);
+    builder.seal_block(ok_block);
+    let fd = builder.block_params(ok_block)[0];
 
     // ── 4. Read sizes + offsets from params ──────────────────────────────────
     let load_u32 = |b: &mut FunctionBuilder, off: i32| -> cranelift::prelude::Value {
