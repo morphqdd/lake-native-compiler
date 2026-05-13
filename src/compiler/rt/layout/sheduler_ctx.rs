@@ -530,6 +530,8 @@ impl ShedulerCtxLayout {
         );
         ExecCtxLayout::store(builder, zero, main_ctx_ptr, ExecCtxLayout::MAILBOX_HEAD);
         ExecCtxLayout::store(builder, zero, main_ctx_ptr, ExecCtxLayout::MAILBOX_TAIL);
+        // Death flag — see ExecCtxLayout::IS_DYING.
+        ExecCtxLayout::store(builder, zero, main_ctx_ptr, ExecCtxLayout::IS_DYING);
 
         let process_ctx = ProcessCtxLayout::init_ctx(ctx, builder, "main", main_ctx_fat_ptr)?;
 

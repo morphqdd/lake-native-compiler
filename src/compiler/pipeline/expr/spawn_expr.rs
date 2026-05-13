@@ -151,6 +151,9 @@ pub fn compile_spawn(
     );
     ExecCtxLayout::store(builder, zero, exec_ctx_ptr, ExecCtxLayout::MAILBOX_HEAD);
     ExecCtxLayout::store(builder, zero, exec_ctx_ptr, ExecCtxLayout::MAILBOX_TAIL);
+    // IS_DYING starts at 0; rt-fns flip it to 1 to signal a crash that
+    // machine.rs::quantum_loop_block will translate into STOP_DONE.
+    ExecCtxLayout::store(builder, zero, exec_ctx_ptr, ExecCtxLayout::IS_DYING);
 
     let proc_ctx_fat_ptr =
         ProcessCtxLayout::init_ctx(ctx, builder, machine_name, exec_ctx_fat_ptr)?;

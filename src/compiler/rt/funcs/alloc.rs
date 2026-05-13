@@ -1,14 +1,20 @@
 use anyhow::{Result, anyhow};
 use cranelift::{
     codegen::ir::BlockArg,
-    module::{FuncOrDataId, Linkage, Module},
+    module::{DataDescription, FuncOrDataId, Linkage, Module},
     prelude::{
         AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder, IntCC, MemFlags, TrapCode,
         Type,
     },
 };
 
-use crate::compiler::{ctx::CompilerCtx, rt::layout::FatPtrLayout};
+use crate::compiler::{
+    ctx::CompilerCtx,
+    rt::layout::{
+        ExecCtxLayout, FatPtrLayout, process_ctx::ProcessCtxLayout,
+        sheduler_ctx::ShedulerCtxLayout,
+    },
+};
 
 /// Build `rt_allocate(size: i64) -> i64`.
 ///
@@ -251,13 +257,133 @@ fn define_allocate_impl(
 
     let end_addr = builder.ins().iadd(aligned_user_ptr, alloc_size);
 
-    // Bounds check: trap if we'd exceed the heap.
+    // Bounds check — heap exhausted is recoverable: instead of trapping
+    // the whole program we mark the current actor as :dying so the next
+    // quantum tick (machine.rs::quantum_loop_block) returns STOP_DONE and
+    // the scheduler unlinks just that actor.  We still need to return a
+    // value from this function — the caller expects a fat-ptr.  We hand
+    // back a null fat-ptr (0); the dying actor has at most one CPS block
+    // worth of execution before quantum_loop_block kills it.  If that
+    // block touches the null pointer the program dies — accepted trade-
+    // off for the MVP; a proper safe sentinel buffer is #87 follow-up.
     let in_bounds = builder
         .ins()
         .icmp(IntCC::UnsignedLessThanOrEqual, end_addr, heap_end_addr);
+    let oom_block = builder.create_block();
+    let cont_block = builder.create_block();
     builder
         .ins()
-        .trapz(in_bounds, TrapCode::HEAP_OUT_OF_BOUNDS);
+        .brif(in_bounds, cont_block, &[], oom_block, &[]);
+
+    // ── oom_block: mark current actor :dying, optionally log, return null ──
+    builder.switch_to_block(oom_block);
+    builder.seal_block(oom_block);
+
+    // Locate the current actor's exec_ctx via the scheduler global:
+    //   sched_ctx_fat_ptr → sched_ctx → process_arr[CURRENT_PROCESS] →
+    //   proc_ctx → EXEC_CTX → exec_ctx.IS_DYING ← 1
+    let sched_data_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
+        Some(FuncOrDataId::Data(id)) => id,
+        _ => return Err(anyhow!("sheduler_ctx_fat_ptr global not found for OOM die path")),
+    };
+    let sched_gv = ctx
+        .module_mut()
+        .declare_data_in_func(sched_data_id, &mut builder.func);
+    let sched_fat_addr = builder.ins().global_value(ty, sched_gv);
+    let sched_ptr = builder
+        .ins()
+        .load(ty, MemFlags::trusted(), sched_fat_addr, 0);
+    let proc_arr_fat = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sched_ptr,
+        ShedulerCtxLayout::PROCESS_ARR_FAT,
+    );
+    let proc_arr_start = builder
+        .ins()
+        .load(ty, MemFlags::trusted(), proc_arr_fat, 0);
+    let current_idx = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sched_ptr,
+        ShedulerCtxLayout::CURRENT_PROCESS,
+    );
+    let idx_scaled = builder.ins().imul_imm(current_idx, 8);
+    let slot_addr = builder.ins().iadd(proc_arr_start, idx_scaled);
+    let proc_ctx_fat = builder.ins().load(ty, MemFlags::trusted(), slot_addr, 0);
+    let proc_ctx_ptr = builder
+        .ins()
+        .load(ty, MemFlags::trusted(), proc_ctx_fat, 0);
+    let exec_ctx_fat = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        proc_ctx_ptr,
+        ProcessCtxLayout::EXEC_CTX,
+    );
+    let exec_ctx_ptr = builder
+        .ins()
+        .load(ty, MemFlags::trusted(), exec_ctx_fat, 0);
+    let one_dying = builder.ins().iconst(ty, 1);
+    builder.ins().store(
+        MemFlags::trusted(),
+        one_dying,
+        exec_ctx_ptr,
+        ExecCtxLayout::IS_DYING,
+    );
+
+    // Optional crash log to stderr — gated at lakec invocation by
+    // LAKE_DEATH_LOG=1.  Cost: ~6 instructions on the cold OOM path
+    // when enabled, zero when disabled.  Reading the env at compile
+    // time keeps the produced binary free of any extra branches.
+    let want_log = std::env::var("LAKE_DEATH_LOG")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    if want_log {
+        let syscall_id = match ctx.module().get_name("rt_syscall") {
+            Some(FuncOrDataId::Func(id)) => id,
+            _ => {
+                return Err(anyhow!(
+                    "rt_syscall must be declared before LAKE_DEATH_LOG-instrumented rt_allocate"
+                ));
+            }
+        };
+        let syscall_ref = ctx
+            .module_mut()
+            .declare_func_in_func(syscall_id, &mut builder.func);
+        // Embed the message as a local data symbol.  Name is suffixed by
+        // `func_name` so rt_allocate and rt_allocate_raw get distinct
+        // symbols (declare_data rejects duplicates).
+        const MSG: &str = "lake: actor died — rt_allocate: heap exhausted\n";
+        let msg_sym = format!("__lake_oom_msg_{func_name}");
+        let msg_data_id =
+            ctx.module_mut()
+                .declare_data(&msg_sym, Linkage::Local, false, false)?;
+        let mut msg_desc = DataDescription::new();
+        msg_desc.define(MSG.as_bytes().to_vec().into_boxed_slice());
+        ctx.module_mut().define_data(msg_data_id, &msg_desc)?;
+        let msg_gv = ctx
+            .module_mut()
+            .declare_data_in_func(msg_data_id, &mut builder.func);
+        let msg_ptr = builder.ins().global_value(ty, msg_gv);
+        let msg_len = builder.ins().iconst(ty, MSG.len() as i64);
+        let sys_write = builder.ins().iconst(ty, 1); // Linux x86-64 SYS_WRITE
+        let stderr_fd = builder.ins().iconst(ty, 2);
+        let zero_arg = builder.ins().iconst(ty, 0);
+        builder.ins().call(
+            syscall_ref,
+            &[sys_write, stderr_fd, msg_ptr, msg_len, zero_arg, zero_arg, zero_arg],
+        );
+    }
+
+    // Return null fat-ptr.  Caller's next quantum boundary observes
+    // IS_DYING and bails to STOP_DONE.
+    let null = builder.ins().iconst(ty, 0);
+    builder.ins().return_(&[null]);
+
+    builder.switch_to_block(cont_block);
+    builder.seal_block(cont_block);
+    // Suppress unused-import warning when no other site references TrapCode.
+    let _ = TrapCode::HEAP_OUT_OF_BOUNDS;
 
     // Write the fat-pointer header at heap_curr_addr.
     builder

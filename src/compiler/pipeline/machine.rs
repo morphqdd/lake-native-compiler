@@ -178,6 +178,28 @@ pub fn compile_machine(ctx: &mut CompilerCtx, machine: &Machine<'_>, quantum: i6
         ExecCtxLayout::BLOCK_ID,
     );
 
+    // Death check: an rt-* call (rt_allocate on OOM, …) inside the just-
+    // executed block may have flipped IS_DYING.  When that happens we
+    // bail to STOP_DONE so the scheduler removes the actor instead of
+    // running another quantum tick with a corrupted state.
+    let is_dying = builder.ins().load(
+        ptr_ty,
+        MemFlags::trusted(),
+        exec_start,
+        ExecCtxLayout::IS_DYING,
+    );
+    let dying_cond = builder.ins().icmp_imm(IntCC::NotEqual, is_dying, 0);
+    let alive_block = builder.create_block();
+    builder.ins().brif(
+        dying_cond,
+        quantum_stop_done_block,
+        &[],
+        alive_block,
+        &[],
+    );
+
+    builder.switch_to_block(alive_block);
+
     let remaining = builder.use_var(quantum_var);
     let new_remaining = builder.ins().iadd_imm(remaining, -1);
     builder.def_var(quantum_var, new_remaining);
