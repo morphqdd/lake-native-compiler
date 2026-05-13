@@ -339,12 +339,15 @@ fn compile_fused_self_call(
         builder.ins().store(MemFlags::trusted(), *val, vars_start, i as i32 * 8);
     }
 
-    // 4. Set BRANCH_ID — with guard dispatch if multiple branches share this hash
-    let branch_id_val = if candidates.len() > 1 {
+    // 4. Set BRANCH_ID — with guard dispatch if multiple branches share this hash.
+    //    Skip the store when we KNOW we're staying in the same branch
+    //    (single-candidate self-loop to current branch).
+    let single_candidate = candidates.len() == 1;
+    let same_branch = single_candidate
+        && Some(candidates[0].branch_id) == ctx.current_branch_id();
+
+    let branch_id_val = if !single_candidate {
         let disc_pos = dispatch::find_first_guard_pos(&candidates);
-        // Discriminant is the already-computed arg value at disc_pos.
-        // We read it back from VARIABLES (which we just wrote) — safe because
-        // writes happened before this load in program order.
         let disc = builder.ins().load(
             ptr_ty,
             MemFlags::trusted(),
@@ -352,15 +355,35 @@ fn compile_fused_self_call(
             disc_pos as i32 * 8,
         );
         let namespace = ctx.next_dispatch_id();
-        dispatch::emit_guard_select(ctx, builder, ptr_ty, &candidates, disc, namespace)?
+        Some(dispatch::emit_guard_select(
+            ctx, builder, ptr_ty, &candidates, disc, namespace,
+        )?)
+    } else if !same_branch {
+        Some(builder.ins().iconst(ptr_ty, candidates[0].branch_id as i64))
     } else {
-        builder.ins().iconst(ptr_ty, candidates[0].branch_id as i64)
+        // BRANCH_ID unchanged — skip the store.
+        None
     };
 
-    // exec_start was computed in block b; b_merge is dominated by b, so this is valid.
-    builder.ins().store(MemFlags::trusted(), branch_id_val, exec_start, ExecCtxLayout::BRANCH_ID);
+    if let Some(bid) = branch_id_val {
+        builder
+            .ins()
+            .store(MemFlags::trusted(), bid, exec_start, ExecCtxLayout::BRANCH_ID);
+    }
 
-    // 5. Jump to quantum_continue with block_id = 0
+    // 5. Jump to quantum_continue with block_id = 0.
+    //
+    //    A "true tail-self loop" optimization (skip qb + machine_switch
+    //    and brif directly back into the body) needs a Cranelift handle
+    //    to body[0]'s block.  Branch_switch_block could in theory accept
+    //    an iconst(0) block_id and dispatch to body[0], but Cranelift's
+    //    Switch lookup doesn't fold the constant when the same block has
+    //    multiple callers with dynamic ids — so attempting that
+    //    regressed SHA-256 by ~2x.  Future work: pre-create body[0] in
+    //    branch.rs and expose it via CompilerCtx; then this jump becomes
+    //    `dec quantum; brif zero, fast_yield, body_block_0`.  For now we
+    //    take the legacy qb path but still benefit from the BRANCH_ID
+    //    store skip above.
     let next_id = builder.ins().iconst(ptr_ty, 0);
     let qb = ctx.quantum_block();
     builder.ins().jump(qb, &[BlockArg::Value(next_id)]);

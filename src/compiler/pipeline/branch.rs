@@ -13,7 +13,7 @@ use log::debug;
 
 use crate::compiler::{
     ctx::CompilerCtx,
-    pipeline::expr::{BranchState, StmtOutcome, compile_expr, is_fast_chain_pair},
+    pipeline::expr::{BranchState, StmtOutcome, accepts_entry_pub, compile_expr},
     rt::layout::ExecCtxLayout,
 };
 
@@ -55,6 +55,12 @@ pub fn compile_branch(
 
     machine_switch.set_entry(branch_id, branch_entry_block);
 
+    // Tail-self loop optimization: expose this branch's switch block +
+    // id so change_state_expr can short-circuit `self(...)` calls into
+    // a single-indirect-jump loop back-edge, skipping qb + machine_switch
+    // dispatch.
+    ctx.set_current_branch(branch_id, branch_switch_block);
+
     // ── Branch entry: read BLOCK_ID and jump to the block switch ─────────────
     builder.switch_to_block(branch_entry_block);
     // Use cached exec_start (compile_machine init'ed it) instead of re-loading.
@@ -91,31 +97,49 @@ pub fn compile_branch(
         state.insert_with_lake_type(ident_str, ptr_ty, lake_ty);
     }
 
-    // #80 Level 2 — fast-path chaining.
+    // #80 Level 3 — super-block merging.
     //
-    // For each pair of adjacent statements where BOTH are fast-path
-    // eligible (pure_expr or `let x = <pure>`), allocate a Cranelift
-    // entry block for the successor and pass it as `fall_through` to
-    // the current statement.  The fast handler emits
-    // `dec quantum; brif zero, fast_yield[next], fall_through` in place
-    // of `jump quantum_block(next)`, eliminating the machine_switch +
-    // branch_switch indirect Switches on the hot path.
+    // Consecutive statements that all accept_entry (pure_expr or
+    // `let x = <pure>`) are merged into ONE Cranelift basic block.
+    // Inside the super-block:
+    //   - No per-statement create_block / brif terminator;
+    //   - All vars_start / exec_start loads shared via Cranelift GVN;
+    //   - Cranelift instruction scheduling + regalloc operate over the
+    //     full sequence as one unit.
     //
-    // Non-fast-path statements stay on the legacy qb route — they're
-    // reached through branch_switch dispatch as normal.
-    let mut current_entry: Option<cranelift::codegen::ir::Block> = None;
+    // The super-block ends with a single `emit_continue` (inline
+    // quantum check + brif to next stmt's qb path).  Re-entry semantics
+    // are preserved by registering set_entry(stmt_id, super_b) for
+    // every statement in the run — re-entering at any of those ids
+    // re-runs the whole super-block from `b`, idempotent because all
+    // super-block-eligible statements are pure.
+    //
+    // Statements that don't accept entry (when, wait, jump, spawn,
+    // self, non-pure let) end the super-block and emit normally.
+    let mut super_b: Option<cranelift::codegen::ir::Block> = None;
     for (i, expr) in branch.body.iter().enumerate() {
-        let chain_to_next = branch
+        let this_fast = accepts_entry_pub(&expr.inner);
+        let next_fast = branch
             .body
             .get(i + 1)
-            .map(|next| is_fast_chain_pair(&expr.inner, &next.inner))
+            .map(|e| accepts_entry_pub(&e.inner))
             .unwrap_or(false);
 
-        let fall_through = if chain_to_next {
-            Some(builder.create_block())
+        let entry = if this_fast {
+            if let Some(b) = super_b {
+                Some(b)
+            } else if next_fast {
+                let b = builder.create_block();
+                super_b = Some(b);
+                Some(b)
+            } else {
+                None
+            }
         } else {
             None
         };
+
+        let omit_exit = this_fast && next_fast;
 
         let outcome = compile_expr(
             ctx,
@@ -125,8 +149,9 @@ pub fn compile_branch(
             &mut branch_switch,
             &mut state,
             &expr,
-            current_entry,
-            fall_through,
+            entry,
+            None,
+            omit_exit,
         )?;
 
         match outcome {
@@ -137,7 +162,9 @@ pub fn compile_branch(
             }
         }
 
-        current_entry = fall_through;
+        if !omit_exit {
+            super_b = None;
+        }
     }
 
     // ── Emit the per-branch block switch ──────────────────────────────────────
