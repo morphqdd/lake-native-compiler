@@ -275,13 +275,17 @@ fn define_allocate_impl(
         .ins()
         .brif(in_bounds, cont_block, &[], oom_block, &[]);
 
-    // ── oom_block: mark current actor :dying, optionally log, return null ──
+    // ── oom_block: try to mark the current actor :dying.  Falls back to
+    //    process-exit when there's no actor yet — true for the very early
+    //    allocations during scheduler bootstrap (ShedulerCtxLayout::init,
+    //    init_main_process) that run before `sheduler_ctx_fat_ptr` is
+    //    populated or before any process is registered.
     builder.switch_to_block(oom_block);
     builder.seal_block(oom_block);
 
-    // Locate the current actor's exec_ctx via the scheduler global:
-    //   sched_ctx_fat_ptr → sched_ctx → process_arr[CURRENT_PROCESS] →
-    //   proc_ctx → EXEC_CTX → exec_ctx.IS_DYING ← 1
+    // Resolve the scheduler context's address.  When the global value
+    // (= the fat-ptr stored in the static) is still zero we're inside
+    // very early init; take the process-exit branch.
     let sched_data_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
         Some(FuncOrDataId::Data(id)) => id,
         _ => return Err(anyhow!("sheduler_ctx_fat_ptr global not found for OOM die path")),
@@ -289,10 +293,43 @@ fn define_allocate_impl(
     let sched_gv = ctx
         .module_mut()
         .declare_data_in_func(sched_data_id, &mut builder.func);
+    // The global slot holds a 16-byte fat-ptr `{ start, end }`; `start`
+    // is the address of the sched_ctx struct itself, which is the
+    // `sched_ptr` we need.  No extra deref — the first 8 bytes already
+    // carry the struct address (or 0 when the slot hasn't been written
+    // yet, which is what we test against here).
     let sched_fat_addr = builder.ins().global_value(ty, sched_gv);
     let sched_ptr = builder
         .ins()
         .load(ty, MemFlags::trusted(), sched_fat_addr, 0);
+    let check_count_block = builder.create_block();
+    let init_exit_block = builder.create_block();
+    let mark_actor_block = builder.create_block();
+    let sched_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, sched_ptr, 0);
+    builder
+        .ins()
+        .brif(sched_nonzero, check_count_block, &[], init_exit_block, &[]);
+
+    // ── check_count_block: scheduler ctx exists; do we have at least
+    //    one actor registered?  If not the failing allocation is part of
+    //    init_main_process — fall through to process-exit.
+    builder.switch_to_block(check_count_block);
+    builder.seal_block(check_count_block);
+    let real_count = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sched_ptr,
+        ShedulerCtxLayout::REAL_COUNT_OF_PROCESSES,
+    );
+    let count_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, real_count, 0);
+    builder
+        .ins()
+        .brif(count_nonzero, mark_actor_block, &[], init_exit_block, &[]);
+
+    // ── mark_actor_block: standard actor-time path.  Find the running
+    //    actor's exec_ctx, set IS_DYING, optionally log, return null.
+    builder.switch_to_block(mark_actor_block);
+    builder.seal_block(mark_actor_block);
     let proc_arr_fat = builder.ins().load(
         ty,
         MemFlags::trusted(),
@@ -332,13 +369,13 @@ fn define_allocate_impl(
     );
 
     // Optional crash log to stderr — gated at lakec invocation by
-    // LAKE_DEATH_LOG=1.  Cost: ~6 instructions on the cold OOM path
-    // when enabled, zero when disabled.  Reading the env at compile
-    // time keeps the produced binary free of any extra branches.
+    // LAKE_DEATH_LOG=1.  Reading the env at compile time keeps the
+    // produced binary free of any extra branches when disabled.
     let want_log = std::env::var("LAKE_DEATH_LOG")
         .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
-    if want_log {
+
+    let syscall_ref_for_log = if want_log {
         let syscall_id = match ctx.module().get_name("rt_syscall") {
             Some(FuncOrDataId::Func(id)) => id,
             _ => {
@@ -347,25 +384,39 @@ fn define_allocate_impl(
                 ));
             }
         };
-        let syscall_ref = ctx
-            .module_mut()
-            .declare_func_in_func(syscall_id, &mut builder.func);
-        // Embed the message as a local data symbol.  Name is suffixed by
-        // `func_name` so rt_allocate and rt_allocate_raw get distinct
-        // symbols (declare_data rejects duplicates).
-        const MSG: &str = "lake: actor died — rt_allocate: heap exhausted\n";
-        let msg_sym = format!("__lake_oom_msg_{func_name}");
+        Some(
+            ctx.module_mut()
+                .declare_func_in_func(syscall_id, &mut builder.func),
+        )
+    } else {
+        None
+    };
+
+    // Helper closure: declare a unique `Local` data symbol holding `msg`
+    // bytes and emit a write(2, …) syscall via the captured syscall ref.
+    // Symbol name is suffixed by `func_name` + `tag` to keep
+    // rt_allocate / rt_allocate_raw / actor / init messages distinct
+    // (declare_data rejects duplicates within a module).
+    let mut emit_log = |builder: &mut FunctionBuilder,
+                        ctx: &mut CompilerCtx,
+                        tag: &str,
+                        msg: &str|
+     -> Result<()> {
+        let Some(syscall_ref) = syscall_ref_for_log else {
+            return Ok(());
+        };
+        let sym = format!("__lake_die_msg_{func_name}_{tag}");
         let msg_data_id =
             ctx.module_mut()
-                .declare_data(&msg_sym, Linkage::Local, false, false)?;
+                .declare_data(&sym, Linkage::Local, false, false)?;
         let mut msg_desc = DataDescription::new();
-        msg_desc.define(MSG.as_bytes().to_vec().into_boxed_slice());
+        msg_desc.define(msg.as_bytes().to_vec().into_boxed_slice());
         ctx.module_mut().define_data(msg_data_id, &msg_desc)?;
         let msg_gv = ctx
             .module_mut()
             .declare_data_in_func(msg_data_id, &mut builder.func);
         let msg_ptr = builder.ins().global_value(ty, msg_gv);
-        let msg_len = builder.ins().iconst(ty, MSG.len() as i64);
+        let msg_len = builder.ins().iconst(ty, msg.len() as i64);
         let sys_write = builder.ins().iconst(ty, 1); // Linux x86-64 SYS_WRITE
         let stderr_fd = builder.ins().iconst(ty, 2);
         let zero_arg = builder.ins().iconst(ty, 0);
@@ -373,12 +424,47 @@ fn define_allocate_impl(
             syscall_ref,
             &[sys_write, stderr_fd, msg_ptr, msg_len, zero_arg, zero_arg, zero_arg],
         );
-    }
+        Ok(())
+    };
+
+    emit_log(
+        &mut builder,
+        &mut ctx,
+        "actor",
+        "lake: actor died — rt_allocate: heap exhausted\n",
+    )?;
 
     // Return null fat-ptr.  Caller's next quantum boundary observes
     // IS_DYING and bails to STOP_DONE.
     let null = builder.ins().iconst(ty, 0);
     builder.ins().return_(&[null]);
+
+    // ── init_exit_block: no actor to mark; this is a fatal init-time
+    //    allocation failure.  Best we can do is log + exit cleanly
+    //    instead of trapping with SIGILL.
+    builder.switch_to_block(init_exit_block);
+    builder.seal_block(init_exit_block);
+    let syscall_id_for_exit = match ctx.module().get_name("rt_syscall") {
+        Some(FuncOrDataId::Func(id)) => id,
+        _ => return Err(anyhow!("rt_syscall must be declared before rt_allocate init-exit path")),
+    };
+    let syscall_ref_for_exit = ctx
+        .module_mut()
+        .declare_func_in_func(syscall_id_for_exit, &mut builder.func);
+    emit_log(
+        &mut builder,
+        &mut ctx,
+        "init",
+        "lake: init failed — rt_allocate exhausted before scheduler ready\n",
+    )?;
+    let sys_exit = builder.ins().iconst(ty, 60); // Linux x86-64 SYS_EXIT
+    let code = builder.ins().iconst(ty, 137); // 128 + SIGKILL convention
+    let zero_arg2 = builder.ins().iconst(ty, 0);
+    builder.ins().call(
+        syscall_ref_for_exit,
+        &[sys_exit, code, zero_arg2, zero_arg2, zero_arg2, zero_arg2, zero_arg2],
+    );
+    builder.ins().trap(TrapCode::user(0xDE).unwrap());
 
     builder.switch_to_block(cont_block);
     builder.seal_block(cont_block);
