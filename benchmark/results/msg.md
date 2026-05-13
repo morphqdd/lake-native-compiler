@@ -1,6 +1,6 @@
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `lake (cooperative, mailbox)` | 23.4 ± 0.8 | 22.2 | 26.8 | 7.52 ± 1.18 |
-| `c++ (coroutines, manual scheduler)` | 3.1 ± 0.5 | 2.2 | 4.7 | 1.00 |
-| `rust (tokio mpsc)` | 26.6 ± 1.0 | 25.4 | 30.6 | 8.55 ± 1.35 |
-| `go (goroutines, channels, GOMAXPROCS=1)` | 39.7 ± 0.7 | 38.4 | 41.4 | 12.78 ± 1.97 |
+| `lake (cooperative, mailbox)` | 20.3 ± 1.6 | 18.7 | 26.9 | 7.08 ± 1.24 |
+| `c++ (coroutines, manual scheduler)` | 2.9 ± 0.4 | 2.2 | 4.3 | 1.00 |
+| `rust (tokio mpsc)` | 27.0 ± 1.5 | 25.4 | 32.4 | 9.41 ± 1.55 |
+| `go (goroutines, channels, GOMAXPROCS=1)` | 40.0 ± 1.8 | 37.6 | 46.5 | 13.94 ± 2.26 |

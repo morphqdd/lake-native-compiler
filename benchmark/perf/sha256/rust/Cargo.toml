@@ -1,0 +1,15 @@
+[package]
+name = "sha256_bench"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sha256_bench"
+path = "src/main.rs"
+
+[dependencies]
+sha2 = "0.10"
+
+[profile.release]
+lto = true
+codegen-units = 1
