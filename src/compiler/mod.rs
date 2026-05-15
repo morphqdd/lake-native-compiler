@@ -251,12 +251,16 @@ fn count_expr_slots(expr: &Expr<'_>) -> usize {
                 .unwrap_or(0)
         }
         Expr::When { branches, cond } => {
+            // #103: backend allocates slots sequentially across arms
+            // rather than reusing the slot range per arm.  Until that
+            // changes, size the buffer for the sum of arms so no arm
+            // overruns it.  Conservative — over-allocates when many
+            // arms have wait/let bindings — but safe.
             count_expr_slots(&cond.inner)
                 + branches
                     .iter()
                     .map(|(_, body)| body.iter().map(|e| count_expr_slots(&e.inner)).sum::<usize>())
-                    .max()
-                    .unwrap_or(0)
+                    .sum::<usize>()
         }
         Expr::Wait { handlers, filter } => {
             let filter_slots: usize =

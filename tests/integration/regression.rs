@@ -150,3 +150,129 @@ fn sequential_ret_self_loop_actors_each_run_once() {
     assert!(s.contains('['), "missing `[` separator: {s:?}");
     assert!(s.contains(']'), "missing `]` separator: {s:?}");
 }
+
+/// #103: count_branch_vars sized the VARIABLES buffer with
+/// `max(arm slot counts)` across when-arms, but the backend allocates
+/// slots sequentially through both arms.  When the dead arm holds 2+
+/// sequential ret-calls (each adds pid_let + sender + value slots
+/// through Phase 2 lowering) and the live arm holds another ret-call,
+/// the live arm's slot indices overran the buffer.  The overrun
+/// stomped on adjacent scheduler memory; downstream the caller saw a
+/// stale i64 in place of its expected buf and SIGSEGVed when
+/// dereferencing it.
+///
+/// Surface symptom in lake-house: `house build` printed an empty
+/// entry path then crashed.  Required cross-module + when with a
+/// dead-arm holding 2+ ret-calls.
+///
+/// Fixed by treating when-arm slot counts as a sum, since arms are
+/// emitted with non-overlapping slot indices.
+#[test]
+fn issue_103_when_dead_arm_slot_overrun() {
+    // Self-loop scan_entry returns a positive value, so the false arm
+    // runs (alloc + copy + trim).  The true arm holds 2 println calls
+    // — dead at runtime but exercising the slot-overrun path.
+    let src = r#"
+        +std.io.{ println print_buf print }
+        +std.bytes.{ size at trim }
+        +std.process.{ alloc_or_die }
+        @rt(rt_store rt_copy_bytes)
+
+        const MAX_MANIFEST = 4096
+
+        scan_entry is {
+          flen i64 i i64 -> ret i64 {
+            when i >= flen {
+              true  -> { ret 7 * MAX_MANIFEST + 3 }
+              false -> { self(flen i + 1) }
+            }
+          }
+        }
+
+        parse_entry is {
+          file buf flen i64 -> ret buf {
+            let packed = scan_entry(flen 0)
+            when packed < 0 {
+              true -> {
+                println("a")
+                println("b")
+                ret file
+              }
+              false -> {
+                let q = packed / MAX_MANIFEST
+                let n = packed - q * MAX_MANIFEST
+                let out = alloc_or_die(n)
+                rt_copy_bytes(out 0 file q n)
+                let _t = trim(out n)
+                ret out
+              }
+            }
+          }
+        }
+
+        build_input is {
+          _pad i64 -> ret buf {
+            let f = alloc_or_die(11)
+            rt_store(f 101 1 0) rt_store(f 110 1 1) rt_store(f 116 1 2)
+            rt_store(f 114 1 3) rt_store(f 121 1 4) rt_store(f 32 1 5)
+            rt_store(f 34 1 6)  rt_store(f 97 1 7)  rt_store(f 98 1 8)
+            rt_store(f 99 1 9)  rt_store(f 34 1 10)
+            let _t = trim(f 11)
+            ret f
+          }
+        }
+
+        main is {
+          _ -> {
+            let m = build_input(0)
+            let entry = parse_entry(m size(m))
+            let es = size(entry)
+            when es {
+              3 -> { print("OK: ") print_buf(entry) println("") }
+              _ -> { println("BAD") }
+            }
+          }
+        }
+    "#;
+    let out = run(src).unwrap();
+    assert_eq!(out.exit_code, 0, "stderr: {:?}", out.stderr);
+    assert!(
+        out.stdout_str().contains("OK: abc"),
+        "expected `OK: abc`, got: {:?}",
+        out.stdout_str()
+    );
+}
+
+/// #103 corollary: dead-arm with many sequential ret-calls must not
+/// shift the slot indices used by the live arm, even when there are
+/// no nested ret-calls.  This is the same root cause as the previous
+/// test but with a flat (no inner-when) live arm — pins the slot
+/// math without dependence on the wait-handler descent in Phase 4.
+#[test]
+fn issue_103_when_dead_arm_three_sequential_ret_calls() {
+    let src = r#"
+        +std.io.{ println }
+        @rt(rt_exit)
+
+        main is {
+          _ -> {
+            when 1 < 0 {
+              true -> {
+                println("never_a")
+                println("never_b")
+                println("never_c")
+              }
+              false -> {
+                println("live")
+              }
+            }
+            rt_exit(0)
+          }
+        }
+    "#;
+    let out = run(src).unwrap();
+    assert_eq!(out.exit_code, 0, "stderr: {:?}", out.stderr);
+    let s = out.stdout_str();
+    assert!(s.contains("live"), "live arm did not run: {s:?}");
+    assert!(!s.contains("never_"), "dead arm leaked output: {s:?}");
+}
