@@ -88,11 +88,13 @@ pub fn compile<SP: AsRef<Path>>(
         for item in &module.ast {
             match &item.inner {
                 Item::Directive(directive) if directive.name.as_str() == "rt" => {
-                    let Type::Named(func_name) = &directive.args[0].inner else {
-                        bail!("@rt expects a named type, found: {:?}", directive.args[0]);
-                    };
-                    debug!("index: @rt '{}'", func_name.0);
-                    ctx.declare_rt_func_in_prog(func_name.0);
+                    for arg in &directive.args {
+                        let Type::Named(func_name) = &arg.inner else {
+                            bail!("@rt expects a named type, found: {:?}", arg);
+                        };
+                        debug!("index: @rt '{}'", func_name.0);
+                        ctx.declare_rt_func_in_prog(func_name.0);
+                    }
                 }
                 Item::Machine(machine) => {
                     let name = machine.inner.ident.to_string();
