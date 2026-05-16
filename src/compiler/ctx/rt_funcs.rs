@@ -20,6 +20,7 @@ pub struct RtFuncs {
     pub allocate: FuncId,
     pub allocate_raw: FuncId,
     pub free: FuncId,
+    pub scratch_buf: FuncId,
 }
 
 impl RtFuncs {
@@ -36,6 +37,7 @@ impl RtFuncs {
             allocate: resolve_func(module, "rt_allocate")?,
             allocate_raw: resolve_func(module, "rt_allocate_raw")?,
             free: resolve_func(module, "rt_free")?,
+            scratch_buf: resolve_func(module, "rt_scratch_buf")?,
         })
     }
 
@@ -88,6 +90,15 @@ impl RtFuncs {
 
     pub fn free_ref(&self, module: &mut ObjectModule, builder: &mut FunctionBuilder) -> FuncRef {
         module.declare_func_in_func(self.free, builder.func)
+    }
+
+    /// Per-actor scratch buffer pool — see feature #082.
+    pub fn scratch_buf_ref(
+        &self,
+        module: &mut ObjectModule,
+        builder: &mut FunctionBuilder,
+    ) -> FuncRef {
+        module.declare_func_in_func(self.scratch_buf, builder.func)
     }
 }
 
