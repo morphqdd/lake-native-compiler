@@ -57,6 +57,13 @@ struct Cli {
     /// Linker to use
     #[arg(long, default_value = "mold")]
     linker: String,
+
+    /// Output directory for the built binary + intermediate
+    /// objects.  Defaults to `<source-dir>/build/`.  The binary's
+    /// filename is always the source file's stem (e.g.
+    /// `src/main.lake` → `<out>/main`).
+    #[arg(short = 'o', long = "out")]
+    out_dir: Option<String>,
 }
 
 /// Run `work` while showing an animated progress bar.
@@ -128,7 +135,10 @@ fn main() -> Result<()> {
         .and_then(|s| s.to_str())
         .ok_or_else(|| anyhow::anyhow!("Invalid source path: {}", src_path.display()))?
         .to_string();
-    let build_dir = src_path.parent().unwrap_or(Path::new(".")).join("build");
+    let build_dir = match &cli.out_dir {
+        Some(p) => Path::new(p).to_path_buf(),
+        None => src_path.parent().unwrap_or(Path::new(".")).join("build"),
+    };
 
     println!(
         "\n  {} {} [{}]",
