@@ -109,15 +109,36 @@ pub fn compile<'a>(
         }
 
         let next_available = branch_outcome.next_available();
+        // Redirect from the arm's exit slot back to `after_when_id`.
+        // Both `Continue` and `Wait` outcomes resume execution at
+        // `next_available` — Continue immediately, Wait once the
+        // reply lands — so both need a redirect that funnels them
+        // back to the post-when code.  Only true terminal outcomes
+        // (`StateChange`) skip the redirect.
+        let needs_redirect = matches!(
+            branch_outcome,
+            StmtOutcome::Continue(_) | StmtOutcome::Wait { .. }
+        );
 
         if i < branches.len() - 1 {
-            if !branch_outcome.is_terminal() {
+            if needs_redirect {
                 let b_redirect = builder.create_block();
                 redirect_info.push((next_available, b_redirect));
             }
             current_id = next_available + 1;
         } else {
-            current_id = next_available;
+            // Last arm: redirect to after_when_id is needed too,
+            // otherwise its exit lands at the unregistered slot
+            // after the arm's body and falls through to the
+            // outer_switch default (STOP_DONE) — silently dropping
+            // every statement that follows the `when` block.
+            if needs_redirect {
+                let b_redirect = builder.create_block();
+                redirect_info.push((next_available, b_redirect));
+                current_id = next_available + 1;
+            } else {
+                current_id = next_available;
+            }
         }
     }
 
