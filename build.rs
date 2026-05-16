@@ -26,8 +26,8 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=external/aarch64/entry.asm");
     println!("cargo:rerun-if-changed=external/aarch64/syscall.asm");
 
-    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH")
-        .context("CARGO_CFG_TARGET_ARCH not set")?;
+    let target_arch =
+        std::env::var("CARGO_CFG_TARGET_ARCH").context("CARGO_CFG_TARGET_ARCH not set")?;
     let target = std::env::var("TARGET").unwrap_or_default();
 
     // Cross-assembler prefix: empty when host == target.  Otherwise pick
@@ -51,9 +51,7 @@ fn main() -> Result<()> {
     };
 
     let src_dir = PathBuf::from(format!("external/{target_arch}"));
-    let out_dir: PathBuf = std::env::var("OUT_DIR")
-        .context("OUT_DIR not set")?
-        .into();
+    let out_dir: PathBuf = std::env::var("OUT_DIR").context("OUT_DIR not set")?.into();
 
     for stem in ["entry", "syscall"] {
         let src = src_dir.join(format!("{stem}.asm"));
@@ -78,7 +76,11 @@ fn main() -> Result<()> {
         if !status.success() {
             bail!("{as_tool} failed to assemble {}", src.display());
         }
-        println!("cargo:rustc-env=LAKE_{}_OBJ={}", stem.to_uppercase(), out.display());
+        println!(
+            "cargo:rustc-env=LAKE_{}_OBJ={}",
+            stem.to_uppercase(),
+            out.display()
+        );
     }
 
     Ok(())

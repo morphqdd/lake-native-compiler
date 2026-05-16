@@ -68,12 +68,18 @@ pub enum PreStmt<'src> {
     /// `let X = <pure expr>` — fold the default to a single Cranelift
     /// value, declare a per-iter local binding so subsequent pre-stmts
     /// and the self-args fold can see it by name.
-    Let { name: &'src str, default: Expr<'src> },
+    Let {
+        name: &'src str,
+        default: Expr<'src>,
+    },
     /// Bare scheduler-safe rt-call (e.g. `rt_store(...)`).  After #78
     /// inlines pure stdlib helpers like `set_be32` and `set`, the
     /// expanded body lands here as top-level `rt_store` / `rt_load_*`
     /// / `rt_copy_bytes` invocations.  Args must all be pure.
-    SideEffect { callee: &'src str, args: Vec<Expr<'src>> },
+    SideEffect {
+        callee: &'src str,
+        args: Vec<Expr<'src>>,
+    },
 }
 
 /// Information captured from a detected tail-self loop.
@@ -106,12 +112,7 @@ pub struct TailLoopInfo<'src> {
 fn is_unroll_safe_side_effect(name: &str) -> bool {
     matches!(
         name,
-        "rt_store"
-            | "rt_copy_bytes"
-            | "rt_load_u8"
-            | "rt_load_u16"
-            | "rt_load_u32"
-            | "rt_load_u64"
+        "rt_store" | "rt_copy_bytes" | "rt_load_u8" | "rt_load_u16" | "rt_load_u32" | "rt_load_u64"
     )
 }
 
@@ -120,7 +121,11 @@ fn is_unroll_safe_side_effect(name: &str) -> bool {
 /// shape is unroll-safe; otherwise the detector should bail out.
 fn classify_pre_stmt<'src>(expr: &Expr<'src>) -> Option<PreStmt<'src>> {
     match expr {
-        Expr::Let { ident, default: Some(d), .. } => {
+        Expr::Let {
+            ident,
+            default: Some(d),
+            ..
+        } => {
             if pure_expr::is_pure(&d.inner) {
                 Some(PreStmt::Let {
                     name: ident.inner.0,
@@ -406,13 +411,7 @@ pub fn compile_unrolled_branch<'src>(
 
     for _iter in 0..unroll_factor {
         // Cond folds against the current Cranelift Variable values.
-        let cond_val = pure_expr::fold(
-            &info.cond,
-            builder,
-            ptr_ty,
-            Some(vars_start),
-            state,
-        );
+        let cond_val = pure_expr::fold(&info.cond, builder, ptr_ty, Some(vars_start), state);
         // If self-arm key was `true`, continue iff cond is non-zero.
         // If self-arm key was `false`, continue iff cond is zero (i.e.
         // when 0 == n { true → exit; false → self } loops while n != 0).
@@ -490,9 +489,7 @@ pub fn compile_unrolled_branch<'src>(
     }
 
     let remaining = builder.use_var(qv);
-    let new_remaining = builder
-        .ins()
-        .iadd_imm(remaining, -(unroll_factor as i64));
+    let new_remaining = builder.ins().iadd_imm(remaining, -(unroll_factor as i64));
     builder.def_var(qv, new_remaining);
 
     let exhausted = builder

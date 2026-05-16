@@ -190,13 +190,9 @@ pub fn compile_machine(ctx: &mut CompilerCtx, machine: &Machine<'_>, quantum: i6
     );
     let dying_cond = builder.ins().icmp_imm(IntCC::NotEqual, is_dying, 0);
     let alive_block = builder.create_block();
-    builder.ins().brif(
-        dying_cond,
-        quantum_stop_done_block,
-        &[],
-        alive_block,
-        &[],
-    );
+    builder
+        .ins()
+        .brif(dying_cond, quantum_stop_done_block, &[], alive_block, &[]);
 
     builder.switch_to_block(alive_block);
 

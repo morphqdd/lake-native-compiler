@@ -219,7 +219,14 @@ fn index_machine(
                 "index: '{name}' branch[{branch_id}] \
                  hash={hash:#018x} params={param_count} vars={var_count}"
             );
-            ctx.insert_pattern(&name, hash, param_count, branch_id as u128, var_count, guards)?;
+            ctx.insert_pattern(
+                &name,
+                hash,
+                param_count,
+                branch_id as u128,
+                var_count,
+                guards,
+            )?;
         }
     }
     Ok(())
@@ -244,11 +251,7 @@ fn index_machine(
 ///     time (`wait_expr.rs::compile`).  Sibling handlers share slots
 ///     so we take the maximum across them rather than the sum.
 fn count_branch_vars(branch: &Branch<'_>) -> usize {
-    let body_slots: usize = branch
-        .body
-        .iter()
-        .map(|e| count_expr_slots(&e.inner))
-        .sum();
+    let body_slots: usize = branch.body.iter().map(|e| count_expr_slots(&e.inner)).sum();
     branch.patterns.len() + body_slots
 }
 
@@ -271,12 +274,15 @@ fn count_expr_slots(expr: &Expr<'_>) -> usize {
             count_expr_slots(&cond.inner)
                 + branches
                     .iter()
-                    .map(|(_, body)| body.iter().map(|e| count_expr_slots(&e.inner)).sum::<usize>())
+                    .map(|(_, body)| {
+                        body.iter()
+                            .map(|e| count_expr_slots(&e.inner))
+                            .sum::<usize>()
+                    })
                     .sum::<usize>()
         }
         Expr::Wait { handlers, filter } => {
-            let filter_slots: usize =
-                filter.iter().map(|f| count_expr_slots(&f.inner)).sum();
+            let filter_slots: usize = filter.iter().map(|f| count_expr_slots(&f.inner)).sum();
             // All wait handlers share the same slot range — see
             // `wait_expr.rs`.  Take the maximum across siblings rather
             // than the sum.
@@ -303,11 +309,17 @@ fn count_expr_slots(expr: &Expr<'_>) -> usize {
         }
         Expr::Jump { ident, args } => {
             count_expr_slots(&ident.inner)
-                + args.iter().map(|a| count_expr_slots(&a.inner)).sum::<usize>()
+                + args
+                    .iter()
+                    .map(|a| count_expr_slots(&a.inner))
+                    .sum::<usize>()
         }
         Expr::MethodCall { receiver, args, .. } => {
             count_expr_slots(&receiver.inner)
-                + args.iter().map(|a| count_expr_slots(&a.inner)).sum::<usize>()
+                + args
+                    .iter()
+                    .map(|a| count_expr_slots(&a.inner))
+                    .sum::<usize>()
         }
         Expr::Add(l, r)
         | Expr::Sub(l, r)

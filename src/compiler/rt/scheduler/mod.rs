@@ -78,7 +78,9 @@ pub fn build_scheduler(ctx: &mut CompilerCtx, builder: &mut FunctionBuilder) -> 
     // case (no pending submissions) skips the call entirely — single
     // load + compare + brif on the hot path.
     let sh_use_flush = builder.use_var(sh_ptr_var);
-    let sh_data_flush = builder.ins().load(ptr_ty, MemFlags::trusted(), sh_use_flush, 0);
+    let sh_data_flush = builder
+        .ins()
+        .load(ptr_ty, MemFlags::trusted(), sh_use_flush, 0);
     let pending = builder.ins().load(
         ptr_ty,
         MemFlags::trusted(),

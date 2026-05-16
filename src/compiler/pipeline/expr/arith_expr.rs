@@ -49,7 +49,16 @@ pub fn compile<'a>(
 
     // ── Step 1: Compile LHS → TEMP_VAL ───────────────────────────────────────
     let lhs_done_id = match compile_expr(
-        ctx, builder, machine_ctx_var, block_id, branch_switch, state, lhs, None, None, false,
+        ctx,
+        builder,
+        machine_ctx_var,
+        block_id,
+        branch_switch,
+        state,
+        lhs,
+        None,
+        None,
+        false,
     )? {
         StmtOutcome::Continue(id) => id,
         other => bail!(
@@ -72,9 +81,7 @@ pub fn compile<'a>(
         // runtime; eliminating its function-call overhead is the
         // single biggest opt available.
         let ctx_ptr = builder.use_var(machine_ctx_var);
-        let exec_start = builder
-            .ins()
-            .load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
+        let exec_start = builder.ins().load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
         let lhs_val = builder.ins().load(
             ptr_ty,
             MemFlags::trusted(),
@@ -87,9 +94,7 @@ pub fn compile<'a>(
             exec_start,
             ExecCtxLayout::VARIABLES,
         );
-        let vars_start = builder
-            .ins()
-            .load(ptr_ty, MemFlags::trusted(), vars_fat, 0);
+        let vars_start = builder.ins().load(ptr_ty, MemFlags::trusted(), vars_fat, 0);
         builder.ins().store(
             MemFlags::trusted(),
             lhs_val,
@@ -129,9 +134,7 @@ pub fn compile<'a>(
     {
         // #81 — inline all rt loads/stores (scheduler-trusted).
         let ctx_ptr = builder.use_var(machine_ctx_var);
-        let exec_start = builder
-            .ins()
-            .load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
+        let exec_start = builder.ins().load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
         // Load variables fat ptr → start.
         let vars_fat = builder.ins().load(
             ptr_ty,
@@ -139,16 +142,12 @@ pub fn compile<'a>(
             exec_start,
             ExecCtxLayout::VARIABLES,
         );
-        let vars_start = builder
-            .ins()
-            .load(ptr_ty, MemFlags::trusted(), vars_fat, 0);
+        let vars_start = builder.ins().load(ptr_ty, MemFlags::trusted(), vars_fat, 0);
         // Load saved LHS from vars[tmp_slot].
-        let lhs_val = builder.ins().load(
-            ptr_ty,
-            MemFlags::trusted(),
-            vars_start,
-            tmp_slot as i32 * 8,
-        );
+        let lhs_val =
+            builder
+                .ins()
+                .load(ptr_ty, MemFlags::trusted(), vars_start, tmp_slot as i32 * 8);
         // Load RHS from TEMP_VAL.
         let rhs_val = builder.ins().load(
             ptr_ty,
@@ -164,11 +163,15 @@ pub fn compile<'a>(
             BinaryOp::Mul => builder.ins().imul(lhs_val, rhs_val),
             BinaryOp::Div => builder.ins().sdiv(lhs_val, rhs_val),
             BinaryOp::Le => {
-                let cmp = builder.ins().icmp(IntCC::SignedLessThanOrEqual, lhs_val, rhs_val);
+                let cmp = builder
+                    .ins()
+                    .icmp(IntCC::SignedLessThanOrEqual, lhs_val, rhs_val);
                 builder.ins().uextend(ptr_ty, cmp)
             }
             BinaryOp::Ge => {
-                let cmp = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, lhs_val, rhs_val);
+                let cmp = builder
+                    .ins()
+                    .icmp(IntCC::SignedGreaterThanOrEqual, lhs_val, rhs_val);
                 builder.ins().uextend(ptr_ty, cmp)
             }
             BinaryOp::Eq => {
@@ -180,7 +183,9 @@ pub fn compile<'a>(
                 builder.ins().uextend(ptr_ty, cmp)
             }
             BinaryOp::Gt => {
-                let cmp = builder.ins().icmp(IntCC::SignedGreaterThan, lhs_val, rhs_val);
+                let cmp = builder
+                    .ins()
+                    .icmp(IntCC::SignedGreaterThan, lhs_val, rhs_val);
                 builder.ins().uextend(ptr_ty, cmp)
             }
         };

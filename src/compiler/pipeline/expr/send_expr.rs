@@ -10,8 +10,7 @@ use crate::compiler::{
     ctx::CompilerCtx,
     pipeline::expr::{BranchState, StmtOutcome},
     rt::layout::{
-        ExecCtxLayout, FatPtrLayout, process_ctx::ProcessCtxLayout,
-        sheduler_ctx::ShedulerCtxLayout,
+        ExecCtxLayout, FatPtrLayout, process_ctx::ProcessCtxLayout, sheduler_ctx::ShedulerCtxLayout,
     },
 };
 
@@ -53,9 +52,7 @@ pub fn compile_send(
     // ── 1. Load PID from sender's VARIABLES ─────────────────────────────
     let ctx_ptr = builder.use_var(machine_ctx_var);
     // Sender's ExecCtx fat-ptr -> ExecCtx start.
-    let sender_exec_start = builder
-        .ins()
-        .load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
+    let sender_exec_start = builder.ins().load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
     // VARIABLES fat-ptr (offset 24 in ExecCtx).
     let sender_vars_fat = builder.ins().load(
         ptr_ty,
@@ -66,12 +63,9 @@ pub fn compile_send(
     let vars_ptr = builder
         .ins()
         .load(ptr_ty, MemFlags::trusted(), sender_vars_fat, 0);
-    let pid_val = builder.ins().load(
-        ptr_ty,
-        MemFlags::trusted(),
-        vars_ptr,
-        var_index as i32 * 8,
-    );
+    let pid_val = builder
+        .ins()
+        .load(ptr_ty, MemFlags::trusted(), vars_ptr, var_index as i32 * 8);
     let _ = rt_funcs;
 
     // ── 1a. Resolve pid → proc_ctx via the scheduler's pid_table.
@@ -91,18 +85,12 @@ pub fn compile_send(
         .module_mut()
         .declare_data_in_func(sched_data_id, &mut builder.func);
     let sh_fat_ptr_for_lookup = builder.ins().global_value(ptr_ty, sched_gv);
-    let target_proc_ctx_fat = ShedulerCtxLayout::lookup_proc_ctx(
-        sh_fat_ptr_for_lookup,
-        pid_val,
-        ctx,
-        builder,
-    );
+    let target_proc_ctx_fat =
+        ShedulerCtxLayout::lookup_proc_ctx(sh_fat_ptr_for_lookup, pid_val, ctx, builder);
 
     let send_block = builder.create_block();
     let continue_block = builder.create_block();
-    let proc_ctx_is_null = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, target_proc_ctx_fat, 0);
+    let proc_ctx_is_null = builder.ins().icmp_imm(IntCC::Equal, target_proc_ctx_fat, 0);
     builder
         .ins()
         .brif(proc_ctx_is_null, continue_block, &[], send_block, &[]);
@@ -111,8 +99,7 @@ pub fn compile_send(
 
     // ── 2. Load target's exec_ctx via its proc_ctx fat-ptr ──────────────
     let target_exec_ctx_fat = ProcessCtxLayout::get_exec_ctx(target_proc_ctx_fat, ctx, builder)?;
-    let target_exec_start =
-        FatPtrLayout::load_start(builder, ptr_ty, target_exec_ctx_fat);
+    let target_exec_start = FatPtrLayout::load_start(builder, ptr_ty, target_exec_ctx_fat);
 
     // ── 3. Enqueue args into target's mailbox ───────────────────────────
     let target_mailbox_fat = ExecCtxLayout::load(
@@ -138,9 +125,10 @@ pub fn compile_send(
     let sender_ja = builder
         .ins()
         .load(ptr_ty, MemFlags::trusted(), sender_ja_fat, 0);
-    let target_mailbox_start = builder
-        .ins()
-        .load(ptr_ty, MemFlags::trusted(), target_mailbox_fat, 0);
+    let target_mailbox_start =
+        builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), target_mailbox_fat, 0);
 
     // Copy each arg: JUMP_ARGS[call_base + i] → mailbox[(TAIL + i) mod 256]
     for i in 0..arg_count {

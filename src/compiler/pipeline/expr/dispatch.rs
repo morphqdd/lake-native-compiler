@@ -67,14 +67,9 @@ pub fn emit_guard_select(
             candidates,
             discriminant,
         )),
-        Some(GuardKind::Str) => emit_str_guard_select(
-            ctx,
-            builder,
-            ptr_ty,
-            candidates,
-            discriminant,
-            namespace,
-        ),
+        Some(GuardKind::Str) => {
+            emit_str_guard_select(ctx, builder, ptr_ty, candidates, discriminant, namespace)
+        }
     }
 }
 
@@ -103,10 +98,7 @@ pub fn emit_int_guard_select(
     let mut guard_switch = Switch::new();
     let mut wildcard_block = None::<(cranelift::prelude::Block, u128)>;
 
-    let arm_blocks: Vec<_> = candidates
-        .iter()
-        .map(|_| builder.create_block())
-        .collect();
+    let arm_blocks: Vec<_> = candidates.iter().map(|_| builder.create_block()).collect();
 
     for (i, branch) in candidates.iter().enumerate() {
         let guard = branch.guards.iter().find_map(|g| g.as_ref());
@@ -120,9 +112,7 @@ pub fn emit_int_guard_select(
         }
     }
 
-    let default_block = wildcard_block
-        .map(|(b, _)| b)
-        .unwrap_or(arm_blocks[0]);
+    let default_block = wildcard_block.map(|(b, _)| b).unwrap_or(arm_blocks[0]);
 
     guard_switch.emit(builder, discriminant, default_block);
 
@@ -329,17 +319,13 @@ pub fn emit_str_guard_select(
 
     // mphf_hash + lookup
     let mphf_hash = emit_hash_function(builder, fxhash_val, mphf.seed);
-    let disp_gv = ctx
-        .module_mut()
-        .declare_data_in_func(disp_id, builder.func);
+    let disp_gv = ctx.module_mut().declare_data_in_func(disp_id, builder.func);
     let disp_ptr = builder.ins().global_value(ptr_ty, disp_gv);
     let index_i32 = emit_mphf_lookup(builder, &mphf, mphf_hash, disp_ptr);
     let index = builder.ins().uextend(i64_ty, index_i32);
 
     // Verify hash: keys[index] == fxhash_val.
-    let keys_gv = ctx
-        .module_mut()
-        .declare_data_in_func(keys_id, builder.func);
+    let keys_gv = ctx.module_mut().declare_data_in_func(keys_id, builder.func);
     let keys_ptr = builder.ins().global_value(ptr_ty, keys_gv);
     let key_offset = builder.ins().imul_imm(index, 8);
     let key_addr = builder.ins().iadd(keys_ptr, key_offset);
@@ -352,22 +338,20 @@ pub fn emit_str_guard_select(
     // ── b_check_len: lit_meta[index].len == len ──────────────────────────────
     builder.switch_to_block(b_check_len);
     builder.seal_block(b_check_len);
-    let meta_gv = ctx
-        .module_mut()
-        .declare_data_in_func(meta_id, builder.func);
+    let meta_gv = ctx.module_mut().declare_data_in_func(meta_id, builder.func);
     let meta_ptr = builder.ins().global_value(ptr_ty, meta_gv);
     let meta_offset = builder.ins().imul_imm(index, 16);
     let meta_addr = builder.ins().iadd(meta_ptr, meta_offset);
     let lit_offset = builder
         .ins()
         .load(i64_ty, MemFlags::trusted(), meta_addr, 0);
-    let lit_len = builder.ins().load(i64_ty, MemFlags::trusted(), meta_addr, 8);
+    let lit_len = builder
+        .ins()
+        .load(i64_ty, MemFlags::trusted(), meta_addr, 8);
     let len_eq = builder.ins().icmp(IntCC::Equal, lit_len, len);
 
     // Compute lit_start = blob_ptr + lit_offset for the memcmp loop.
-    let blob_gv = ctx
-        .module_mut()
-        .declare_data_in_func(blob_id, builder.func);
+    let blob_gv = ctx.module_mut().declare_data_in_func(blob_id, builder.func);
     let blob_ptr = builder.ins().global_value(ptr_ty, blob_gv);
     let lit_start = builder.ins().iadd(blob_ptr, lit_offset);
 
@@ -421,9 +405,7 @@ pub fn emit_str_guard_select(
     // ── b_match: load branch_id from bid table[index], jump to merge ────────
     builder.switch_to_block(b_match);
     builder.seal_block(b_match);
-    let bid_gv = ctx
-        .module_mut()
-        .declare_data_in_func(bid_id, builder.func);
+    let bid_gv = ctx.module_mut().declare_data_in_func(bid_id, builder.func);
     let bid_ptr = builder.ins().global_value(ptr_ty, bid_gv);
     let bid_offset = builder.ins().imul_imm(index, 8);
     let bid_addr = builder.ins().iadd(bid_ptr, bid_offset);
@@ -437,9 +419,7 @@ pub fn emit_str_guard_select(
         .map(|w| w.branch_id)
         .or_else(|| candidates.first().map(|c| c.branch_id))
         .unwrap_or(0);
-    let fb_val = builder
-        .ins()
-        .iconst(ptr_ty, fallback_branch_id as i64);
+    let fb_val = builder.ins().iconst(ptr_ty, fallback_branch_id as i64);
     builder.ins().jump(b_merge, &[BlockArg::Value(fb_val)]);
 
     // ── b_merge: caller continues here with the selected branch_id ──────────

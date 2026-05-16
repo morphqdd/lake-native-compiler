@@ -32,7 +32,10 @@ fn str_guard_branch_dispatch_playground_repro() {
         s.contains("Hello, world!"),
         "first-branch output missing: {s:?}"
     );
-    assert!(s.contains("Not hello"), "fallback-branch output missing: {s:?}");
+    assert!(
+        s.contains("Not hello"),
+        "fallback-branch output missing: {s:?}"
+    );
 }
 
 /// Allocator regression: spawn many short-lived actors in sequence to exercise

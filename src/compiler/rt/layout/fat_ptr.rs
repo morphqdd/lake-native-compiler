@@ -44,12 +44,7 @@ impl FatPtrLayout {
     }
 
     /// Initialise a fat pointer to cover `[data_ptr, data_ptr + byte_len)`.
-    pub fn init(
-        builder: &mut FunctionBuilder,
-        fat_ptr: Value,
-        data_ptr: Value,
-        byte_len: i64,
-    ) {
+    pub fn init(builder: &mut FunctionBuilder, fat_ptr: Value, data_ptr: Value, byte_len: i64) {
         let end = builder.ins().iadd_imm(data_ptr, byte_len);
         Self::store_start(builder, fat_ptr, data_ptr);
         Self::store_end(builder, fat_ptr, end);
@@ -71,9 +66,7 @@ impl FatPtrLayout {
         let in_bounds = builder
             .ins()
             .icmp(IntCC::UnsignedLessThanOrEqual, access_end, end);
-        builder
-            .ins()
-            .trapz(in_bounds, TrapCode::unwrap_user(32));
+        builder.ins().trapz(in_bounds, TrapCode::unwrap_user(32));
     }
 }
 

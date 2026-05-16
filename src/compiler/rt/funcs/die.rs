@@ -18,17 +18,12 @@
 use anyhow::{Result, anyhow};
 use cranelift::{
     module::{DataDescription, FuncOrDataId, Linkage, Module},
-    prelude::{
-        FunctionBuilder, FunctionBuilderContext, InstBuilder, IntCC, MemFlags, TrapCode,
-    },
+    prelude::{FunctionBuilder, FunctionBuilderContext, InstBuilder, IntCC, MemFlags, TrapCode},
 };
 
 use crate::compiler::{
     ctx::CompilerCtx,
-    rt::layout::{
-        ExecCtxLayout, process_ctx::ProcessCtxLayout,
-        sheduler_ctx::ShedulerCtxLayout,
-    },
+    rt::layout::{ExecCtxLayout, process_ctx::ProcessCtxLayout, sheduler_ctx::ShedulerCtxLayout},
     target::LinuxSyscalls,
 };
 
@@ -55,7 +50,11 @@ pub fn define_die_actor(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     // yet initialised → fall through to the process-exit path.
     let sched_data_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
         Some(FuncOrDataId::Data(id)) => id,
-        _ => return Err(anyhow!("sheduler_ctx_fat_ptr global missing for rt_die_actor")),
+        _ => {
+            return Err(anyhow!(
+                "sheduler_ctx_fat_ptr global missing for rt_die_actor"
+            ));
+        }
     };
     let sched_gv = ctx
         .module_mut()
@@ -95,9 +94,7 @@ pub fn define_die_actor(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         sched_ptr,
         ShedulerCtxLayout::PROCESS_ARR_FAT,
     );
-    let proc_arr_start = builder
-        .ins()
-        .load(ty, MemFlags::trusted(), proc_arr_fat, 0);
+    let proc_arr_start = builder.ins().load(ty, MemFlags::trusted(), proc_arr_fat, 0);
     let current_idx = builder.ins().load(
         ty,
         MemFlags::trusted(),
@@ -107,18 +104,14 @@ pub fn define_die_actor(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let idx_scaled = builder.ins().imul_imm(current_idx, 8);
     let slot_addr = builder.ins().iadd(proc_arr_start, idx_scaled);
     let proc_ctx_fat = builder.ins().load(ty, MemFlags::trusted(), slot_addr, 0);
-    let proc_ctx_ptr = builder
-        .ins()
-        .load(ty, MemFlags::trusted(), proc_ctx_fat, 0);
+    let proc_ctx_ptr = builder.ins().load(ty, MemFlags::trusted(), proc_ctx_fat, 0);
     let exec_ctx_fat = builder.ins().load(
         ty,
         MemFlags::trusted(),
         proc_ctx_ptr,
         ProcessCtxLayout::EXEC_CTX,
     );
-    let exec_ctx_ptr = builder
-        .ins()
-        .load(ty, MemFlags::trusted(), exec_ctx_fat, 0);
+    let exec_ctx_ptr = builder.ins().load(ty, MemFlags::trusted(), exec_ctx_fat, 0);
     let one = builder.ins().iconst(ty, 1);
     builder.ins().store(
         MemFlags::trusted(),
@@ -135,9 +128,9 @@ pub fn define_die_actor(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
             .module_mut()
             .declare_func_in_func(syscall_id, &mut builder.func);
         const MSG: &str = "lake: actor died — fallible rt-call rejected\n";
-        let msg_data_id = ctx
-            .module_mut()
-            .declare_data("__lake_die_actor_msg", Linkage::Local, false, false)?;
+        let msg_data_id =
+            ctx.module_mut()
+                .declare_data("__lake_die_actor_msg", Linkage::Local, false, false)?;
         let mut desc = DataDescription::new();
         desc.define(MSG.as_bytes().to_vec().into_boxed_slice());
         ctx.module_mut().define_data(msg_data_id, &desc)?;
@@ -146,12 +139,16 @@ pub fn define_die_actor(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
             .declare_data_in_func(msg_data_id, &mut builder.func);
         let msg_ptr = builder.ins().global_value(ty, msg_gv);
         let msg_len = builder.ins().iconst(ty, MSG.len() as i64);
-        let sys_write = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_write);
+        let sys_write = builder
+            .ins()
+            .iconst(ty, LinuxSyscalls::for_host().sys_write);
         let stderr_fd = builder.ins().iconst(ty, 2);
         let zero_arg = builder.ins().iconst(ty, 0);
         builder.ins().call(
             syscall_ref,
-            &[sys_write, stderr_fd, msg_ptr, msg_len, zero_arg, zero_arg, zero_arg],
+            &[
+                sys_write, stderr_fd, msg_ptr, msg_len, zero_arg, zero_arg, zero_arg,
+            ],
         );
     }
     builder.ins().return_(&[]);
@@ -166,8 +163,7 @@ pub fn define_die_actor(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let syscall_ref_exit = ctx
         .module_mut()
         .declare_func_in_func(syscall_id, &mut builder.func);
-    const MSG_INIT: &str =
-        "lake: init failed — rt-fn aborted before scheduler ready (likely io_uring_setup or early rt_allocate)\n";
+    const MSG_INIT: &str = "lake: init failed — rt-fn aborted before scheduler ready (likely io_uring_setup or early rt_allocate)\n";
     let msg_init_id =
         ctx.module_mut()
             .declare_data("__lake_die_actor_init_msg", Linkage::Local, false, false)?;
@@ -179,12 +175,16 @@ pub fn define_die_actor(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .declare_data_in_func(msg_init_id, &mut builder.func);
     let msg_ptr = builder.ins().global_value(ty, msg_gv);
     let msg_len = builder.ins().iconst(ty, MSG_INIT.len() as i64);
-    let sys_write = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_write);
+    let sys_write = builder
+        .ins()
+        .iconst(ty, LinuxSyscalls::for_host().sys_write);
     let stderr_fd = builder.ins().iconst(ty, 2);
     let zero_arg = builder.ins().iconst(ty, 0);
     builder.ins().call(
         syscall_ref_exit,
-        &[sys_write, stderr_fd, msg_ptr, msg_len, zero_arg, zero_arg, zero_arg],
+        &[
+            sys_write, stderr_fd, msg_ptr, msg_len, zero_arg, zero_arg, zero_arg,
+        ],
     );
     let sys_exit = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_exit);
     let code = builder.ins().iconst(ty, 137);

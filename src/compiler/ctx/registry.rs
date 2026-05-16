@@ -193,7 +193,8 @@ mod tests {
         let mut reg = MachineRegistry::default();
         reg.add_machine("main");
         reg.insert_branch("main", 0xABCD, 0, 42, 3, vec![]).unwrap();
-        reg.insert_branch("main", 0xEF01, 1, 43, 5, vec![None]).unwrap();
+        reg.insert_branch("main", 0xEF01, 1, 43, 5, vec![None])
+            .unwrap();
         reg
     }
 
@@ -242,8 +243,10 @@ mod tests {
         reg.add_machine("fib");
         // 0 i64 and 1 i64 and n i64 all share the same type hash
         let h = 0xDEAD;
-        reg.insert_branch("fib", h, 1, 0, 1, vec![Some(GuardValue::Int(0))]).unwrap();
-        reg.insert_branch("fib", h, 1, 1, 1, vec![Some(GuardValue::Int(1))]).unwrap();
+        reg.insert_branch("fib", h, 1, 0, 1, vec![Some(GuardValue::Int(0))])
+            .unwrap();
+        reg.insert_branch("fib", h, 1, 1, 1, vec![Some(GuardValue::Int(1))])
+            .unwrap();
         reg.insert_branch("fib", h, 1, 2, 2, vec![None]).unwrap();
 
         let candidates = reg.branches_for_type_hash("fib", h);

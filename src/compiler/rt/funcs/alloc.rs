@@ -12,8 +12,7 @@ use crate::compiler::{
     ctx::CompilerCtx,
     pipeline::expr::pure_expr::atom_id,
     rt::layout::{
-        ExecCtxLayout, FatPtrLayout, process_ctx::ProcessCtxLayout,
-        sheduler_ctx::ShedulerCtxLayout,
+        ExecCtxLayout, FatPtrLayout, process_ctx::ProcessCtxLayout, sheduler_ctx::ShedulerCtxLayout,
     },
     target::LinuxSyscalls,
 };
@@ -61,14 +60,14 @@ fn define_allocate_impl(
         ctx.module().get_name("heap_end"),
         ctx.module().get_name("free_list_heads"),
     ) {
-        (
-            Some(FuncOrDataId::Data(c)),
-            Some(FuncOrDataId::Data(e)),
-            Some(FuncOrDataId::Data(f)),
-        ) => (c, e, f),
-        _ => return Err(anyhow!(
-            "Heap globals + free_list_heads must be declared before rt_allocate"
-        )),
+        (Some(FuncOrDataId::Data(c)), Some(FuncOrDataId::Data(e)), Some(FuncOrDataId::Data(f))) => {
+            (c, e, f)
+        }
+        _ => {
+            return Err(anyhow!(
+                "Heap globals + free_list_heads must be declared before rt_allocate"
+            ));
+        }
     };
 
     let mmap_id = match ctx.module().get_name("rt_mmap") {
@@ -169,13 +168,9 @@ fn define_allocate_impl(
     // payload_addr = *head    (head holds fat_ptr; fat_ptr.start = payload)
     let payload_addr = builder.ins().load(ty, MemFlags::trusted(), head, 0);
     // next = *payload_addr    (chain pointer stored at offset 0 of payload)
-    let next = builder
-        .ins()
-        .load(ty, MemFlags::trusted(), payload_addr, 0);
+    let next = builder.ins().load(ty, MemFlags::trusted(), payload_addr, 0);
     // free_list[bucket] = next
-    builder
-        .ins()
-        .store(MemFlags::trusted(), next, head_addr, 0);
+    builder.ins().store(MemFlags::trusted(), next, head_addr, 0);
 
     if zero_on_pop {
         // Zero the recycled payload so callers see fresh memory (matches the
@@ -193,15 +188,11 @@ fn define_allocate_impl(
         let zero_body = builder.create_block();
         builder.append_block_param(zero_hdr, ty);
         let zero_start = builder.ins().iconst(ty, 0);
-        builder
-            .ins()
-            .jump(zero_hdr, &[BlockArg::Value(zero_start)]);
+        builder.ins().jump(zero_hdr, &[BlockArg::Value(zero_start)]);
 
         builder.switch_to_block(zero_hdr);
         let zi = builder.block_params(zero_hdr)[0];
-        let zcont = builder
-            .ins()
-            .icmp(IntCC::UnsignedLessThan, zi, zero_limit);
+        let zcont = builder.ins().icmp(IntCC::UnsignedLessThan, zi, zero_limit);
         builder
             .ins()
             .brif(zcont, zero_body, &[], merge_block, &[BlockArg::Value(head)]);
@@ -227,9 +218,7 @@ fn define_allocate_impl(
         builder
             .ins()
             .store(MemFlags::trusted(), zero_w, payload_addr, 0);
-        builder
-            .ins()
-            .jump(merge_block, &[BlockArg::Value(head)]);
+        builder.ins().jump(merge_block, &[BlockArg::Value(head)]);
     }
     let _ = user_size;
 
@@ -243,9 +232,7 @@ fn define_allocate_impl(
     let heap_curr_addr = builder
         .ins()
         .load(ty, MemFlags::trusted(), heap_curr_ptr, 0);
-    let heap_end_addr = builder
-        .ins()
-        .load(ty, MemFlags::trusted(), heap_end_ptr, 0);
+    let heap_end_addr = builder.ins().load(ty, MemFlags::trusted(), heap_end_ptr, 0);
 
     // Skip the 16-byte fat-pointer header to get the start of user data.
     let header = builder.ins().iconst(ty, FatPtrLayout::SIZE as i64);
@@ -312,8 +299,12 @@ fn define_allocate_impl(
         let tuple_start = builder.ins().load(ty, MemFlags::trusted(), tuple_fp, 0);
         let err_a = builder.ins().iconst(ty, atom_id("err"));
         let nomem_a = builder.ins().iconst(ty, atom_id("nomem"));
-        builder.ins().store(MemFlags::trusted(), err_a, tuple_start, 0);
-        builder.ins().store(MemFlags::trusted(), nomem_a, tuple_start, 8);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), err_a, tuple_start, 0);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), nomem_a, tuple_start, 8);
         builder.ins().return_(&[tuple_fp]);
 
         // Move to cont_block so the shared happy-path emission below
@@ -323,187 +314,195 @@ fn define_allocate_impl(
         let _ = TrapCode::HEAP_OUT_OF_BOUNDS;
     } else {
         let sched_data_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
-        Some(FuncOrDataId::Data(id)) => id,
-        _ => return Err(anyhow!("sheduler_ctx_fat_ptr global not found for OOM die path")),
-    };
-    let sched_gv = ctx
-        .module_mut()
-        .declare_data_in_func(sched_data_id, &mut builder.func);
-    // The global slot holds a 16-byte fat-ptr `{ start, end }`; `start`
-    // is the address of the sched_ctx struct itself, which is the
-    // `sched_ptr` we need.  No extra deref — the first 8 bytes already
-    // carry the struct address (or 0 when the slot hasn't been written
-    // yet, which is what we test against here).
-    let sched_fat_addr = builder.ins().global_value(ty, sched_gv);
-    let sched_ptr = builder
-        .ins()
-        .load(ty, MemFlags::trusted(), sched_fat_addr, 0);
-    let check_count_block = builder.create_block();
-    let init_exit_block = builder.create_block();
-    let mark_actor_block = builder.create_block();
-    let sched_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, sched_ptr, 0);
-    builder
-        .ins()
-        .brif(sched_nonzero, check_count_block, &[], init_exit_block, &[]);
-
-    // ── check_count_block: scheduler ctx exists; do we have at least
-    //    one actor registered?  If not the failing allocation is part of
-    //    init_main_process — fall through to process-exit.
-    builder.switch_to_block(check_count_block);
-    builder.seal_block(check_count_block);
-    let real_count = builder.ins().load(
-        ty,
-        MemFlags::trusted(),
-        sched_ptr,
-        ShedulerCtxLayout::REAL_COUNT_OF_PROCESSES,
-    );
-    let count_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, real_count, 0);
-    builder
-        .ins()
-        .brif(count_nonzero, mark_actor_block, &[], init_exit_block, &[]);
-
-    // ── mark_actor_block: standard actor-time path.  Find the running
-    //    actor's exec_ctx, set IS_DYING, optionally log, return null.
-    builder.switch_to_block(mark_actor_block);
-    builder.seal_block(mark_actor_block);
-    let proc_arr_fat = builder.ins().load(
-        ty,
-        MemFlags::trusted(),
-        sched_ptr,
-        ShedulerCtxLayout::PROCESS_ARR_FAT,
-    );
-    let proc_arr_start = builder
-        .ins()
-        .load(ty, MemFlags::trusted(), proc_arr_fat, 0);
-    let current_idx = builder.ins().load(
-        ty,
-        MemFlags::trusted(),
-        sched_ptr,
-        ShedulerCtxLayout::CURRENT_PROCESS,
-    );
-    let idx_scaled = builder.ins().imul_imm(current_idx, 8);
-    let slot_addr = builder.ins().iadd(proc_arr_start, idx_scaled);
-    let proc_ctx_fat = builder.ins().load(ty, MemFlags::trusted(), slot_addr, 0);
-    let proc_ctx_ptr = builder
-        .ins()
-        .load(ty, MemFlags::trusted(), proc_ctx_fat, 0);
-    let exec_ctx_fat = builder.ins().load(
-        ty,
-        MemFlags::trusted(),
-        proc_ctx_ptr,
-        ProcessCtxLayout::EXEC_CTX,
-    );
-    let exec_ctx_ptr = builder
-        .ins()
-        .load(ty, MemFlags::trusted(), exec_ctx_fat, 0);
-    let one_dying = builder.ins().iconst(ty, 1);
-    builder.ins().store(
-        MemFlags::trusted(),
-        one_dying,
-        exec_ctx_ptr,
-        ExecCtxLayout::IS_DYING,
-    );
-
-    // Optional crash log to stderr — gated at lakec invocation by
-    // LAKE_DEATH_LOG=1.  Reading the env at compile time keeps the
-    // produced binary free of any extra branches when disabled.
-    let want_log = std::env::var("LAKE_DEATH_LOG")
-        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
-
-    let syscall_ref_for_log = if want_log {
-        let syscall_id = match ctx.module().get_name("rt_syscall") {
-            Some(FuncOrDataId::Func(id)) => id,
+            Some(FuncOrDataId::Data(id)) => id,
             _ => {
                 return Err(anyhow!(
-                    "rt_syscall must be declared before LAKE_DEATH_LOG-instrumented rt_allocate"
+                    "sheduler_ctx_fat_ptr global not found for OOM die path"
                 ));
             }
         };
-        Some(
-            ctx.module_mut()
-                .declare_func_in_func(syscall_id, &mut builder.func),
-        )
-    } else {
-        None
-    };
-
-    // Helper closure: declare a unique `Local` data symbol holding `msg`
-    // bytes and emit a write(2, …) syscall via the captured syscall ref.
-    // Symbol name is suffixed by `func_name` + `tag` to keep
-    // rt_allocate / rt_allocate_raw / actor / init messages distinct
-    // (declare_data rejects duplicates within a module).
-    let mut emit_log = |builder: &mut FunctionBuilder,
-                        ctx: &mut CompilerCtx,
-                        tag: &str,
-                        msg: &str|
-     -> Result<()> {
-        let Some(syscall_ref) = syscall_ref_for_log else {
-            return Ok(());
-        };
-        let sym = format!("__lake_die_msg_{func_name}_{tag}");
-        let msg_data_id =
-            ctx.module_mut()
-                .declare_data(&sym, Linkage::Local, false, false)?;
-        let mut msg_desc = DataDescription::new();
-        msg_desc.define(msg.as_bytes().to_vec().into_boxed_slice());
-        ctx.module_mut().define_data(msg_data_id, &msg_desc)?;
-        let msg_gv = ctx
+        let sched_gv = ctx
             .module_mut()
-            .declare_data_in_func(msg_data_id, &mut builder.func);
-        let msg_ptr = builder.ins().global_value(ty, msg_gv);
-        let msg_len = builder.ins().iconst(ty, msg.len() as i64);
-        let sys_write = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_write);
-        let stderr_fd = builder.ins().iconst(ty, 2);
-        let zero_arg = builder.ins().iconst(ty, 0);
-        builder.ins().call(
-            syscall_ref,
-            &[sys_write, stderr_fd, msg_ptr, msg_len, zero_arg, zero_arg, zero_arg],
+            .declare_data_in_func(sched_data_id, &mut builder.func);
+        // The global slot holds a 16-byte fat-ptr `{ start, end }`; `start`
+        // is the address of the sched_ctx struct itself, which is the
+        // `sched_ptr` we need.  No extra deref — the first 8 bytes already
+        // carry the struct address (or 0 when the slot hasn't been written
+        // yet, which is what we test against here).
+        let sched_fat_addr = builder.ins().global_value(ty, sched_gv);
+        let sched_ptr = builder
+            .ins()
+            .load(ty, MemFlags::trusted(), sched_fat_addr, 0);
+        let check_count_block = builder.create_block();
+        let init_exit_block = builder.create_block();
+        let mark_actor_block = builder.create_block();
+        let sched_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, sched_ptr, 0);
+        builder
+            .ins()
+            .brif(sched_nonzero, check_count_block, &[], init_exit_block, &[]);
+
+        // ── check_count_block: scheduler ctx exists; do we have at least
+        //    one actor registered?  If not the failing allocation is part of
+        //    init_main_process — fall through to process-exit.
+        builder.switch_to_block(check_count_block);
+        builder.seal_block(check_count_block);
+        let real_count = builder.ins().load(
+            ty,
+            MemFlags::trusted(),
+            sched_ptr,
+            ShedulerCtxLayout::REAL_COUNT_OF_PROCESSES,
         );
-        Ok(())
-    };
+        let count_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, real_count, 0);
+        builder
+            .ins()
+            .brif(count_nonzero, mark_actor_block, &[], init_exit_block, &[]);
 
-    emit_log(
-        &mut builder,
-        &mut ctx,
-        "actor",
-        "lake: actor died — rt_allocate: heap exhausted\n",
-    )?;
+        // ── mark_actor_block: standard actor-time path.  Find the running
+        //    actor's exec_ctx, set IS_DYING, optionally log, return null.
+        builder.switch_to_block(mark_actor_block);
+        builder.seal_block(mark_actor_block);
+        let proc_arr_fat = builder.ins().load(
+            ty,
+            MemFlags::trusted(),
+            sched_ptr,
+            ShedulerCtxLayout::PROCESS_ARR_FAT,
+        );
+        let proc_arr_start = builder.ins().load(ty, MemFlags::trusted(), proc_arr_fat, 0);
+        let current_idx = builder.ins().load(
+            ty,
+            MemFlags::trusted(),
+            sched_ptr,
+            ShedulerCtxLayout::CURRENT_PROCESS,
+        );
+        let idx_scaled = builder.ins().imul_imm(current_idx, 8);
+        let slot_addr = builder.ins().iadd(proc_arr_start, idx_scaled);
+        let proc_ctx_fat = builder.ins().load(ty, MemFlags::trusted(), slot_addr, 0);
+        let proc_ctx_ptr = builder.ins().load(ty, MemFlags::trusted(), proc_ctx_fat, 0);
+        let exec_ctx_fat = builder.ins().load(
+            ty,
+            MemFlags::trusted(),
+            proc_ctx_ptr,
+            ProcessCtxLayout::EXEC_CTX,
+        );
+        let exec_ctx_ptr = builder.ins().load(ty, MemFlags::trusted(), exec_ctx_fat, 0);
+        let one_dying = builder.ins().iconst(ty, 1);
+        builder.ins().store(
+            MemFlags::trusted(),
+            one_dying,
+            exec_ctx_ptr,
+            ExecCtxLayout::IS_DYING,
+        );
 
-    // Return null fat-ptr.  Caller's next quantum boundary observes
-    // IS_DYING and bails to STOP_DONE.
-    let null = builder.ins().iconst(ty, 0);
-    builder.ins().return_(&[null]);
+        // Optional crash log to stderr — gated at lakec invocation by
+        // LAKE_DEATH_LOG=1.  Reading the env at compile time keeps the
+        // produced binary free of any extra branches when disabled.
+        let want_log = std::env::var("LAKE_DEATH_LOG")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
 
-    // ── init_exit_block: no actor to mark; this is a fatal init-time
-    //    allocation failure.  Best we can do is log + exit cleanly
-    //    instead of trapping with SIGILL.
-    builder.switch_to_block(init_exit_block);
-    builder.seal_block(init_exit_block);
-    let syscall_id_for_exit = match ctx.module().get_name("rt_syscall") {
-        Some(FuncOrDataId::Func(id)) => id,
-        _ => return Err(anyhow!("rt_syscall must be declared before rt_allocate init-exit path")),
-    };
-    let syscall_ref_for_exit = ctx
-        .module_mut()
-        .declare_func_in_func(syscall_id_for_exit, &mut builder.func);
-    emit_log(
-        &mut builder,
-        &mut ctx,
-        "init",
-        "lake: init failed — rt_allocate exhausted before scheduler ready\n",
-    )?;
-    let sys_exit = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_exit);
-    let code = builder.ins().iconst(ty, 137); // 128 + SIGKILL convention
-    let zero_arg2 = builder.ins().iconst(ty, 0);
-    builder.ins().call(
-        syscall_ref_for_exit,
-        &[sys_exit, code, zero_arg2, zero_arg2, zero_arg2, zero_arg2, zero_arg2],
-    );
-    builder.ins().trap(TrapCode::user(0xDE).unwrap());
+        let syscall_ref_for_log = if want_log {
+            let syscall_id = match ctx.module().get_name("rt_syscall") {
+                Some(FuncOrDataId::Func(id)) => id,
+                _ => {
+                    return Err(anyhow!(
+                        "rt_syscall must be declared before LAKE_DEATH_LOG-instrumented rt_allocate"
+                    ));
+                }
+            };
+            Some(
+                ctx.module_mut()
+                    .declare_func_in_func(syscall_id, &mut builder.func),
+            )
+        } else {
+            None
+        };
 
-    builder.switch_to_block(cont_block);
-    builder.seal_block(cont_block);
+        // Helper closure: declare a unique `Local` data symbol holding `msg`
+        // bytes and emit a write(2, …) syscall via the captured syscall ref.
+        // Symbol name is suffixed by `func_name` + `tag` to keep
+        // rt_allocate / rt_allocate_raw / actor / init messages distinct
+        // (declare_data rejects duplicates within a module).
+        let mut emit_log = |builder: &mut FunctionBuilder,
+                            ctx: &mut CompilerCtx,
+                            tag: &str,
+                            msg: &str|
+         -> Result<()> {
+            let Some(syscall_ref) = syscall_ref_for_log else {
+                return Ok(());
+            };
+            let sym = format!("__lake_die_msg_{func_name}_{tag}");
+            let msg_data_id = ctx
+                .module_mut()
+                .declare_data(&sym, Linkage::Local, false, false)?;
+            let mut msg_desc = DataDescription::new();
+            msg_desc.define(msg.as_bytes().to_vec().into_boxed_slice());
+            ctx.module_mut().define_data(msg_data_id, &msg_desc)?;
+            let msg_gv = ctx
+                .module_mut()
+                .declare_data_in_func(msg_data_id, &mut builder.func);
+            let msg_ptr = builder.ins().global_value(ty, msg_gv);
+            let msg_len = builder.ins().iconst(ty, msg.len() as i64);
+            let sys_write = builder
+                .ins()
+                .iconst(ty, LinuxSyscalls::for_host().sys_write);
+            let stderr_fd = builder.ins().iconst(ty, 2);
+            let zero_arg = builder.ins().iconst(ty, 0);
+            builder.ins().call(
+                syscall_ref,
+                &[
+                    sys_write, stderr_fd, msg_ptr, msg_len, zero_arg, zero_arg, zero_arg,
+                ],
+            );
+            Ok(())
+        };
+
+        emit_log(
+            &mut builder,
+            &mut ctx,
+            "actor",
+            "lake: actor died — rt_allocate: heap exhausted\n",
+        )?;
+
+        // Return null fat-ptr.  Caller's next quantum boundary observes
+        // IS_DYING and bails to STOP_DONE.
+        let null = builder.ins().iconst(ty, 0);
+        builder.ins().return_(&[null]);
+
+        // ── init_exit_block: no actor to mark; this is a fatal init-time
+        //    allocation failure.  Best we can do is log + exit cleanly
+        //    instead of trapping with SIGILL.
+        builder.switch_to_block(init_exit_block);
+        builder.seal_block(init_exit_block);
+        let syscall_id_for_exit = match ctx.module().get_name("rt_syscall") {
+            Some(FuncOrDataId::Func(id)) => id,
+            _ => {
+                return Err(anyhow!(
+                    "rt_syscall must be declared before rt_allocate init-exit path"
+                ));
+            }
+        };
+        let syscall_ref_for_exit = ctx
+            .module_mut()
+            .declare_func_in_func(syscall_id_for_exit, &mut builder.func);
+        emit_log(
+            &mut builder,
+            &mut ctx,
+            "init",
+            "lake: init failed — rt_allocate exhausted before scheduler ready\n",
+        )?;
+        let sys_exit = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_exit);
+        let code = builder.ins().iconst(ty, 137); // 128 + SIGKILL convention
+        let zero_arg2 = builder.ins().iconst(ty, 0);
+        builder.ins().call(
+            syscall_ref_for_exit,
+            &[
+                sys_exit, code, zero_arg2, zero_arg2, zero_arg2, zero_arg2, zero_arg2,
+            ],
+        );
+        builder.ins().trap(TrapCode::user(0xDE).unwrap());
+
+        builder.switch_to_block(cont_block);
+        builder.seal_block(cont_block);
     } // end of raw OOM `else` branch — builder is now on cont_block.
     // Suppress unused-import warning when no other site references TrapCode.
     let _ = TrapCode::HEAP_OUT_OF_BOUNDS;
@@ -572,7 +571,11 @@ fn define_allocate_impl(
         // _ -> ... }` without an extra layer of unwrapping.
         let alloc_raw_id = match ctx.module().get_name("rt_allocate_raw") {
             Some(FuncOrDataId::Func(id)) => id,
-            _ => return Err(anyhow!("rt_allocate_raw missing for rt_allocate tuple wrap")),
+            _ => {
+                return Err(anyhow!(
+                    "rt_allocate_raw missing for rt_allocate tuple wrap"
+                ));
+            }
         };
         let alloc_raw_ref = ctx
             .module_mut()
@@ -582,8 +585,12 @@ fn define_allocate_impl(
         let tuple_fp = builder.inst_results(call)[0];
         let tuple_start = builder.ins().load(ty, MemFlags::trusted(), tuple_fp, 0);
         let ok_a = builder.ins().iconst(ty, atom_id("ok"));
-        builder.ins().store(MemFlags::trusted(), ok_a, tuple_start, 0);
-        builder.ins().store(MemFlags::trusted(), result, tuple_start, 8);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), ok_a, tuple_start, 0);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), result, tuple_start, 8);
         builder.ins().return_(&[tuple_fp]);
     } else {
         builder.ins().return_(&[result]);
@@ -614,9 +621,7 @@ pub fn define_free(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let free_list_id = match ctx.module().get_name("free_list_heads") {
         Some(FuncOrDataId::Data(id)) => id,
         _ => {
-            return Err(anyhow!(
-                "free_list_heads must be declared before rt_free"
-            ));
+            return Err(anyhow!("free_list_heads must be declared before rt_free"));
         }
     };
 
@@ -648,19 +653,13 @@ pub fn define_free(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .declare_func_in_func(munmap_id, &mut builder.func);
 
     // Read fat_ptr.start and fat_ptr.end to compute payload size.
-    let payload_start = builder
-        .ins()
-        .load(ty, MemFlags::trusted(), fat_ptr_addr, 0);
-    let payload_end = builder
-        .ins()
-        .load(ty, MemFlags::trusted(), fat_ptr_addr, 8);
+    let payload_start = builder.ins().load(ty, MemFlags::trusted(), fat_ptr_addr, 0);
+    let payload_end = builder.ins().load(ty, MemFlags::trusted(), fat_ptr_addr, 8);
     let size = builder.ins().isub(payload_end, payload_start);
 
     // bucket_idx = ceil(log2(max(size, 16))) - 4
     let sixteen = builder.ins().iconst(ty, 16);
-    let lt_min = builder
-        .ins()
-        .icmp(IntCC::UnsignedLessThan, size, sixteen);
+    let lt_min = builder.ins().icmp(IntCC::UnsignedLessThan, size, sixteen);
     let size_clamped = builder.ins().select(lt_min, sixteen, size);
     let size_minus_one = builder.ins().iadd_imm(size_clamped, -1);
     let lz = builder.ins().clz(size_minus_one);
@@ -702,9 +701,7 @@ pub fn define_free(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     builder.switch_to_block(huge_free_block);
     builder.seal_block(huge_free_block);
     let mmap_size = builder.ins().isub(payload_end, fat_ptr_addr);
-    builder
-        .ins()
-        .call(munmap_ref, &[fat_ptr_addr, mmap_size]);
+    builder.ins().call(munmap_ref, &[fat_ptr_addr, mmap_size]);
     builder.ins().return_(&[]);
 
     let sig = builder.func.signature.clone();
@@ -746,9 +743,7 @@ pub fn define_store(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let in_bounds = builder
         .ins()
         .icmp(IntCC::UnsignedLessThanOrEqual, access_end, end);
-    builder
-        .ins()
-        .trapz(in_bounds, TrapCode::unwrap_user(32));
+    builder.ins().trapz(in_bounds, TrapCode::unwrap_user(32));
 
     // Byte-by-byte store loop — write the LSB-first `size` bytes of
     // `val` to `access_ptr`.  Cranelift's plain `store` always emits
@@ -778,7 +773,9 @@ pub fn define_store(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     builder.seal_block(bloop_b);
     let shift_bits = builder.ins().imul_imm(i, 8);
     let shifted = builder.ins().ushr(val, shift_bits);
-    let byte = builder.ins().ireduce(cranelift::prelude::types::I8, shifted);
+    let byte = builder
+        .ins()
+        .ireduce(cranelift::prelude::types::I8, shifted);
     let dst = builder.ins().iadd(access_ptr, i);
     builder.ins().store(MemFlags::new(), byte, dst, 0);
     let i_next = builder.ins().iadd_imm(i, 1);
@@ -839,9 +836,7 @@ pub fn define_loads(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         let in_bounds = builder
             .ins()
             .icmp(IntCC::UnsignedLessThanOrEqual, access_end, end);
-        builder
-            .ins()
-            .trapz(in_bounds, TrapCode::unwrap_user(32));
+        builder.ins().trapz(in_bounds, TrapCode::unwrap_user(32));
 
         let raw_val = builder
             .ins()

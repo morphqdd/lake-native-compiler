@@ -73,9 +73,7 @@ pub fn compile(
     //    Big win for stdlib helpers that do many rt-calls per branch
     //    (set_be32 = 4 rt_store calls; init_k_table = 64 set_be32 calls;
     //    SHA-256 hot path uses these heavily).
-    if ctx.is_declared_rt_func_in_prog(callee_name)
-        && args.iter().all(|a| pure_expr::is_pure(a))
-    {
+    if ctx.is_declared_rt_func_in_prog(callee_name) && args.iter().all(|a| pure_expr::is_pure(a)) {
         return compile_fused_rt_call(
             ctx,
             builder,
@@ -126,9 +124,7 @@ pub fn compile(
 
         // #81 — inline rt_load_u64 / rt_store (scheduler-trusted).
         let ctx_ptr = builder.use_var(machine_ctx_var);
-        let exec_start = builder
-            .ins()
-            .load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
+        let exec_start = builder.ins().load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
         let arg_val = builder.ins().load(
             ptr_ty,
             MemFlags::trusted(),
@@ -141,9 +137,7 @@ pub fn compile(
             exec_start,
             ExecCtxLayout::JUMP_ARGS,
         );
-        let ja_start = builder
-            .ins()
-            .load(ptr_ty, MemFlags::trusted(), ja_fat, 0);
+        let ja_start = builder.ins().load(ptr_ty, MemFlags::trusted(), ja_fat, 0);
         builder.ins().store(
             MemFlags::trusted(),
             arg_val,
@@ -165,18 +159,14 @@ pub fn compile(
 
         // #81 — inline rt_load_u64 / rt_store (scheduler-trusted JUMP_ARGS).
         let ctx_ptr = builder.use_var(machine_ctx_var);
-        let exec_start = builder
-            .ins()
-            .load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
+        let exec_start = builder.ins().load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
         let ja_fat = builder.ins().load(
             ptr_ty,
             MemFlags::trusted(),
             exec_start,
             ExecCtxLayout::JUMP_ARGS,
         );
-        let ja_start = builder
-            .ins()
-            .load(ptr_ty, MemFlags::trusted(), ja_fat, 0);
+        let ja_start = builder.ins().load(ptr_ty, MemFlags::trusted(), ja_fat, 0);
 
         let mut arg_vals = Vec::with_capacity(args.len());
         for i in 0..args.len() {
@@ -255,10 +245,7 @@ pub fn compile(
         let callee_lake_type = {
             let raw = _ty.to_string();
             if raw == "?" {
-                state
-                    .lake_type_of(callee_name)
-                    .unwrap_or("?")
-                    .to_string()
+                state.lake_type_of(callee_name).unwrap_or("?").to_string()
             } else {
                 raw
             }
@@ -368,18 +355,14 @@ fn compile_fused_rt_call(
 
     // Load exec_start + vars_start once for fold.
     let ctx_ptr = builder.use_var(machine_ctx_var);
-    let exec_start = builder
-        .ins()
-        .load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
+    let exec_start = builder.ins().load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
     let vars_fat = builder.ins().load(
         ptr_ty,
         MemFlags::trusted(),
         exec_start,
         ExecCtxLayout::VARIABLES,
     );
-    let vars_start = builder
-        .ins()
-        .load(ptr_ty, MemFlags::trusted(), vars_fat, 0);
+    let vars_start = builder.ins().load(ptr_ty, MemFlags::trusted(), vars_fat, 0);
 
     // Fold each arg as a Value.
     let arg_vals: Vec<_> = args
@@ -428,7 +411,9 @@ fn compile_legacy_rt_call(
     // re-entered with these args.  This is a placeholder; in practice
     // park-aware rt-fns with all-pure args are rare (the actor's
     // pid is usually a Var or a let result).
-    bail!("park-aware rt-fn with all-pure args — not yet supported on fused path; rewrite to pin through a regular variable");
+    bail!(
+        "park-aware rt-fn with all-pure args — not yet supported on fused path; rewrite to pin through a regular variable"
+    );
 }
 
 /// Instead of the normal ~10-block staging pipeline (eval → TEMP_VAL → JUMP_ARGS
@@ -465,7 +450,12 @@ fn compile_fused_self_call(
     // 1. Load exec_start and vars_start once
     let ctx_ptr = builder.use_var(machine_ctx_var);
     let exec_start = builder.ins().load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
-    let vars_fp = builder.ins().load(ptr_ty, MemFlags::trusted(), exec_start, ExecCtxLayout::VARIABLES);
+    let vars_fp = builder.ins().load(
+        ptr_ty,
+        MemFlags::trusted(),
+        exec_start,
+        ExecCtxLayout::VARIABLES,
+    );
     let vars_start = builder.ins().load(ptr_ty, MemFlags::trusted(), vars_fp, 0);
 
     // 2. Compute ALL values first (before any stores).
@@ -478,27 +468,30 @@ fn compile_fused_self_call(
 
     // 3. Write all values directly to VARIABLES
     for (i, val) in values.iter().enumerate() {
-        builder.ins().store(MemFlags::trusted(), *val, vars_start, i as i32 * 8);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), *val, vars_start, i as i32 * 8);
     }
 
     // 4. Set BRANCH_ID — with guard dispatch if multiple branches share this hash.
     //    Skip the store when we KNOW we're staying in the same branch
     //    (single-candidate self-loop to current branch).
     let single_candidate = candidates.len() == 1;
-    let same_branch = single_candidate
-        && Some(candidates[0].branch_id) == ctx.current_branch_id();
+    let same_branch = single_candidate && Some(candidates[0].branch_id) == ctx.current_branch_id();
 
     let branch_id_val = if !single_candidate {
         let disc_pos = dispatch::find_first_guard_pos(&candidates);
-        let disc = builder.ins().load(
-            ptr_ty,
-            MemFlags::trusted(),
-            vars_start,
-            disc_pos as i32 * 8,
-        );
+        let disc = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), vars_start, disc_pos as i32 * 8);
         let namespace = ctx.next_dispatch_id();
         Some(dispatch::emit_guard_select(
-            ctx, builder, ptr_ty, &candidates, disc, namespace,
+            ctx,
+            builder,
+            ptr_ty,
+            &candidates,
+            disc,
+            namespace,
         )?)
     } else if !same_branch {
         Some(builder.ins().iconst(ptr_ty, candidates[0].branch_id as i64))
@@ -508,9 +501,12 @@ fn compile_fused_self_call(
     };
 
     if let Some(bid) = branch_id_val {
-        builder
-            .ins()
-            .store(MemFlags::trusted(), bid, exec_start, ExecCtxLayout::BRANCH_ID);
+        builder.ins().store(
+            MemFlags::trusted(),
+            bid,
+            exec_start,
+            ExecCtxLayout::BRANCH_ID,
+        );
     }
 
     // 5. Tail-self loop optimization: when self() loops back to the
@@ -551,13 +547,9 @@ fn compile_fused_self_call(
 
         // brif → branch_entry (skips machine_switch).
         // branch_entry reloads var-cache + dispatches via branch_switch.
-        builder.ins().brif(
-            exhausted,
-            yb,
-            &[BlockArg::Value(zero)],
-            bb,
-            &[],
-        );
+        builder
+            .ins()
+            .brif(exhausted, yb, &[BlockArg::Value(zero)], bb, &[]);
     } else {
         // Fallback: branch transition (different BRANCH_ID) or pre-Level-2
         // build — go through the full qb dispatch chain.

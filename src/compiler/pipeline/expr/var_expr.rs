@@ -38,15 +38,15 @@ pub fn compile(
     let store_ref = ctx.get_func(builder, "rt_store")?;
 
     // Load the variables fat ptr.
-    let vars_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::VARIABLES as i64);
+    let vars_offset = builder
+        .ins()
+        .iconst(ptr_ty, ExecCtxLayout::VARIABLES as i64);
     let vars_call = builder.ins().call(load_u64_ref, &[ctx_ptr, vars_offset]);
     let vars_ptr = builder.inst_results(vars_call)[0];
 
     // Load the value at vars[var_index].
     let var_offset = builder.ins().iconst(ptr_ty, var_index as i64 * 8);
-    let val_call = builder
-        .ins()
-        .call(load_u64_ref, &[vars_ptr, var_offset]);
+    let val_call = builder.ins().call(load_u64_ref, &[vars_ptr, var_offset]);
     let val = builder.inst_results(val_call)[0];
 
     // Store it in TEMP_VAL.

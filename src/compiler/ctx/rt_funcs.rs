@@ -86,11 +86,7 @@ impl RtFuncs {
         module.declare_func_in_func(self.allocate_raw, builder.func)
     }
 
-    pub fn free_ref(
-        &self,
-        module: &mut ObjectModule,
-        builder: &mut FunctionBuilder,
-    ) -> FuncRef {
+    pub fn free_ref(&self, module: &mut ObjectModule, builder: &mut FunctionBuilder) -> FuncRef {
         module.declare_func_in_func(self.free, builder.func)
     }
 }

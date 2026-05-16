@@ -182,9 +182,10 @@ pub fn fold_with_self(
     state: &BranchState,
 ) -> Value {
     match expr {
-        Expr::Num(s, _) => builder
-            .ins()
-            .iconst(ptr_ty, lake_frontend::api::expr::parse_int_literal(s).unwrap_or(0)),
+        Expr::Num(s, _) => builder.ins().iconst(
+            ptr_ty,
+            lake_frontend::api::expr::parse_int_literal(s).unwrap_or(0),
+        ),
         Expr::Bool(b) => builder.ins().iconst(ptr_ty, if *b { 1 } else { 0 }),
         Expr::Atom(name) => builder.ins().iconst(ptr_ty, atom_id(name)),
         Expr::TupleIndex { receiver, index } => {
@@ -210,8 +211,16 @@ pub fn fold_with_self(
         // Jump arm below).
         Expr::Index { receiver, index } => {
             use cranelift::prelude::types;
-            let recv_val = fold_with_self(&receiver.inner, builder, ptr_ty, vars_start, self_pid, state);
-            let idx_val = fold_with_self(&index.inner, builder, ptr_ty, vars_start, self_pid, state);
+            let recv_val = fold_with_self(
+                &receiver.inner,
+                builder,
+                ptr_ty,
+                vars_start,
+                self_pid,
+                state,
+            );
+            let idx_val =
+                fold_with_self(&index.inner, builder, ptr_ty, vars_start, self_pid, state);
             let start = builder.ins().load(ptr_ty, MemFlags::trusted(), recv_val, 0);
             let addr = builder.ins().iadd(start, idx_val);
             let raw = builder.ins().load(types::I8, MemFlags::trusted(), addr, 0);
@@ -223,7 +232,11 @@ pub fn fold_with_self(
         ),
         Expr::Var(name, _) => {
             let (_, slot) = state.get(name).expect("variable not found in state");
-            debug_assert!(slot < state.len(), "slot {slot} out of range {}", state.len());
+            debug_assert!(
+                slot < state.len(),
+                "slot {slot} out of range {}",
+                state.len()
+            );
             // Variable cache: if branch.rs already loaded this slot into
             // a Cranelift Variable at branch_entry, use_var picks it up
             // from a register instead of re-loading from memory.  For
@@ -233,7 +246,9 @@ pub fn fold_with_self(
                 builder.use_var(var)
             } else {
                 let vs = vars_start.expect("vars_start missing for Var node");
-                builder.ins().load(ptr_ty, MemFlags::trusted(), vs, slot as i32 * 8)
+                builder
+                    .ins()
+                    .load(ptr_ty, MemFlags::trusted(), vs, slot as i32 * 8)
             }
         }
         Expr::Add(l, r) => {
@@ -329,16 +344,23 @@ pub fn fold_with_self(
         Expr::Jump { ident, args } => {
             let callee = match ident.inner {
                 Expr::Var(name, _) => name,
-                _ => unreachable!("Jump in fold must have Var callee — is_pure should have rejected otherwise"),
+                _ => unreachable!(
+                    "Jump in fold must have Var callee — is_pure should have rejected otherwise"
+                ),
             };
             let size_ty = rt_load_size_ty(callee).unwrap_or_else(|| {
-                unreachable!("fold called on non-pure Jump to '{}'; is_pure mismatch", callee)
+                unreachable!(
+                    "fold called on non-pure Jump to '{}'; is_pure mismatch",
+                    callee
+                )
             });
 
             // Two args: fat_ptr_addr, offset.
             debug_assert_eq!(args.len(), 2, "{} takes 2 args (fat_ptr, offset)", callee);
-            let fp_val = fold_with_self(&args[0].inner, builder, ptr_ty, vars_start, self_pid, state);
-            let off_val = fold_with_self(&args[1].inner, builder, ptr_ty, vars_start, self_pid, state);
+            let fp_val =
+                fold_with_self(&args[0].inner, builder, ptr_ty, vars_start, self_pid, state);
+            let off_val =
+                fold_with_self(&args[1].inner, builder, ptr_ty, vars_start, self_pid, state);
 
             // Fat-ptr deref: start = *fat_ptr_addr.  Trusted because
             // we've already type-checked the buf type via the language
@@ -396,9 +418,12 @@ pub fn compile(
     let exec_start = builder.ins().load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
 
     let vars_start = if has_var(expr) {
-        let vars_fp = builder
-            .ins()
-            .load(ptr_ty, MemFlags::trusted(), exec_start, ExecCtxLayout::VARIABLES);
+        let vars_fp = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            exec_start,
+            ExecCtxLayout::VARIABLES,
+        );
         let start = builder.ins().load(ptr_ty, MemFlags::trusted(), vars_fp, 0);
         Some(start)
     } else {
@@ -422,9 +447,12 @@ pub fn compile(
 
     let result = fold_with_self(expr, builder, ptr_ty, vars_start, self_pid, state);
 
-    builder
-        .ins()
-        .store(MemFlags::trusted(), result, exec_start, ExecCtxLayout::TEMP_VAL);
+    builder.ins().store(
+        MemFlags::trusted(),
+        result,
+        exec_start,
+        ExecCtxLayout::TEMP_VAL,
+    );
 
     // #80 Level 2/3: emit exit unless we're mid-super-block.
     if !omit_exit {
@@ -462,13 +490,9 @@ pub fn emit_continue(
         let new_remaining = builder.ins().iadd_imm(remaining, -1);
         builder.def_var(qv, new_remaining);
         let exhausted = builder.ins().icmp_imm(IntCC::Equal, new_remaining, 0);
-        builder.ins().brif(
-            exhausted,
-            yb,
-            &[BlockArg::Value(next)],
-            ft,
-            &[],
-        );
+        builder
+            .ins()
+            .brif(exhausted, yb, &[BlockArg::Value(next)], ft, &[]);
         return;
     }
 

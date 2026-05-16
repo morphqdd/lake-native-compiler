@@ -66,10 +66,12 @@ pub fn compile(
     // Lazily load vars / self_pid because elements may reference both.
     let needs_vars = elems.iter().any(|e| references_var(e));
     let vars_start = if needs_vars {
-        let vars_fp =
-            builder
-                .ins()
-                .load(ptr_ty, MemFlags::trusted(), exec_start, ExecCtxLayout::VARIABLES);
+        let vars_fp = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            exec_start,
+            ExecCtxLayout::VARIABLES,
+        );
         Some(builder.ins().load(ptr_ty, MemFlags::trusted(), vars_fp, 0))
     } else {
         None
@@ -198,9 +200,7 @@ fn emit_string_fat_ptr(
         }
     };
 
-    let data_gv = ctx
-        .module_mut()
-        .declare_data_in_func(data_id, builder.func);
+    let data_gv = ctx.module_mut().declare_data_in_func(data_id, builder.func);
     let fat_ptr_gv = ctx
         .module_mut()
         .declare_data_in_func(fat_ptr_id, builder.func);

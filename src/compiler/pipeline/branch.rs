@@ -184,9 +184,12 @@ pub fn compile_branch(
     builder.switch_to_block(branch_entry_block);
     let exec_start = ctx.exec_start(builder, machine_ctx_var);
     let _ = named_slots;
-    let block_id_load = builder
-        .ins()
-        .load(ptr_ty, MemFlags::trusted(), exec_start, ExecCtxLayout::BLOCK_ID);
+    let block_id_load = builder.ins().load(
+        ptr_ty,
+        MemFlags::trusted(),
+        exec_start,
+        ExecCtxLayout::BLOCK_ID,
+    );
     builder
         .ins()
         .jump(branch_switch_block, &[BlockArg::Value(block_id_load)]);

@@ -1,9 +1,7 @@
 use anyhow::{Result, anyhow};
 use cranelift::{
     module::{FuncOrDataId, Linkage, Module},
-    prelude::{
-        AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder, IntCC, TrapCode,
-    },
+    prelude::{AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder, IntCC, TrapCode},
 };
 
 use crate::compiler::{ctx::CompilerCtx, rt::layout::FatPtrLayout};
@@ -45,15 +43,14 @@ pub fn define_write(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let in_bounds = builder
         .ins()
         .icmp(IntCC::UnsignedLessThanOrEqual, access_end, end);
-    builder
-        .ins()
-        .trapz(in_bounds, TrapCode::unwrap_user(32));
+    builder.ins().trapz(in_bounds, TrapCode::unwrap_user(32));
 
     let syscall_nr = builder.ins().iconst(ty, SYSCALL_WRITE);
     let zero = builder.ins().iconst(ty, 0);
-    builder
-        .ins()
-        .call(syscall_ref, &[syscall_nr, fd, start, size, zero, zero, zero]);
+    builder.ins().call(
+        syscall_ref,
+        &[syscall_nr, fd, start, size, zero, zero, zero],
+    );
     builder.ins().return_(&[]);
 
     let sig = builder.func.signature.clone();
@@ -112,6 +109,8 @@ pub fn define_write_static(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 fn get_syscall_id(ctx: &CompilerCtx) -> Result<cranelift::module::FuncId> {
     match ctx.module().get_name("rt_syscall") {
         Some(FuncOrDataId::Func(id)) => Ok(id),
-        _ => Err(anyhow!("rt_syscall must be declared before write functions")),
+        _ => Err(anyhow!(
+            "rt_syscall must be declared before write functions"
+        )),
     }
 }

@@ -188,17 +188,15 @@ impl ShedulerCtxLayout {
 
         let init_cap = builder.ins().iconst(ptr_ty, Self::INITIAL_QUEUE_CAP);
         let pid_cap_offset = builder.ins().iconst(ptr_ty, Self::PID_TABLE_CAP as i64);
-        builder.ins().call(
-            store_ref,
-            &[sh_ctx_ptr, init_cap, ptr_size, pid_cap_offset],
-        );
+        builder
+            .ins()
+            .call(store_ref, &[sh_ctx_ptr, init_cap, ptr_size, pid_cap_offset]);
 
         let one = builder.ins().iconst(ptr_ty, 1);
         let pid_len_offset = builder.ins().iconst(ptr_ty, Self::PID_TABLE_LEN as i64);
-        builder.ins().call(
-            store_ref,
-            &[sh_ctx_ptr, one, ptr_size, pid_len_offset],
-        );
+        builder
+            .ins()
+            .call(store_ref, &[sh_ctx_ptr, one, ptr_size, pid_len_offset]);
 
         // free_slots — stack of recycled slot indices (i64 each).
         let init_bytes = builder.ins().iconst(ptr_ty, Self::INITIAL_QUEUE_CAP * 8);
@@ -264,13 +262,10 @@ impl ShedulerCtxLayout {
         let aligned = builder.ins().imul_imm(new_len, 8);
         let call_slot = builder.ins().call(load_ref, &[free_slots, aligned]);
         let popped = builder.inst_results(call_slot)[0];
-        builder.ins().call(
-            store_ref,
-            &[sh_ctx_ptr, new_len, ptr_size, fs_len_off],
-        );
         builder
             .ins()
-            .jump(merge_block, &[BlockArg::Value(popped)]);
+            .call(store_ref, &[sh_ctx_ptr, new_len, ptr_size, fs_len_off]);
+        builder.ins().jump(merge_block, &[BlockArg::Value(popped)]);
 
         // ── fresh_block: slot = pid_table_len++ ─────────────────────────────
         builder.switch_to_block(fresh_block);
@@ -279,13 +274,10 @@ impl ShedulerCtxLayout {
         let call_pt_len = builder.ins().call(load_ref, &[sh_ctx_ptr, pt_len_off]);
         let cur_len = builder.inst_results(call_pt_len)[0];
         let next_len = builder.ins().iadd_imm(cur_len, 1);
-        builder.ins().call(
-            store_ref,
-            &[sh_ctx_ptr, next_len, ptr_size, pt_len_off],
-        );
         builder
             .ins()
-            .jump(merge_block, &[BlockArg::Value(cur_len)]);
+            .call(store_ref, &[sh_ctx_ptr, next_len, ptr_size, pt_len_off]);
+        builder.ins().jump(merge_block, &[BlockArg::Value(cur_len)]);
 
         builder.switch_to_block(merge_block);
         builder.seal_block(merge_block);
@@ -325,19 +317,13 @@ impl ShedulerCtxLayout {
             .load(ptr_ty, MemFlags::trusted(), sh_ctx_ptr, 0);
 
         // slot = pid_table_len; pid_table_len += 1
-        let slot = builder.ins().load(
-            ptr_ty,
-            MemFlags::trusted(),
-            sh_data,
-            Self::PID_TABLE_LEN,
-        );
+        let slot = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), sh_data, Self::PID_TABLE_LEN);
         let new_len = builder.ins().iadd_imm(slot, 1);
-        builder.ins().store(
-            MemFlags::trusted(),
-            new_len,
-            sh_data,
-            Self::PID_TABLE_LEN,
-        );
+        builder
+            .ins()
+            .store(MemFlags::trusted(), new_len, sh_data, Self::PID_TABLE_LEN);
 
         // Grow pid_table so the entry at slot fits (stride 8 = log_stride 3).
         let pid_table_fat = Self::emit_grow_array_if_full_strided(
@@ -390,12 +376,10 @@ impl ShedulerCtxLayout {
         let sh_data = builder
             .ins()
             .load(ptr_ty, MemFlags::trusted(), sh_ctx_ptr, 0);
-        let pid_table_fat = builder.ins().load(
-            ptr_ty,
-            MemFlags::trusted(),
-            sh_data,
-            Self::PID_TABLE_FAT,
-        );
+        let pid_table_fat =
+            builder
+                .ins()
+                .load(ptr_ty, MemFlags::trusted(), sh_data, Self::PID_TABLE_FAT);
         let pid_table = builder
             .ins()
             .load(ptr_ty, MemFlags::trusted(), pid_table_fat, 0);
@@ -434,12 +418,10 @@ impl ShedulerCtxLayout {
         let sh_data = builder
             .ins()
             .load(ptr_ty, MemFlags::trusted(), sh_ctx_ptr, 0);
-        let pid_table_fat = builder.ins().load(
-            ptr_ty,
-            MemFlags::trusted(),
-            sh_data,
-            Self::PID_TABLE_FAT,
-        );
+        let pid_table_fat =
+            builder
+                .ins()
+                .load(ptr_ty, MemFlags::trusted(), sh_data, Self::PID_TABLE_FAT);
         let pid_table = builder
             .ins()
             .load(ptr_ty, MemFlags::trusted(), pid_table_fat, 0);
@@ -619,7 +601,9 @@ impl ShedulerCtxLayout {
         let free_ref = rt_funcs.free_ref(ctx.module_mut(), builder);
 
         // Read EXEC_CTX (offset 8) from the ProcessCtx payload.
-        let exec_ctx_offset = builder.ins().iconst(ptr_ty, ProcessCtxLayout::EXEC_CTX as i64);
+        let exec_ctx_offset = builder
+            .ins()
+            .iconst(ptr_ty, ProcessCtxLayout::EXEC_CTX as i64);
         let call_exec = builder
             .ins()
             .call(load_ref, &[process_ctx_fat_ptr, exec_ctx_offset]);
@@ -636,22 +620,26 @@ impl ShedulerCtxLayout {
 
         // Read the three nested fat-ptrs from the ExecCtx payload before any
         // free, since freeing them clobbers their start fields.
-        let vars_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::VARIABLES as i64);
+        let vars_offset = builder
+            .ins()
+            .iconst(ptr_ty, ExecCtxLayout::VARIABLES as i64);
         let call_vars = builder
             .ins()
             .call(load_ref, &[exec_ctx_fat_ptr, vars_offset]);
         let vars_fat_ptr = builder.inst_results(call_vars)[0];
 
-        let args_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::JUMP_ARGS as i64);
+        let args_offset = builder
+            .ins()
+            .iconst(ptr_ty, ExecCtxLayout::JUMP_ARGS as i64);
         let call_args = builder
             .ins()
             .call(load_ref, &[exec_ctx_fat_ptr, args_offset]);
         let args_fat_ptr = builder.inst_results(call_args)[0];
 
-        let mb_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::MAILBOX_FAT as i64);
-        let call_mb = builder
+        let mb_offset = builder
             .ins()
-            .call(load_ref, &[exec_ctx_fat_ptr, mb_offset]);
+            .iconst(ptr_ty, ExecCtxLayout::MAILBOX_FAT as i64);
+        let call_mb = builder.ins().call(load_ref, &[exec_ctx_fat_ptr, mb_offset]);
         let mailbox_fat_ptr = builder.inst_results(call_mb)[0];
 
         // Mark the pid as dead in the table.  Future sends to this pid
@@ -662,9 +650,7 @@ impl ShedulerCtxLayout {
             _ => None,
         };
         if let Some(id) = sched_data_id {
-            let sched_gv = ctx
-                .module_mut()
-                .declare_data_in_func(id, &mut builder.func);
+            let sched_gv = ctx.module_mut().declare_data_in_func(id, &mut builder.func);
             let sh_ctx_ptr = builder.ins().global_value(ptr_ty, sched_gv);
             Self::clear_pid(sh_ctx_ptr, dead_pid, ctx, builder);
         }
@@ -755,12 +741,10 @@ impl ShedulerCtxLayout {
             .ins()
             .load(ptr_ty, MemFlags::trusted(), sh_ctx_ptr, 0);
 
-        let current_idx = builder.ins().load(
-            ptr_ty,
-            MemFlags::trusted(),
-            sh_data,
-            Self::CURRENT_PROCESS,
-        );
+        let current_idx =
+            builder
+                .ins()
+                .load(ptr_ty, MemFlags::trusted(), sh_data, Self::CURRENT_PROCESS);
         let current_aligned = builder.ins().imul_imm(current_idx, 8);
 
         let last_idx = builder.ins().load(
@@ -771,12 +755,10 @@ impl ShedulerCtxLayout {
         );
         let last_aligned = builder.ins().imul_imm(last_idx, 8);
 
-        let process_arr_fat = builder.ins().load(
-            ptr_ty,
-            MemFlags::trusted(),
-            sh_data,
-            Self::PROCESS_ARR_FAT,
-        );
+        let process_arr_fat =
+            builder
+                .ins()
+                .load(ptr_ty, MemFlags::trusted(), sh_data, Self::PROCESS_ARR_FAT);
         let process_arr = builder
             .ins()
             .load(ptr_ty, MemFlags::trusted(), process_arr_fat, 0);
@@ -836,12 +818,9 @@ impl ShedulerCtxLayout {
             .ins()
             .load(ptr_ty, MemFlags::trusted(), sh_ctx_ptr2, 0);
         let zero = builder.ins().iconst(ptr_ty, 0);
-        builder.ins().store(
-            MemFlags::trusted(),
-            zero,
-            sh_data2,
-            Self::CURRENT_PROCESS,
-        );
+        builder
+            .ins()
+            .store(MemFlags::trusted(), zero, sh_data2, Self::CURRENT_PROCESS);
         builder.ins().jump(loop_block, &[]);
 
         builder.switch_to_block(done_block);
@@ -914,9 +893,7 @@ impl ShedulerCtxLayout {
             .ins()
             .load(ptr_ty, MemFlags::trusted(), wait_arr_fat, 0);
         let slot_addr = builder.ins().iadd(wait_arr_start, aligned_index);
-        builder
-            .ins()
-            .store(MemFlags::trusted(), pid, slot_addr, 0);
+        builder.ins().store(MemFlags::trusted(), pid, slot_addr, 0);
 
         builder.ins().store(
             MemFlags::trusted(),
@@ -1015,9 +992,7 @@ impl ShedulerCtxLayout {
         // ── no_grow_block: pass old_fat through ─────────────────────────────
         builder.switch_to_block(no_grow_block);
         builder.seal_block(no_grow_block);
-        builder
-            .ins()
-            .jump(merge_block, &[BlockArg::Value(old_fat)]);
+        builder.ins().jump(merge_block, &[BlockArg::Value(old_fat)]);
 
         // ── grow_block: alloc 2× → copy → free → update fields ──────────────
         builder.switch_to_block(grow_block);
@@ -1033,9 +1008,7 @@ impl ShedulerCtxLayout {
         // align to 8 — `chunks = next_index << (log_stride - 3)`.
         let old_start = builder.ins().load(ptr_ty, MemFlags::trusted(), old_fat, 0);
         let new_start = builder.ins().load(ptr_ty, MemFlags::trusted(), new_fat, 0);
-        let chunks = builder
-            .ins()
-            .ishl_imm(next_index, log_stride - 3);
+        let chunks = builder.ins().ishl_imm(next_index, log_stride - 3);
 
         let copy_header = builder.create_block();
         let copy_body = builder.create_block();
@@ -1056,9 +1029,7 @@ impl ShedulerCtxLayout {
         let src_addr = builder.ins().iadd(old_start, off);
         let dst_addr = builder.ins().iadd(new_start, off);
         let val = builder.ins().load(ptr_ty, MemFlags::trusted(), src_addr, 0);
-        builder
-            .ins()
-            .store(MemFlags::trusted(), val, dst_addr, 0);
+        builder.ins().store(MemFlags::trusted(), val, dst_addr, 0);
         let i_next = builder.ins().iadd_imm(i, 1);
         builder.ins().jump(copy_header, &[BlockArg::Value(i_next)]);
 
@@ -1074,9 +1045,7 @@ impl ShedulerCtxLayout {
             .ins()
             .call(store_ref, &[sh_ctx_ptr, new_cap, ptr_size, cap_off_v]);
 
-        builder
-            .ins()
-            .jump(merge_block, &[BlockArg::Value(new_fat)]);
+        builder.ins().jump(merge_block, &[BlockArg::Value(new_fat)]);
 
         builder.switch_to_block(merge_block);
         builder.seal_block(merge_block);
@@ -1243,12 +1212,9 @@ impl ShedulerCtxLayout {
             .ins()
             .load(ptr_ty, MemFlags::trusted(), sh_ctx_ptr, 0);
 
-        let wait_arr = builder.ins().load(
-            ptr_ty,
-            MemFlags::trusted(),
-            sh_data,
-            Self::WAIT_ARR_FAT,
-        );
+        let wait_arr = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), sh_data, Self::WAIT_ARR_FAT);
 
         let last_waited_idx = builder.ins().load(
             ptr_ty,
@@ -1290,9 +1256,7 @@ impl ShedulerCtxLayout {
         // SSA values are visible in dominated successors so the reload
         // is redundant.  Inline the wait_arr fat-ptr deref + indexed
         // load to skip two rt_load_u64 function calls per scan step.
-        let wait_arr_start = builder
-            .ins()
-            .load(ptr_ty, MemFlags::trusted(), wait_arr, 0);
+        let wait_arr_start = builder.ins().load(ptr_ty, MemFlags::trusted(), wait_arr, 0);
         let aligned_i = builder.ins().imul_imm(i, 8);
         let entry_addr = builder.ins().iadd(wait_arr_start, aligned_i);
         let entry = builder
@@ -1349,10 +1313,9 @@ impl ShedulerCtxLayout {
         // Copy last → found
         let call_last_entry = builder.ins().call(load_ref, &[wait_arr, last_aligned]);
         let last_entry = builder.inst_results(call_last_entry)[0];
-        builder.ins().call(
-            store_ref,
-            &[wait_arr, last_entry, ptr_size, found_aligned],
-        );
+        builder
+            .ins()
+            .call(store_ref, &[wait_arr, last_entry, ptr_size, found_aligned]);
 
         // Zero last slot
         let zero = builder.ins().iconst(ptr_ty, 0);
@@ -1374,32 +1337,23 @@ impl ShedulerCtxLayout {
         let count_offset = builder
             .ins()
             .iconst(ptr_ty, Self::WAITED_PROCESS_COUNT as i64);
-        let call_wc = builder
-            .ins()
-            .call(load_ref, &[sh_ctx_ptr, count_offset]);
+        let call_wc = builder.ins().call(load_ref, &[sh_ctx_ptr, count_offset]);
         let waited_count = builder.inst_results(call_wc)[0];
         let new_wc = builder.ins().iadd_imm(waited_count, -1);
-        builder.ins().call(
-            store_ref,
-            &[sh_ctx_ptr, new_wc, ptr_size, count_offset],
-        );
+        builder
+            .ins()
+            .call(store_ref, &[sh_ctx_ptr, new_wc, ptr_size, count_offset]);
 
         // pid_val is a monotonic pid; look up the live proc_ctx fat-ptr
         // from the pid_table to enqueue into process_arr.  If the pid
         // was already cleared (dead actor), the lookup returns 0 and we
         // skip the enqueue — handled by the brif below.
         let proc_ctx = Self::lookup_proc_ctx(sh_ctx_ptr, pid_val, ctx, builder);
-        let lookup_ok = builder
-            .ins()
-            .icmp_imm(IntCC::NotEqual, proc_ctx, 0);
+        let lookup_ok = builder.ins().icmp_imm(IntCC::NotEqual, proc_ctx, 0);
         let enqueue_block = builder.create_block();
-        builder.ins().brif(
-            lookup_ok,
-            enqueue_block,
-            &[],
-            after_block,
-            &[],
-        );
+        builder
+            .ins()
+            .brif(lookup_ok, enqueue_block, &[], after_block, &[]);
         builder.switch_to_block(enqueue_block);
         builder.seal_block(enqueue_block);
         Self::new_process(sh_ctx_ptr, proc_ctx, ctx, builder)?;

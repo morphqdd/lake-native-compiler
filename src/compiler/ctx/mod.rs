@@ -221,7 +221,8 @@ impl CompilerCtx {
 
     /// Update the exact variable count for a branch after it has been compiled.
     pub fn update_branch_var_count(&mut self, machine: &str, branch_id: u128, var_count: usize) {
-        self.registry.update_var_count(machine, branch_id, var_count);
+        self.registry
+            .update_var_count(machine, branch_id, var_count);
     }
 
     pub fn machines(&self) -> impl Iterator<Item = &str> {
@@ -336,11 +337,7 @@ impl CompilerCtx {
     ///
     /// `machine_ctx_var` is passed for the fallback path.  When the cache is
     /// hot, this argument is unused.
-    pub fn exec_start(
-        &self,
-        builder: &mut FunctionBuilder,
-        machine_ctx_var: Variable,
-    ) -> Value {
+    pub fn exec_start(&self, builder: &mut FunctionBuilder, machine_ctx_var: Variable) -> Value {
         if let Some(var) = self.current_exec_start_var {
             builder.use_var(var)
         } else {
@@ -408,7 +405,11 @@ impl CompilerCtx {
         let ptr_ty = self.module.target_config().pointer_type();
         let mut module_ctx = self.module.make_context();
         module_ctx.func.signature.params.push(AbiParam::new(ptr_ty));
-        module_ctx.func.signature.returns.push(AbiParam::new(ptr_ty));
+        module_ctx
+            .func
+            .signature
+            .returns
+            .push(AbiParam::new(ptr_ty));
         let sig = module_ctx.func.signature.clone();
         self.module.declare_function(name, Linkage::Export, &sig)?;
         self.module.clear_context(&mut module_ctx);

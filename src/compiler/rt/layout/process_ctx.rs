@@ -59,10 +59,9 @@ impl ProcessCtxLayout {
         // mis-route the wake-up.
         let zero = builder.ins().iconst(ptr_ty, 0);
         let io_idx_offset = builder.ins().iconst(ptr_ty, Self::IO_PARKED_IDX as i64);
-        builder.ins().call(
-            store_ref,
-            &[process_ctx_ptr, zero, ptr_size, io_idx_offset],
-        );
+        builder
+            .ins()
+            .call(store_ref, &[process_ctx_ptr, zero, ptr_size, io_idx_offset]);
 
         Ok(process_ctx_ptr)
     }

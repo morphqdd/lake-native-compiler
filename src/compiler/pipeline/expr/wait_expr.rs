@@ -77,7 +77,7 @@ pub(crate) fn compile<'a>(
     struct HandlerMeta {
         arg_count: usize,
         var_base: usize,
-        guard_i64: Option<i64>,   // None = wildcard (default case)
+        guard_i64: Option<i64>, // None = wildcard (default case)
     }
 
     let handler_var_base_start = state.len();
@@ -112,7 +112,11 @@ pub(crate) fn compile<'a>(
             handler_var_base_start
         };
 
-        handlers.push(HandlerMeta { arg_count, var_base, guard_i64: guard });
+        handlers.push(HandlerMeta {
+            arg_count,
+            var_base,
+            guard_i64: guard,
+        });
     }
 
     // arg_count used for dequeue = largest across all handlers
@@ -213,7 +217,9 @@ pub(crate) fn compile<'a>(
         let head = ExecCtxLayout::load(builder, ptr_ty, exec_start, ExecCtxLayout::MAILBOX_HEAD);
         let tail = ExecCtxLayout::load(builder, ptr_ty, exec_start, ExecCtxLayout::MAILBOX_TAIL);
         let has_msg = builder.ins().icmp(IntCC::NotEqual, head, tail);
-        builder.ins().brif(has_msg, dequeue_block, &[], suspend_block, &[]);
+        builder
+            .ins()
+            .brif(has_msg, dequeue_block, &[], suspend_block, &[]);
     }
 
     // dispatch_block takes the message's first arg as a block parameter
@@ -230,7 +236,8 @@ pub(crate) fn compile<'a>(
         let ctx_ptr = builder.use_var(machine_ctx_var);
         let exec_start = builder.ins().load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
 
-        let mailbox_fat = ExecCtxLayout::load(builder, ptr_ty, exec_start, ExecCtxLayout::MAILBOX_FAT);
+        let mailbox_fat =
+            ExecCtxLayout::load(builder, ptr_ty, exec_start, ExecCtxLayout::MAILBOX_FAT);
         let head = ExecCtxLayout::load(builder, ptr_ty, exec_start, ExecCtxLayout::MAILBOX_HEAD);
         // Inlined fat-ptr deref: scheduler-owned mailbox, no bounds check.
         let mailbox_start = builder
@@ -243,25 +250,14 @@ pub(crate) fn compile<'a>(
             let msg_index_mod = builder.ins().band_imm(head, 255);
             let msg_offset = builder.ins().imul_imm(msg_index_mod, 8);
             let addr = builder.ins().iadd(mailbox_start, msg_offset);
-            Some(
-                builder
-                    .ins()
-                    .load(ptr_ty, MemFlags::trusted(), addr, 0),
-            )
+            Some(builder.ins().load(ptr_ty, MemFlags::trusted(), addr, 0))
         } else {
             None
         };
 
         // Dequeue args into VARIABLES (inlined deref).
-        let vars_fat = ExecCtxLayout::load(
-            builder,
-            ptr_ty,
-            exec_start,
-            ExecCtxLayout::VARIABLES,
-        );
-        let vars_ptr = builder
-            .ins()
-            .load(ptr_ty, MemFlags::trusted(), vars_fat, 0);
+        let vars_fat = ExecCtxLayout::load(builder, ptr_ty, exec_start, ExecCtxLayout::VARIABLES);
+        let vars_ptr = builder.ins().load(ptr_ty, MemFlags::trusted(), vars_fat, 0);
 
         // Use the wildcard handler's var_base for dequeue destination
         let dequeue_var_base = handlers
@@ -275,9 +271,7 @@ pub(crate) fn compile<'a>(
             let msg_index_mod = builder.ins().band_imm(msg_index, 255);
             let msg_offset = builder.ins().imul_imm(msg_index_mod, 8);
             let src_addr = builder.ins().iadd(mailbox_start, msg_offset);
-            let msg_val = builder
-                .ins()
-                .load(ptr_ty, MemFlags::trusted(), src_addr, 0);
+            let msg_val = builder.ins().load(ptr_ty, MemFlags::trusted(), src_addr, 0);
 
             builder.ins().store(
                 MemFlags::trusted(),
@@ -291,12 +285,16 @@ pub(crate) fn compile<'a>(
         // Advance HEAD
         let new_head = builder.ins().iadd_imm(head, dequeue_arg_count as i64);
         let new_head_mod = builder.ins().band_imm(new_head, 255);
-        ExecCtxLayout::store(builder, new_head_mod, exec_start, ExecCtxLayout::MAILBOX_HEAD);
+        ExecCtxLayout::store(
+            builder,
+            new_head_mod,
+            exec_start,
+            ExecCtxLayout::MAILBOX_HEAD,
+        );
 
         // Discriminant value passed to dispatch_block.  Zero placeholder
         // when no discriminant was loaded (no guards, no filter).
-        let disc_for_dispatch = discriminant
-            .unwrap_or_else(|| builder.ins().iconst(ptr_ty, 0));
+        let disc_for_dispatch = discriminant.unwrap_or_else(|| builder.ins().iconst(ptr_ty, 0));
 
         // Filter check (only when `wait <pid>* { ... }` had filter pids).
         // For each filter expression, fold its value at runtime and
@@ -413,5 +411,7 @@ pub(crate) fn compile<'a>(
     // Register wait_check in the branch switch
     branch_switch.set_entry(block_id as u128, wait_check_block);
 
-    Ok(StmtOutcome::Wait { next_avaitlable: after_wait_id })
+    Ok(StmtOutcome::Wait {
+        next_avaitlable: after_wait_id,
+    })
 }

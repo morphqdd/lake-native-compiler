@@ -176,7 +176,10 @@ fn accepts_entry(expr: &Expr<'_>) -> bool {
     if pure_expr::is_pure(expr) {
         return true;
     }
-    if let Expr::Let { default: Some(d), .. } = expr {
+    if let Expr::Let {
+        default: Some(d), ..
+    } = expr
+    {
         return pure_expr::is_pure(&d.inner);
     }
     false
@@ -335,8 +338,8 @@ pub fn compile_expr(
             // we synthesize a Jump and route through the standard
             // jump_expr machinery so arg staging + return-via-TEMP_VAL
             // work uniformly.
-            use lake_frontend::api::ast::{Ident, Type as AstType};
             use chumsky::span::Spanned;
+            use lake_frontend::api::ast::{Ident, Type as AstType};
             let span: chumsky::span::SimpleSpan = (0..0).into();
             let callee = Expr::Var(
                 "rt_load_u8",

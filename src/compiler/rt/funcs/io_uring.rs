@@ -12,8 +12,8 @@ use cranelift::{
     codegen::ir::{BlockArg, StackSlot, StackSlotData, StackSlotKind},
     module::{FuncOrDataId, Linkage, Module},
     prelude::{
-        AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder, IntCC, MemFlags,
-        TrapCode, Value, types,
+        AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder, IntCC, MemFlags, TrapCode,
+        Value, types,
     },
 };
 
@@ -88,14 +88,22 @@ pub fn define_io_uring_setup(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
     let syscall_id = match ctx.module().get_name("rt_syscall") {
         Some(FuncOrDataId::Func(id)) => id,
-        _ => return Err(anyhow!("rt_syscall must be declared before rt_io_uring_setup")),
+        _ => {
+            return Err(anyhow!(
+                "rt_syscall must be declared before rt_io_uring_setup"
+            ));
+        }
     };
     // Use `_raw` — io_uring's params struct is fully overwritten right
     // after allocation, and user-facing `rt_allocate` now returns a
     // tuple `{atom buf}` which this internal site cannot consume.
     let allocate_id = match ctx.module().get_name("rt_allocate_raw") {
         Some(FuncOrDataId::Func(id)) => id,
-        _ => return Err(anyhow!("rt_allocate_raw must be declared before rt_io_uring_setup")),
+        _ => {
+            return Err(anyhow!(
+                "rt_allocate_raw must be declared before rt_io_uring_setup"
+            ));
+        }
     };
     let free_id = match ctx.module().get_name("rt_free") {
         Some(FuncOrDataId::Func(id)) => id,
@@ -103,7 +111,11 @@ pub fn define_io_uring_setup(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     };
     let store_id = match ctx.module().get_name("rt_store") {
         Some(FuncOrDataId::Func(id)) => id,
-        _ => return Err(anyhow!("rt_store must be declared before rt_io_uring_setup")),
+        _ => {
+            return Err(anyhow!(
+                "rt_store must be declared before rt_io_uring_setup"
+            ));
+        }
     };
 
     let mut builder_ctx = FunctionBuilderContext::new();
@@ -176,15 +188,14 @@ pub fn define_io_uring_setup(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     const RETRY_DELAY_NS: i64 = 5_000_000; // 5 ms
 
     // Stack-allocated timespec { tv_sec=0, tv_nsec=5_000_000 } for nanosleep.
-    let ts_slot = builder.create_sized_stack_slot(StackSlotData::new(
-        StackSlotKind::ExplicitSlot,
-        16,
-        4,
-    ));
+    let ts_slot =
+        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 4));
     let ts_addr = builder.ins().stack_addr(ty, ts_slot, 0);
     builder.ins().store(MemFlags::trusted(), zero64, ts_addr, 0);
     let nsec_val = builder.ins().iconst(ty, RETRY_DELAY_NS);
-    builder.ins().store(MemFlags::trusted(), nsec_val, ts_addr, 8);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), nsec_val, ts_addr, 8);
 
     let try_block = builder.create_block();
     builder.append_block_param(try_block, ty); // remaining retries
@@ -195,11 +206,15 @@ pub fn define_io_uring_setup(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     builder.append_block_param(ok_block, ty); // fd
 
     let max_retries = builder.ins().iconst(ty, MAX_RETRIES);
-    builder.ins().jump(try_block, &[BlockArg::Value(max_retries)]);
+    builder
+        .ins()
+        .jump(try_block, &[BlockArg::Value(max_retries)]);
 
     builder.switch_to_block(try_block);
     let remaining = builder.block_params(try_block)[0];
-    let nr = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_io_uring_setup);
+    let nr = builder
+        .ins()
+        .iconst(ty, LinuxSyscalls::for_host().sys_io_uring_setup);
     let entries = builder.ins().iconst(ty, RING_ENTRIES);
     let call_setup = builder.ins().call(
         syscall_ref,
@@ -219,7 +234,9 @@ pub fn define_io_uring_setup(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
     builder.switch_to_block(retry_block);
     let remaining_rb = builder.block_params(retry_block)[0];
-    let has_retries = builder.ins().icmp_imm(IntCC::SignedGreaterThan, remaining_rb, 0);
+    let has_retries = builder
+        .ins()
+        .icmp_imm(IntCC::SignedGreaterThan, remaining_rb, 0);
     let do_sleep_block = builder.create_block();
     builder
         .ins()
@@ -227,7 +244,9 @@ pub fn define_io_uring_setup(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
     builder.switch_to_block(do_sleep_block);
     builder.seal_block(do_sleep_block);
-    let nano_nr = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_nanosleep);
+    let nano_nr = builder
+        .ins()
+        .iconst(ty, LinuxSyscalls::for_host().sys_nanosleep);
     builder.ins().call(
         syscall_ref,
         &[nano_nr, ts_addr, zero64, zero64, zero64, zero64, zero64],
@@ -253,7 +272,8 @@ pub fn define_io_uring_setup(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
     // ── 4. Read sizes + offsets from params ──────────────────────────────────
     let load_u32 = |b: &mut FunctionBuilder, off: i32| -> cranelift::prelude::Value {
-        b.ins().load(types::I32, MemFlags::trusted(), params_start, off)
+        b.ins()
+            .load(types::I32, MemFlags::trusted(), params_start, off)
     };
     let sq_entries = load_u32(&mut builder, PARAMS_OFF_SQ_ENTRIES);
     let cq_entries = load_u32(&mut builder, PARAMS_OFF_CQ_ENTRIES);
@@ -311,7 +331,15 @@ pub fn define_io_uring_setup(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let off_sqes = builder.ins().iconst(ty, IORING_OFF_SQES);
     let call_sqes = builder.ins().call(
         syscall_ref,
-        &[nr_mmap, zero64, sqe_array_len, prot, flags_mmap, fd, off_sqes],
+        &[
+            nr_mmap,
+            zero64,
+            sqe_array_len,
+            prot,
+            flags_mmap,
+            fd,
+            off_sqes,
+        ],
     );
     let sqe_array_ptr = builder.inst_results(call_sqes)[0];
 
@@ -397,7 +425,11 @@ pub fn define_io_uring_flush(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
     let syscall_id = match ctx.module().get_name("rt_syscall") {
         Some(FuncOrDataId::Func(id)) => id,
-        _ => return Err(anyhow!("rt_syscall must be declared before rt_io_uring_flush")),
+        _ => {
+            return Err(anyhow!(
+                "rt_syscall must be declared before rt_io_uring_flush"
+            ));
+        }
     };
     let sched_fat_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
         Some(FuncOrDataId::Data(id)) => id,
@@ -419,9 +451,7 @@ pub fn define_io_uring_flush(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .module_mut()
         .declare_data_in_func(sched_fat_id, &mut builder.func);
     let sh_ctx_fat = builder.ins().global_value(ty, sched_gv);
-    let sh_ctx_start = builder
-        .ins()
-        .load(ty, MemFlags::trusted(), sh_ctx_fat, 0);
+    let sh_ctx_start = builder.ins().load(ty, MemFlags::trusted(), sh_ctx_fat, 0);
 
     let pending = builder.ins().load(
         ty,
@@ -444,7 +474,9 @@ pub fn define_io_uring_flush(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         sh_ctx_start,
         ShedulerCtxLayout::IO_URING_FD,
     );
-    let nr_enter = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_io_uring_enter);
+    let nr_enter = builder
+        .ins()
+        .iconst(ty, LinuxSyscalls::for_host().sys_io_uring_enter);
     let zero64 = builder.ins().iconst(ty, 0);
     let _ = builder.ins().call(
         syscall_ref,
@@ -534,15 +566,11 @@ pub fn define_write_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let in_bounds = builder
         .ins()
         .icmp(IntCC::UnsignedLessThanOrEqual, access_end, end);
-    builder
-        .ins()
-        .trapz(in_bounds, TrapCode::unwrap_user(32));
+    builder.ins().trapz(in_bounds, TrapCode::unwrap_user(32));
 
     // ── Load resolved ring pointers from sh_ctx ──────────────────────────────
     // sh_ctx_fat is a fat-ptr address; deref once to get raw sh_ctx start.
-    let sh_ctx_start = builder
-        .ins()
-        .load(ty, MemFlags::trusted(), sh_ctx_fat, 0);
+    let sh_ctx_start = builder.ins().load(ty, MemFlags::trusted(), sh_ctx_fat, 0);
     let load_field = |b: &mut FunctionBuilder, off: i32| -> cranelift::prelude::Value {
         b.ins().load(ty, MemFlags::trusted(), sh_ctx_start, off)
     };
@@ -584,9 +612,7 @@ pub fn define_write_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .ins()
         .store(MemFlags::trusted(), opcode, sqe_addr, 0);
     let fd32 = builder.ins().ireduce(types::I32, fd);
-    builder
-        .ins()
-        .store(MemFlags::trusted(), fd32, sqe_addr, 4);
+    builder.ins().store(MemFlags::trusted(), fd32, sqe_addr, 4);
     builder
         .ins()
         .store(MemFlags::trusted(), start, sqe_addr, 16);
@@ -609,8 +635,9 @@ pub fn define_write_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         sh_ctx_start,
         ShedulerCtxLayout::PROCESS_ARR_FAT,
     );
-    let proc_arr_start_for_ud =
-        builder.ins().load(ty, MemFlags::trusted(), proc_arr_fat_for_ud, 0);
+    let proc_arr_start_for_ud = builder
+        .ins()
+        .load(ty, MemFlags::trusted(), proc_arr_fat_for_ud, 0);
     let cur_off = builder.ins().ishl_imm(cur_idx, 3);
     let cur_addr = builder.ins().iadd(proc_arr_start_for_ud, cur_off);
     let cur_proc_ctx = builder.ins().load(ty, MemFlags::trusted(), cur_addr, 0);
@@ -621,9 +648,7 @@ pub fn define_write_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     // SQ.array[idx] = idx — the indirect submission queue.
     let arr_offset = builder.ins().ishl_imm(idx, 2);
     let arr_slot = builder.ins().iadd(sq_array_ptr, arr_offset);
-    builder
-        .ins()
-        .store(MemFlags::trusted(), idx32, arr_slot, 0);
+    builder.ins().store(MemFlags::trusted(), idx32, arr_slot, 0);
 
     // Advance SQ.tail with a release store.  On x86-64 the syscall (when one
     // fires below) acts as the full barrier; the userspace-only path leaves
@@ -641,9 +666,11 @@ pub fn define_write_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .load(ty, MemFlags::trusted(), sh_ctx_start, pending_off);
     let pending_next = builder.ins().iadd_imm(pending, 1);
 
-    let batch_full = builder
-        .ins()
-        .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, pending_next, SQE_BATCH_SIZE);
+    let batch_full = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThanOrEqual,
+        pending_next,
+        SQE_BATCH_SIZE,
+    );
 
     let flush_block = builder.create_block();
     let no_flush_block = builder.create_block();
@@ -655,10 +682,20 @@ pub fn define_write_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     // ── flush_block: io_uring_enter(fd, pending_next, 0, 0); pending = 0 ────
     builder.switch_to_block(flush_block);
     builder.seal_block(flush_block);
-    let nr_enter = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_io_uring_enter);
+    let nr_enter = builder
+        .ins()
+        .iconst(ty, LinuxSyscalls::for_host().sys_io_uring_enter);
     let _ = builder.ins().call(
         syscall_ref,
-        &[nr_enter, ring_fd, pending_next, zero64, zero64, zero64, zero64],
+        &[
+            nr_enter,
+            ring_fd,
+            pending_next,
+            zero64,
+            zero64,
+            zero64,
+            zero64,
+        ],
     );
     builder
         .ins()
@@ -706,9 +743,7 @@ fn emit_wake_by_user_data(
     let nonzero = builder.ins().icmp_imm(IntCC::NotEqual, user_data, 0);
     let wake_block = builder.create_block();
     let wake_done = builder.create_block();
-    builder
-        .ins()
-        .brif(nonzero, wake_block, &[], wake_done, &[]);
+    builder.ins().brif(nonzero, wake_block, &[], wake_done, &[]);
 
     builder.switch_to_block(wake_block);
     builder.seal_block(wake_block);
@@ -761,7 +796,9 @@ fn emit_wake_by_user_data(
     let same = builder.ins().icmp(IntCC::Equal, match_idx, last_idx);
     let fix_idx_block = builder.create_block();
     let fix_idx_done = builder.create_block();
-    builder.ins().brif(same, fix_idx_done, &[], fix_idx_block, &[]);
+    builder
+        .ins()
+        .brif(same, fix_idx_done, &[], fix_idx_block, &[]);
 
     builder.switch_to_block(fix_idx_block);
     builder.seal_block(fix_idx_block);
@@ -866,7 +903,11 @@ pub fn define_io_uring_wait_cqe(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
     let syscall_id = match ctx.module().get_name("rt_syscall") {
         Some(FuncOrDataId::Func(id)) => id,
-        _ => return Err(anyhow!("rt_syscall must be declared before rt_io_uring_wait_cqe")),
+        _ => {
+            return Err(anyhow!(
+                "rt_syscall must be declared before rt_io_uring_wait_cqe"
+            ));
+        }
     };
     let sched_fat_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
         Some(FuncOrDataId::Data(id)) => id,
@@ -905,14 +946,15 @@ pub fn define_io_uring_wait_cqe(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
     // io_uring_enter(fd, to_submit=pending, min_complete=1,
     //                flags=IORING_ENTER_GETEVENTS)
-    let nr = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_io_uring_enter);
+    let nr = builder
+        .ins()
+        .iconst(ty, LinuxSyscalls::for_host().sys_io_uring_enter);
     let zero = builder.ins().iconst(ty, 0);
     let one = builder.ins().iconst(ty, 1);
     let flags = builder.ins().iconst(ty, 1); // IORING_ENTER_GETEVENTS = 1
-    let _ = builder.ins().call(
-        syscall_ref,
-        &[nr, ring_fd, pending, one, flags, zero, zero],
-    );
+    let _ = builder
+        .ins()
+        .call(syscall_ref, &[nr, ring_fd, pending, one, flags, zero, zero]);
     builder.ins().store(
         MemFlags::trusted(),
         zero,
@@ -1106,9 +1148,7 @@ pub fn define_io_uring_poll_cq(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .module_mut()
         .declare_data_in_func(sched_fat_id, &mut builder.func);
     let sh_ctx_fat = builder.ins().global_value(ty, sched_gv);
-    let sh_ctx_start = builder
-        .ins()
-        .load(ty, MemFlags::trusted(), sh_ctx_fat, 0);
+    let sh_ctx_start = builder.ins().load(ty, MemFlags::trusted(), sh_ctx_fat, 0);
 
     let cq_head_ptr = builder.ins().load(
         ty,
@@ -1150,9 +1190,7 @@ pub fn define_io_uring_poll_cq(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let head_init = builder
         .ins()
         .load(types::I32, MemFlags::trusted(), cq_head_ptr, 0);
-    builder
-        .ins()
-        .jump(loop_hdr, &[BlockArg::Value(head_init)]);
+    builder.ins().jump(loop_hdr, &[BlockArg::Value(head_init)]);
 
     builder.switch_to_block(loop_hdr);
     let head = builder.block_params(loop_hdr)[0];
@@ -1178,9 +1216,7 @@ pub fn define_io_uring_poll_cq(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     emit_wake_by_user_data(sh_ctx_start, user_data, res, ty, &mut builder);
 
     let head_next = builder.ins().iadd_imm(head, 1);
-    builder
-        .ins()
-        .jump(loop_hdr, &[BlockArg::Value(head_next)]);
+    builder.ins().jump(loop_hdr, &[BlockArg::Value(head_next)]);
     builder.seal_block(loop_hdr);
 
     builder.switch_to_block(loop_exit);
@@ -1224,8 +1260,8 @@ pub fn define_listen_tcp(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     // sockaddr_in is 16 B; optval (int=1 for SO_REUSEADDR) is 4 B.  Allocate
     // a single 32 B explicit stack slot — first 16 B = sockaddr, last 16 B
     // for optval (only the leading 4 B used).
-    let scratch: StackSlot = builder
-        .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 32, 4));
+    let scratch: StackSlot =
+        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 32, 4));
 
     let entry = builder.create_block();
     builder.append_block_param(entry, ty);
@@ -1245,9 +1281,7 @@ pub fn define_listen_tcp(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
     // Zero the 32 B scratch.
     for off in (0..32).step_by(8) {
-        builder
-            .ins()
-            .store(MemFlags::trusted(), zero, sa_addr, off);
+        builder.ins().store(MemFlags::trusted(), zero, sa_addr, off);
     }
 
     // sockaddr_in:
@@ -1269,12 +1303,12 @@ pub fn define_listen_tcp(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
     // optval = (int)1
     let one32 = builder.ins().iconst(types::I32, 1);
-    builder
-        .ins()
-        .store(MemFlags::trusted(), one32, opt_addr, 0);
+    builder.ins().store(MemFlags::trusted(), one32, opt_addr, 0);
 
     // socket(AF_INET, SOCK_STREAM, 0) → fd
-    let nr_socket = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_socket);
+    let nr_socket = builder
+        .ins()
+        .iconst(ty, LinuxSyscalls::for_host().sys_socket);
     let af = builder.ins().iconst(ty, AF_INET);
     let sock_stream = builder.ins().iconst(ty, SOCK_STREAM);
     let call_sock = builder.ins().call(
@@ -1282,11 +1316,15 @@ pub fn define_listen_tcp(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         &[nr_socket, af, sock_stream, zero, zero, zero, zero],
     );
     let fd = builder.inst_results(call_sock)[0];
-    let fd_ok = builder.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, fd, 0);
+    let fd_ok = builder
+        .ins()
+        .icmp_imm(IntCC::SignedGreaterThanOrEqual, fd, 0);
     builder.ins().trapz(fd_ok, TrapCode::unwrap_user(50));
 
     // setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &1, 4)
-    let nr_setsockopt = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_setsockopt);
+    let nr_setsockopt = builder
+        .ins()
+        .iconst(ty, LinuxSyscalls::for_host().sys_setsockopt);
     let sol = builder.ins().iconst(ty, SOL_SOCKET);
     let reuse = builder.ins().iconst(ty, SO_REUSEADDR);
     let four = builder.ins().iconst(ty, 4);
@@ -1303,11 +1341,15 @@ pub fn define_listen_tcp(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         &[nr_bind, fd, sa_addr, sixteen, zero, zero, zero],
     );
     let bind_rc = builder.inst_results(call_bind)[0];
-    let bind_ok = builder.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, bind_rc, 0);
+    let bind_ok = builder
+        .ins()
+        .icmp_imm(IntCC::SignedGreaterThanOrEqual, bind_rc, 0);
     builder.ins().trapz(bind_ok, TrapCode::unwrap_user(51));
 
     // listen(fd, 4096)
-    let nr_listen = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_listen);
+    let nr_listen = builder
+        .ins()
+        .iconst(ty, LinuxSyscalls::for_host().sys_listen);
     let backlog = builder.ins().iconst(ty, 4096);
     let _ = builder.ins().call(
         syscall_ref,
@@ -1351,7 +1393,9 @@ pub fn define_close(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let syscall_ref = ctx
         .module_mut()
         .declare_func_in_func(syscall_id, &mut builder.func);
-    let nr = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_close);
+    let nr = builder
+        .ins()
+        .iconst(ty, LinuxSyscalls::for_host().sys_close);
     let zero = builder.ins().iconst(ty, 0);
     let _ = builder
         .ins()
@@ -1430,9 +1474,7 @@ fn emit_submit_sqe(
         .ins()
         .store(MemFlags::trusted(), opcode, sqe_addr, 0);
     let fd32 = builder.ins().ireduce(types::I32, fd);
-    builder
-        .ins()
-        .store(MemFlags::trusted(), fd32, sqe_addr, 4);
+    builder.ins().store(MemFlags::trusted(), fd32, sqe_addr, 4);
     builder
         .ins()
         .store(MemFlags::trusted(), addr_ext, sqe_addr, 16);
@@ -1465,9 +1507,7 @@ fn emit_submit_sqe(
     // SQ.array[idx] = idx
     let arr_off = builder.ins().ishl_imm(idx, 2);
     let arr_slot = builder.ins().iadd(sq_array_ptr, arr_off);
-    builder
-        .ins()
-        .store(MemFlags::trusted(), idx32, arr_slot, 0);
+    builder.ins().store(MemFlags::trusted(), idx32, arr_slot, 0);
 
     let new_tail = builder.ins().iadd_imm(tail, 1);
     builder
@@ -1507,7 +1547,11 @@ pub fn define_accept_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
     let syscall_id = match ctx.module().get_name("rt_syscall") {
         Some(FuncOrDataId::Func(id)) => id,
-        _ => return Err(anyhow!("rt_syscall must be declared before rt_accept_async")),
+        _ => {
+            return Err(anyhow!(
+                "rt_syscall must be declared before rt_accept_async"
+            ));
+        }
     };
     let sched_fat_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
         Some(FuncOrDataId::Data(id)) => id,
@@ -1515,7 +1559,11 @@ pub fn define_accept_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     };
     let park_id = match ctx.module().get_name("rt_io_park_current") {
         Some(FuncOrDataId::Func(id)) => id,
-        _ => return Err(anyhow!("rt_io_park_current must be declared before rt_accept_async")),
+        _ => {
+            return Err(anyhow!(
+                "rt_io_park_current must be declared before rt_accept_async"
+            ));
+        }
     };
 
     let mut builder_ctx = FunctionBuilderContext::new();
@@ -1545,7 +1593,15 @@ pub fn define_accept_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
     let zero = builder.ins().iconst(ty, 0);
 
-    emit_submit_sqe(sh_ctx_start, IORING_OP_ACCEPT, fd, zero, zero, ty, &mut builder);
+    emit_submit_sqe(
+        sh_ctx_start,
+        IORING_OP_ACCEPT,
+        fd,
+        zero,
+        zero,
+        ty,
+        &mut builder,
+    );
 
     // No explicit io_uring_enter — emit_submit_sqe bumped SQE_PENDING; the
     // scheduler's combined wait+submit on its next park-tick will fold this
@@ -1590,7 +1646,11 @@ pub fn define_send_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     };
     let park_id = match ctx.module().get_name("rt_io_park_current") {
         Some(FuncOrDataId::Func(id)) => id,
-        _ => return Err(anyhow!("rt_io_park_current must be declared before rt_send_async")),
+        _ => {
+            return Err(anyhow!(
+                "rt_io_park_current must be declared before rt_send_async"
+            ));
+        }
     };
 
     let mut builder_ctx = FunctionBuilderContext::new();
@@ -1631,11 +1691,17 @@ pub fn define_send_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let in_bounds = builder
         .ins()
         .icmp(IntCC::UnsignedLessThanOrEqual, access_end, end);
-    builder
-        .ins()
-        .trapz(in_bounds, TrapCode::unwrap_user(32));
+    builder.ins().trapz(in_bounds, TrapCode::unwrap_user(32));
 
-    emit_submit_sqe(sh_ctx_start, IORING_OP_SEND, fd, start, size, ty, &mut builder);
+    emit_submit_sqe(
+        sh_ctx_start,
+        IORING_OP_SEND,
+        fd,
+        start,
+        size,
+        ty,
+        &mut builder,
+    );
 
     // No explicit io_uring_enter (see rt_accept_async).  Pending count is
     // bumped by emit_submit_sqe; the scheduler's combined wait+submit
@@ -1674,7 +1740,11 @@ pub fn define_recv_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     };
     let park_id = match ctx.module().get_name("rt_io_park_current") {
         Some(FuncOrDataId::Func(id)) => id,
-        _ => return Err(anyhow!("rt_io_park_current must be declared before rt_recv_async")),
+        _ => {
+            return Err(anyhow!(
+                "rt_io_park_current must be declared before rt_recv_async"
+            ));
+        }
     };
 
     let mut builder_ctx = FunctionBuilderContext::new();
@@ -1714,11 +1784,17 @@ pub fn define_recv_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let in_bounds = builder
         .ins()
         .icmp(IntCC::UnsignedLessThanOrEqual, access_end, end);
-    builder
-        .ins()
-        .trapz(in_bounds, TrapCode::unwrap_user(32));
+    builder.ins().trapz(in_bounds, TrapCode::unwrap_user(32));
 
-    emit_submit_sqe(sh_ctx_start, IORING_OP_RECV, fd, start, size, ty, &mut builder);
+    emit_submit_sqe(
+        sh_ctx_start,
+        IORING_OP_RECV,
+        fd,
+        start,
+        size,
+        ty,
+        &mut builder,
+    );
 
     // Park the calling actor; the scheduler's combined wait+submit will
     // flush the SQE and wake us when the CQE arrives.
@@ -1734,5 +1810,3 @@ pub fn define_recv_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
     Ok(ctx)
 }
-
-

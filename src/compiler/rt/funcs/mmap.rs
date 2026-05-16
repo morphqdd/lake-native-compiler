@@ -39,15 +39,13 @@ pub fn define_mmap(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     // payload.  Allocations larger than 16 MiB take the direct-mmap path:
     // they bypass the bump heap entirely and are unmapped on free, so they
     // never leak.
-    let free_list_id = ctx.module_mut().declare_data(
-        "free_list_heads",
-        Linkage::Export,
-        true,
-        false,
-    )?;
+    let free_list_id =
+        ctx.module_mut()
+            .declare_data("free_list_heads", Linkage::Export, true, false)?;
     let mut free_list_desc = DataDescription::new();
     free_list_desc.define_zeroinit(21 * 8);
-    ctx.module_mut().define_data(free_list_id, &free_list_desc)?;
+    ctx.module_mut()
+        .define_data(free_list_id, &free_list_desc)?;
 
     // ── rt_mmap function ──────────────────────────────────────────────────────
     let syscall_id = match ctx.module().get_name("rt_syscall") {
@@ -81,9 +79,10 @@ pub fn define_mmap(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let fd = builder.ins().iconst(ty, -1i64);
     let offset = builder.ins().iconst(ty, 0);
 
-    let call = builder
-        .ins()
-        .call(syscall_ref, &[sys_mmap, addr, length, prot, flags, fd, offset]);
+    let call = builder.ins().call(
+        syscall_ref,
+        &[sys_mmap, addr, length, prot, flags, fd, offset],
+    );
     let mapped_ptr = builder.inst_results(call)[0];
     builder.ins().return_(&[mapped_ptr]);
 
@@ -129,13 +128,16 @@ pub fn define_munmap(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
     let addr = builder.block_params(entry)[0];
     let length = builder.block_params(entry)[1];
-    let sys_munmap = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_munmap);
+    let sys_munmap = builder
+        .ins()
+        .iconst(ty, LinuxSyscalls::for_host().sys_munmap);
     let zero = builder.ins().iconst(ty, 0);
 
     // rt_syscall takes 7 fixed args; munmap uses only nr+addr+length.
-    let _ = builder
-        .ins()
-        .call(syscall_ref, &[sys_munmap, addr, length, zero, zero, zero, zero]);
+    let _ = builder.ins().call(
+        syscall_ref,
+        &[sys_munmap, addr, length, zero, zero, zero, zero],
+    );
     builder.ins().return_(&[]);
 
     let sig = builder.func.signature.clone();
@@ -160,11 +162,9 @@ pub fn define_init_heap(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         ctx.module().get_name("heap_curr"),
         ctx.module().get_name("heap_end"),
     ) {
-        (
-            Some(FuncOrDataId::Data(b)),
-            Some(FuncOrDataId::Data(c)),
-            Some(FuncOrDataId::Data(e)),
-        ) => (b, c, e),
+        (Some(FuncOrDataId::Data(b)), Some(FuncOrDataId::Data(c)), Some(FuncOrDataId::Data(e))) => {
+            (b, c, e)
+        }
         _ => return Err(anyhow!("Heap globals must be declared before rt_init_heap")),
     };
 

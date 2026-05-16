@@ -1,5 +1,5 @@
-use anyhow::{Result, bail};
 use crate::compiler::pipeline::expr::{StmtOutcome, dispatch};
+use anyhow::{Result, bail};
 use cranelift::{
     codegen::ir::BlockArg,
     frontend::Switch,
@@ -50,10 +50,7 @@ pub fn compile_spawn(
     // Size the VARIABLES buffer by the maximum var_count across all branches of
     // the target machine so that any future state transition (`self(...)`) is
     // safe regardless of which branch is entered next.
-    let max_vars = ctx
-        .max_branch_var_count(machine_name)
-        .unwrap_or(1)
-        .max(1);
+    let max_vars = ctx.max_branch_var_count(machine_name).unwrap_or(1).max(1);
 
     let b = builder.create_block();
     builder.switch_to_block(b);
@@ -81,10 +78,18 @@ pub fn compile_spawn(
     // Load spawning JUMP_ARGS when we have args to copy or need the discriminant.
     let spawning_ja_start = if arg_count > 0 || needs_guard_dispatch {
         let spawning_ctx_ptr = builder.use_var(machine_ctx_var);
-        let jump_args_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::JUMP_ARGS as i64);
-        let call_ja = builder.ins().call(load_ref, &[spawning_ctx_ptr, jump_args_offset]);
+        let jump_args_offset = builder
+            .ins()
+            .iconst(ptr_ty, ExecCtxLayout::JUMP_ARGS as i64);
+        let call_ja = builder
+            .ins()
+            .call(load_ref, &[spawning_ctx_ptr, jump_args_offset]);
         let spawning_jump_args = builder.inst_results(call_ja)[0];
-        Some(FatPtrLayout::load_start(builder, ptr_ty, spawning_jump_args))
+        Some(FatPtrLayout::load_start(
+            builder,
+            ptr_ty,
+            spawning_jump_args,
+        ))
     } else {
         None
     };
@@ -99,7 +104,9 @@ pub fn compile_spawn(
                 ja_start,
                 (jump_args_base + i) as i32 * 8,
             );
-            builder.ins().store(MemFlags::new(), val, vars_start, i as i32 * 8);
+            builder
+                .ins()
+                .store(MemFlags::new(), val, vars_start, i as i32 * 8);
         }
     }
 
@@ -182,14 +189,11 @@ pub fn compile_spawn(
     // process's TEMP_VAL so `let p pid = machine()` captures it. ─────
     let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
     let spawning_ctx = builder.use_var(machine_ctx_var);
-    let temp_offset = builder
-        .ins()
-        .iconst(ptr_ty, ExecCtxLayout::TEMP_VAL as i64);
+    let temp_offset = builder.ins().iconst(ptr_ty, ExecCtxLayout::TEMP_VAL as i64);
     let size = builder.ins().iconst(ptr_ty, 8);
-    builder.ins().call(
-        store_ref,
-        &[spawning_ctx, new_pid, size, temp_offset],
-    );
+    builder
+        .ins()
+        .call(store_ref, &[spawning_ctx, new_pid, size, temp_offset]);
 
     let next_id = block_id + 1;
     let next_id_val = builder.ins().iconst(ptr_ty, next_id);

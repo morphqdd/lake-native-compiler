@@ -97,18 +97,14 @@ pub fn compile(
     builder.switch_to_block(b);
 
     // Resolve global values for this function.
-    let data_gv = ctx
-        .module_mut()
-        .declare_data_in_func(data_id, builder.func);
+    let data_gv = ctx.module_mut().declare_data_in_func(data_id, builder.func);
     let fat_ptr_gv = ctx
         .module_mut()
         .declare_data_in_func(fat_ptr_id, builder.func);
 
     let data_ptr = builder.ins().global_value(ptr_ty, data_gv);
     let fat_ptr = builder.ins().global_value(ptr_ty, fat_ptr_gv);
-    let end_ptr = builder
-        .ins()
-        .iadd_imm(data_ptr, bytes.len() as i64);
+    let end_ptr = builder.ins().iadd_imm(data_ptr, bytes.len() as i64);
 
     // Write [start, end] into the fat pointer.
     builder.ins().store(MemFlags::new(), data_ptr, fat_ptr, 0);

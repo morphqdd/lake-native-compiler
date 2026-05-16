@@ -77,7 +77,18 @@ pub fn compile(
     );
 
     let next_id = match default {
-        Some(d) => match compile_expr(ctx, builder, machine_ctx_var, block_id, branch_switch, state, d, None, None, false)? {
+        Some(d) => match compile_expr(
+            ctx,
+            builder,
+            machine_ctx_var,
+            block_id,
+            branch_switch,
+            state,
+            d,
+            None,
+            None,
+            false,
+        )? {
             StmtOutcome::Continue(id) => id,
             // A terminal default is unusual but we propagate it.
             terminal => return Ok(terminal),
@@ -108,9 +119,7 @@ pub fn compile(
     // #81 — Inline rt_load_u64 / rt_store for TEMP_VAL → vars[var_index].
     // Scheduler-trusted memory.
     let ctx_ptr = builder.use_var(machine_ctx_var);
-    let exec_start = builder
-        .ins()
-        .load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
+    let exec_start = builder.ins().load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
     let temp_val = builder.ins().load(
         ptr_ty,
         MemFlags::trusted(),
@@ -123,9 +132,7 @@ pub fn compile(
         exec_start,
         ExecCtxLayout::VARIABLES,
     );
-    let vars_start = builder
-        .ins()
-        .load(ptr_ty, MemFlags::trusted(), vars_fat, 0);
+    let vars_start = builder.ins().load(ptr_ty, MemFlags::trusted(), vars_fat, 0);
     builder.ins().store(
         MemFlags::trusted(),
         temp_val,
@@ -189,9 +196,7 @@ fn compile_pure_let(
     // Load exec_start (cached on the machine but we still need to
     // reach the variables pointer + own_pid through it).
     let ctx_ptr = builder.use_var(machine_ctx_var);
-    let exec_start = builder
-        .ins()
-        .load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
+    let exec_start = builder.ins().load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
 
     // Mirror pure_expr::compile: load vars_start only if expression
     // reads at least one Var (otherwise the load is dead and litters
@@ -254,9 +259,7 @@ fn compile_pure_let(
             // The folded expr didn't read any vars, so we never loaded
             // vars_start.  Load it now.
             let ctx_ptr = builder.use_var(machine_ctx_var);
-            let exec_start = builder
-                .ins()
-                .load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
+            let exec_start = builder.ins().load(ptr_ty, MemFlags::trusted(), ctx_ptr, 0);
             let vars_fat = builder.ins().load(
                 ptr_ty,
                 MemFlags::trusted(),
@@ -266,12 +269,9 @@ fn compile_pure_let(
             builder.ins().load(ptr_ty, MemFlags::trusted(), vars_fat, 0)
         }
     };
-    builder.ins().store(
-        MemFlags::trusted(),
-        val,
-        vars_target,
-        var_index as i32 * 8,
-    );
+    builder
+        .ins()
+        .store(MemFlags::trusted(), val, vars_target, var_index as i32 * 8);
 
     // #80 Level 2/3: emit exit unless we're mid-super-block.
     if !omit_exit {
@@ -309,9 +309,7 @@ fn pure_expr_uses_vars(expr: &Expr) -> bool {
         | Expr::BOr(l, r)
         | Expr::BXor(l, r)
         | Expr::Shl(l, r)
-        | Expr::Shr(l, r) => {
-            pure_expr_uses_vars(&l.inner) || pure_expr_uses_vars(&r.inner)
-        }
+        | Expr::Shr(l, r) => pure_expr_uses_vars(&l.inner) || pure_expr_uses_vars(&r.inner),
         _ => false,
     }
 }
@@ -334,9 +332,7 @@ fn pure_expr_uses_self(expr: &Expr) -> bool {
         | Expr::BOr(l, r)
         | Expr::BXor(l, r)
         | Expr::Shl(l, r)
-        | Expr::Shr(l, r) => {
-            pure_expr_uses_self(&l.inner) || pure_expr_uses_self(&r.inner)
-        }
+        | Expr::Shr(l, r) => pure_expr_uses_self(&l.inner) || pure_expr_uses_self(&r.inner),
         _ => false,
     }
 }

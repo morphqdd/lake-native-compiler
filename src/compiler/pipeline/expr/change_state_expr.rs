@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::compiler::pipeline::expr::{StmtOutcome, dispatch};
+use anyhow::Result;
 use cranelift::{
     codegen::ir::BlockArg,
     frontend::Switch,
@@ -66,9 +66,7 @@ pub fn compile(
             exec_start,
             ExecCtxLayout::VARIABLES,
         );
-        let vars_start = builder
-            .ins()
-            .load(ptr_ty, MemFlags::trusted(), vars_fat, 0);
+        let vars_start = builder.ins().load(ptr_ty, MemFlags::trusted(), vars_fat, 0);
         let ja_start = spawning_ja_start.unwrap();
         for i in 0..arg_count {
             let val = builder.ins().load(
@@ -111,5 +109,7 @@ pub fn compile(
     builder.ins().jump(qb, &[BlockArg::Value(next_id_val)]);
 
     branch_switch.set_entry(block_id as u128, b);
-    Ok(StmtOutcome::StateChange { next_available: block_id + 1 })
+    Ok(StmtOutcome::StateChange {
+        next_available: block_id + 1,
+    })
 }

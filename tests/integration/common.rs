@@ -49,7 +49,8 @@ pub fn assert_stdout(src: &str, expected: &[u8]) {
         out.exit_code, out.stderr
     );
     assert_eq!(
-        out.stdout, expected,
+        out.stdout,
+        expected,
         "stdout mismatch: got {:?}, want {:?}",
         out.stdout_str(),
         std::str::from_utf8(expected).unwrap_or("<non-utf8>")
