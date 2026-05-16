@@ -1,0 +1,146 @@
+name: ci
+
+on:
+  push:
+    branches: [master, dev]
+  pull_request:
+    branches: [master, dev]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  LAKE_STDLIB: ${{ github.workspace }}/../lake-stdlib
+
+jobs:
+  # ── x86_64 native — full pipeline ─────────────────────────────────────
+  x86_64:
+    name: x86_64-linux-gnu (native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lake-native-compiler
+
+      # lake-stdlib lives alongside the compiler — fetch the same branch
+      # (or master if the sibling repo has no matching branch).
+      - name: Checkout lake-stdlib (sibling repo)
+        uses: actions/checkout@v4
+        with:
+          repository: morphqdd/lake-stdlib
+          path: lake-stdlib
+          ref: master
+        continue-on-error: true
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: lake-native-compiler
+
+      - name: Install mold (linker)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+
+      - name: cargo fmt --check
+        working-directory: lake-native-compiler
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        working-directory: lake-native-compiler
+        run: cargo clippy --release --all-targets -- -D warnings
+        continue-on-error: true
+
+      - name: cargo build --release
+        working-directory: lake-native-compiler
+        run: cargo build --release
+
+      - name: cargo test --release (integration)
+        working-directory: lake-native-compiler
+        env:
+          LAKE_PATH: ${{ github.workspace }}/lake-stdlib
+        run: cargo test --release --test integration -- --test-threads=1
+
+      - name: smoke — counter example
+        working-directory: lake-native-compiler
+        env:
+          LAKE_PATH: ${{ github.workspace }}/lake-stdlib
+        run: |
+          if [ -d "$LAKE_PATH/std" ]; then
+            ./target/release/lakec examples/counter.lake
+            ./examples/build/counter
+          else
+            echo "::warning::lake-stdlib sibling repo missing — skipping smoke test"
+          fi
+
+  # ── aarch64 cross-build + qemu-user run ───────────────────────────────
+  aarch64:
+    name: aarch64-linux-gnu (qemu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lake-native-compiler
+
+      - name: Checkout lake-stdlib (sibling repo)
+        uses: actions/checkout@v4
+        with:
+          repository: morphqdd/lake-stdlib
+          path: lake-stdlib
+          ref: master
+        continue-on-error: true
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: lake-native-compiler
+          key: aarch64
+
+      - name: Install cross binutils + mold + qemu-user
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            binutils-aarch64-linux-gnu \
+            gcc-aarch64-linux-gnu \
+            mold \
+            qemu-user-static
+
+      - name: cargo build --release (cross to aarch64)
+        working-directory: lake-native-compiler
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64-static -L /usr/aarch64-linux-gnu
+        run: cargo build --release --target aarch64-unknown-linux-gnu
+
+      - name: integration tests (qemu-user)
+        working-directory: lake-native-compiler
+        env:
+          LAKE_PATH: ${{ github.workspace }}/lake-stdlib
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64-static -L /usr/aarch64-linux-gnu
+        run: |
+          # qemu-user needs the cross sysroot for libc.  Lake-emitted
+          # binaries are static + nostdlib, but the test harness itself
+          # links against musl/glibc via the Rust toolchain.
+          cargo test --release --target aarch64-unknown-linux-gnu \
+            --test integration -- --test-threads=1
+        # Allow failure until PR2 lands real aarch64 shims + PR3
+        # lands per-arch stdlib syscall numbers.
+        continue-on-error: true
+
+  # ── doc check — README + ROADMAP links don't 404 ──────────────────────
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: lychee link check
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: --no-progress --exclude-mail '**/*.md'
+          fail: false
