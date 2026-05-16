@@ -97,11 +97,15 @@ pub fn define_len(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 pub fn define_to_string_with_ln(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let ty = ctx.module().target_config().pointer_type();
 
-    let alloc_id = match ctx.module().get_name("rt_allocate") {
+    // #105: rt_allocate now returns `{atom buf}` tuple under the
+    // tuple ABI (#87).  Internal Cranelift helpers like this one
+    // want the bare buf — route through rt_allocate_raw to skip
+    // the wrap and the conditional :err path.
+    let alloc_id = match ctx.module().get_name("rt_allocate_raw") {
         Some(FuncOrDataId::Func(id)) => id,
         _ => {
             return Err(anyhow!(
-                "rt_allocate must be declared before to_string_with_ln"
+                "rt_allocate_raw must be declared before to_string_with_ln"
             ));
         }
     };
@@ -257,12 +261,12 @@ pub fn define_to_string_with_ln(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 pub fn define_to_string(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let ty = ctx.module().target_config().pointer_type();
 
-    let alloc_id = match ctx.module().get_name("rt_allocate") {
+    // #105 — same fix as to_string_with_ln: skip the tuple-ABI
+    // wrap by calling rt_allocate_raw directly.
+    let alloc_id = match ctx.module().get_name("rt_allocate_raw") {
         Some(FuncOrDataId::Func(id)) => id,
         _ => {
-            return Err(anyhow!(
-                "rt_allocate must be declared before to_string_with_ln"
-            ));
+            return Err(anyhow!("rt_allocate_raw must be declared before to_string"));
         }
     };
 
