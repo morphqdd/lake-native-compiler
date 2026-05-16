@@ -14,12 +14,15 @@ use crate::compiler::{
                 define_store,
             },
             die::define_die_actor,
+            env::{
+                declare_asm_env_helpers, define_buf_len, define_buf_ptr, define_buf_trim,
+                define_cmp_str_buf, define_cstr_to_buf, define_load_ptr_raw,
+            },
             exit::define_exit,
             io_uring::{
-                define_accept_async, define_close, define_io_park_current,
-                define_io_uring_flush, define_io_uring_poll_cq, define_io_uring_setup,
-                define_io_uring_wait_cqe, define_listen_tcp, define_recv_async,
-                define_send_async, define_write_async,
+                define_accept_async, define_close, define_io_park_current, define_io_uring_flush,
+                define_io_uring_poll_cq, define_io_uring_setup, define_io_uring_wait_cqe,
+                define_listen_tcp, define_recv_async, define_send_async, define_write_async,
             },
             mmap::{define_init_heap, define_mmap, define_munmap},
             read::define_read,
@@ -76,6 +79,20 @@ impl RuntimeBuilder {
         let ctx = define_loads(ctx)?;
         debug!("rt: rt_copy_bytes");
         let ctx = define_copy_bytes(ctx)?;
+        debug!("rt: rt_{{argc,argv,envp}}_raw + rt_cstr_len (asm imports)");
+        let ctx = declare_asm_env_helpers(ctx)?;
+        debug!("rt: rt_load_ptr_raw");
+        let ctx = define_load_ptr_raw(ctx)?;
+        debug!("rt: rt_cstr_to_buf");
+        let ctx = define_cstr_to_buf(ctx)?;
+        debug!("rt: buf_len");
+        let ctx = define_buf_len(ctx)?;
+        debug!("rt: buf_ptr");
+        let ctx = define_buf_ptr(ctx)?;
+        debug!("rt: cmp_str_buf");
+        let ctx = define_cmp_str_buf(ctx)?;
+        debug!("rt: buf_trim");
+        let ctx = define_buf_trim(ctx)?;
         debug!("rt: rt_io_uring_setup");
         let ctx = define_io_uring_setup(ctx)?;
         debug!("rt: rt_write_async");

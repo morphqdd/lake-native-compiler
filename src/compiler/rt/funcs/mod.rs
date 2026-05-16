@@ -1,5 +1,6 @@
 pub mod alloc;
 pub mod die;
+pub mod env;
 pub mod exit;
 pub mod io_uring;
 pub mod mmap;
