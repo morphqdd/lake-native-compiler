@@ -51,8 +51,11 @@ _start:
     add     x5, x5, :lo12:lake_envp
     str     x4, [x5]
 
-    // 16-byte align sp (already aligned per ABI, defensive)
-    and     sp, sp, #-16
+    // 16-byte align sp (already aligned per ABI, defensive).
+    // AArch64 disallows `and sp, ...` directly — round-trip via x9.
+    mov     x9, sp
+    and     x9, x9, #-16
+    mov     sp, x9
 
     bl      lake_main
 
