@@ -73,7 +73,20 @@ pub fn compile(
     //    Big win for stdlib helpers that do many rt-calls per branch
     //    (set_be32 = 4 rt_store calls; init_k_table = 64 set_be32 calls;
     //    SHA-256 hot path uses these heavily).
-    if ctx.is_declared_rt_func_in_prog(callee_name) && args.iter().all(|a| pure_expr::is_pure(a)) {
+    // Park-aware rt fns need the slow path's BLOCK_ID + STOP_PARK
+    // epilogue.  Calling them through the fused fast path bails with
+    // "park-aware rt-fn with all-pure args — not yet supported on
+    // fused path" — keep them off the fast path entirely so TCP /
+    // io_uring stdlib wrappers (where all args are typically Var or
+    // Num and would otherwise qualify) just work.
+    let is_park_aware = matches!(
+        *callee_name,
+        "rt_io_park_current" | "rt_accept_async" | "rt_send_async" | "rt_recv_async"
+    );
+    if !is_park_aware
+        && ctx.is_declared_rt_func_in_prog(callee_name)
+        && args.iter().all(|a| pure_expr::is_pure(a))
+    {
         return compile_fused_rt_call(
             ctx,
             builder,

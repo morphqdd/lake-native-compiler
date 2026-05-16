@@ -5,3 +5,6 @@ CLAUDE.md
 DESIGN.md
 .claude/
 docs/bug-103-investigation.md
+# Agent-only state hub — local context for parallel agents, not
+# committed to the public history.
+docs/state/
