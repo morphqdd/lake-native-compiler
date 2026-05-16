@@ -15,6 +15,7 @@ use crate::compiler::{
         ExecCtxLayout, FatPtrLayout, process_ctx::ProcessCtxLayout,
         sheduler_ctx::ShedulerCtxLayout,
     },
+    target::LinuxSyscalls,
 };
 
 /// Build `rt_allocate(size: i64) -> i64`.
@@ -452,7 +453,7 @@ fn define_allocate_impl(
             .declare_data_in_func(msg_data_id, &mut builder.func);
         let msg_ptr = builder.ins().global_value(ty, msg_gv);
         let msg_len = builder.ins().iconst(ty, msg.len() as i64);
-        let sys_write = builder.ins().iconst(ty, 1); // Linux x86-64 SYS_WRITE
+        let sys_write = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_write);
         let stderr_fd = builder.ins().iconst(ty, 2);
         let zero_arg = builder.ins().iconst(ty, 0);
         builder.ins().call(
@@ -492,7 +493,7 @@ fn define_allocate_impl(
         "init",
         "lake: init failed — rt_allocate exhausted before scheduler ready\n",
     )?;
-    let sys_exit = builder.ins().iconst(ty, 60); // Linux x86-64 SYS_EXIT
+    let sys_exit = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_exit);
     let code = builder.ins().iconst(ty, 137); // 128 + SIGKILL convention
     let zero_arg2 = builder.ins().iconst(ty, 0);
     builder.ins().call(

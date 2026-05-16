@@ -4,10 +4,8 @@ use cranelift::{
     prelude::{AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder, MemFlags},
 };
 
-use crate::compiler::ctx::CompilerCtx;
+use crate::compiler::{ctx::CompilerCtx, target::LinuxSyscalls};
 
-const SYS_MMAP: i64 = 9;
-const SYS_MUNMAP: i64 = 11;
 const PROT_READ: i64 = 0x1;
 const PROT_WRITE: i64 = 0x2;
 const MAP_PRIVATE: i64 = 0x02;
@@ -74,7 +72,7 @@ pub fn define_mmap(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .declare_func_in_func(syscall_id, &mut builder.func);
 
     let length = builder.block_params(entry)[0];
-    let sys_mmap = builder.ins().iconst(ty, SYS_MMAP);
+    let sys_mmap = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_mmap);
     let addr = builder.ins().iconst(ty, 0);
     let prot = builder.ins().iconst(ty, PROT_READ | PROT_WRITE);
     let flags = builder
@@ -131,7 +129,7 @@ pub fn define_munmap(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
     let addr = builder.block_params(entry)[0];
     let length = builder.block_params(entry)[1];
-    let sys_munmap = builder.ins().iconst(ty, SYS_MUNMAP);
+    let sys_munmap = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_munmap);
     let zero = builder.ins().iconst(ty, 0);
 
     // rt_syscall takes 7 fixed args; munmap uses only nr+addr+length.

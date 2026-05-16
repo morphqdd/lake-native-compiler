@@ -4,9 +4,7 @@ use cranelift::{
     prelude::{AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder, TrapCode},
 };
 
-use crate::compiler::ctx::CompilerCtx;
-
-const SYS_EXIT: i64 = 60; // Linux x86-64
+use crate::compiler::{ctx::CompilerCtx, target::LinuxSyscalls};
 
 /// Build and define `rt_exit(code: i64)` — calls `sys_exit` and never returns.
 pub fn define_exit(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
@@ -33,7 +31,7 @@ pub fn define_exit(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .declare_func_in_func(syscall_id, &mut builder.func);
 
     let code = builder.block_params(entry)[0];
-    let sys_exit = builder.ins().iconst(ty, SYS_EXIT);
+    let sys_exit = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_exit);
     let zero = builder.ins().iconst(ty, 0);
     builder
         .ins()

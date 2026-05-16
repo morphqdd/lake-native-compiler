@@ -26,6 +26,7 @@ pub mod ctx;
 pub mod mphf;
 pub mod pipeline;
 pub mod rt;
+pub mod target;
 
 pub fn compile<SP: AsRef<Path>>(
     pb: ProgressBar,
@@ -139,12 +140,20 @@ pub fn compile<SP: AsRef<Path>>(
     Ok(obj.emit()?)
 }
 
-/// Embedded syscall runtime object. Baked into the lakec binary at build time
-/// so the compiler does not depend on CWD or external file layout.
-const SYSCALL_OBJ: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/external/build/syscall.o"
-));
+/// Embedded syscall runtime object. Baked into the lakec binary at build
+/// time so the compiler does not depend on CWD or external file layout.
+/// `build.rs` assembles `external/${TARGET_ARCH}/syscall.asm` into
+/// `$OUT_DIR/syscall.o` and exports the path via `LAKE_SYSCALL_OBJ`.
+const SYSCALL_OBJ: &[u8] = include_bytes!(env!("LAKE_SYSCALL_OBJ"));
+
+/// Embedded ELF entry-point object: provides `_start`, captures
+/// argc/argv/envp from the kernel-supplied stack into BSS globals,
+/// and exposes `rt_argc_raw` / `rt_argv_raw` / `rt_envp_raw` /
+/// `rt_cstr_len` for Lake-side env helpers.  Cranelift cannot emit a
+/// stack-arg `_start` itself (see wasmtime#5996), so this minimal asm
+/// shim runs first and then trampolines into Cranelift's `lake_main`.
+/// `build.rs` picks the per-arch source from `external/${TARGET_ARCH}/`.
+const ENTRY_OBJ: &[u8] = include_bytes!(env!("LAKE_ENTRY_OBJ"));
 
 pub fn link<BP: AsRef<Path>>(
     build_path: BP,
@@ -156,12 +165,15 @@ pub fn link<BP: AsRef<Path>>(
     fs::create_dir_all(&build_path)?;
     let obj_path = build_path.as_ref().join(format!("{name}.o"));
     let syscall_path = build_path.as_ref().join("syscall.o");
+    let entry_path = build_path.as_ref().join("entry.o");
     let out_path = build_path.as_ref().join(name);
     fs::write(&obj_path, bytes)?;
     fs::write(&syscall_path, SYSCALL_OBJ)?;
+    fs::write(&entry_path, ENTRY_OBJ)?;
 
     let mut args = vec![
         "-static".to_string(),
+        entry_path.to_string_lossy().into_owned(),
         syscall_path.to_string_lossy().into_owned(),
         obj_path.to_string_lossy().into_owned(),
         "-o".to_string(),

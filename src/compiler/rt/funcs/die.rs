@@ -29,6 +29,7 @@ use crate::compiler::{
         ExecCtxLayout, process_ctx::ProcessCtxLayout,
         sheduler_ctx::ShedulerCtxLayout,
     },
+    target::LinuxSyscalls,
 };
 
 pub fn define_die_actor(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
@@ -145,7 +146,7 @@ pub fn define_die_actor(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
             .declare_data_in_func(msg_data_id, &mut builder.func);
         let msg_ptr = builder.ins().global_value(ty, msg_gv);
         let msg_len = builder.ins().iconst(ty, MSG.len() as i64);
-        let sys_write = builder.ins().iconst(ty, 1);
+        let sys_write = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_write);
         let stderr_fd = builder.ins().iconst(ty, 2);
         let zero_arg = builder.ins().iconst(ty, 0);
         builder.ins().call(
@@ -178,14 +179,14 @@ pub fn define_die_actor(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .declare_data_in_func(msg_init_id, &mut builder.func);
     let msg_ptr = builder.ins().global_value(ty, msg_gv);
     let msg_len = builder.ins().iconst(ty, MSG_INIT.len() as i64);
-    let sys_write = builder.ins().iconst(ty, 1);
+    let sys_write = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_write);
     let stderr_fd = builder.ins().iconst(ty, 2);
     let zero_arg = builder.ins().iconst(ty, 0);
     builder.ins().call(
         syscall_ref_exit,
         &[sys_write, stderr_fd, msg_ptr, msg_len, zero_arg, zero_arg, zero_arg],
     );
-    let sys_exit = builder.ins().iconst(ty, 60);
+    let sys_exit = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_exit);
     let code = builder.ins().iconst(ty, 137);
     let zero = builder.ins().iconst(ty, 0);
     builder.ins().call(
