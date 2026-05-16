@@ -261,7 +261,7 @@ impl RuntimeBuilder {
         let sig = builder.func.signature.clone();
         let id = ctx
             .module_mut()
-            .declare_function("_start", Linkage::Export, &sig)?;
+            .declare_function("lake_main", Linkage::Export, &sig)?;
         ctx.module_mut().define_function(id, &mut module_ctx)?;
         ctx.module_mut().clear_context(&mut module_ctx);
 
