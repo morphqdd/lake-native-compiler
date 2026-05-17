@@ -124,7 +124,13 @@ pub fn compile<SP: AsRef<Path>>(
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(256);
-                if let Err(err) = compile_machine(&mut ctx, &machine.inner, quantum) {
+                // Feature #084: time-budget quantum.  `LAKE_QUANTUM_US`
+                // (default 200) µs × estimated TSC kHz → cycles baked
+                // as an iconst into the per-block quantum check.
+                let target_cycles: i64 = compute_target_cycles();
+                if let Err(err) =
+                    compile_machine(&mut ctx, &machine.inner, quantum, target_cycles)
+                {
                     error!("{}", err);
                     debug!("{:#?}", ctx.get_registry());
                 }
@@ -155,6 +161,10 @@ const SYSCALL_OBJ: &[u8] = include_bytes!(env!("LAKE_SYSCALL_OBJ"));
 /// `build.rs` picks the per-arch source from `external/${TARGET_ARCH}/`.
 const ENTRY_OBJ: &[u8] = include_bytes!(env!("LAKE_ENTRY_OBJ"));
 
+/// Embedded TSC asm shim — see feature #084.
+/// Per-arch rdtsc (x86_64) / cntvct_el0 (aarch64) reader.
+const TSC_OBJ: &[u8] = include_bytes!(env!("LAKE_TSC_OBJ"));
+
 pub fn link<BP: AsRef<Path>>(
     build_path: BP,
     name: &str,
@@ -166,15 +176,18 @@ pub fn link<BP: AsRef<Path>>(
     let obj_path = build_path.as_ref().join(format!("{name}.o"));
     let syscall_path = build_path.as_ref().join("syscall.o");
     let entry_path = build_path.as_ref().join("entry.o");
+    let tsc_path = build_path.as_ref().join("tsc.o");
     let out_path = build_path.as_ref().join(name);
     fs::write(&obj_path, bytes)?;
     fs::write(&syscall_path, SYSCALL_OBJ)?;
     fs::write(&entry_path, ENTRY_OBJ)?;
+    fs::write(&tsc_path, TSC_OBJ)?;
 
     let mut args = vec![
         "-static".to_string(),
         entry_path.to_string_lossy().into_owned(),
         syscall_path.to_string_lossy().into_owned(),
+        tsc_path.to_string_lossy().into_owned(),
         obj_path.to_string_lossy().into_owned(),
         "-o".to_string(),
         out_path.to_string_lossy().into_owned(),
@@ -188,6 +201,31 @@ pub fn link<BP: AsRef<Path>>(
         bail!("{linker} linker failed");
     }
     Ok(())
+}
+
+/// Feature #084 — time-budget quantum.  Translate `LAKE_QUANTUM_US`
+/// (default 200) into a cycle count baked as an `iconst` into every
+/// machine's per-block quantum check.  Reads the host's
+/// `/sys/devices/system/cpu/cpu0/tsc_freq_khz` (Linux), falling back
+/// to 3 GHz when unavailable.  Compile-host-dependent for now — see
+/// docs/state/features/084_time_budget_quantum.md.
+fn compute_target_cycles() -> i64 {
+    let us: i64 = std::env::var("LAKE_QUANTUM_US")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
+    let tsc_khz: i64 = fs::read_to_string("/sys/devices/system/cpu/cpu0/tsc_freq_khz")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .or_else(|| {
+            fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+        })
+        .unwrap_or(3_000_000);
+    // cycles = us × (tsc_khz / 1000)
+    let cycles = us.saturating_mul(tsc_khz) / 1000;
+    cycles.max(1)
 }
 
 /// Index all branches of a single machine: compute pattern hashes once and

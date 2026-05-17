@@ -8,4 +8,5 @@ pub mod read;
 pub mod scratch;
 pub mod strings;
 pub mod syscall;
+pub mod tsc;
 pub mod write;

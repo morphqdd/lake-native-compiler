@@ -26,7 +26,16 @@ pub const STOP_PARK: i64 = -4; // actor parked on I/O; slot vacated, BLOCK_ID al
 /// blocks per scheduler call, storing the next BLOCK_ID into exec_ctx before
 /// returning STOP_LIMIT.  If a branch signals completion (-1), STOP_DONE is
 /// returned immediately.
-pub fn compile_machine(ctx: &mut CompilerCtx, machine: &Machine<'_>, quantum: i64) -> Result<()> {
+///
+/// Feature #084 — `target_cycles` is the per-slice wall-clock budget in
+/// TSC ticks.  Baked as an `iconst` and compared against `rt_tsc_now() -
+/// ExecCtx.SLICE_START_TSC` inside `quantum_loop_block`.
+pub fn compile_machine(
+    ctx: &mut CompilerCtx,
+    machine: &Machine<'_>,
+    quantum: i64,
+    target_cycles: i64,
+) -> Result<()> {
     let machine_ident = machine.ident.to_string();
     debug!("  branches: {}", machine.items.len());
     ctx.add_machine(&machine_ident);
@@ -201,8 +210,37 @@ pub fn compile_machine(ctx: &mut CompilerCtx, machine: &Machine<'_>, quantum: i6
     builder.def_var(quantum_var, new_remaining);
 
     let is_exhausted = builder.ins().icmp_imm(IntCC::Equal, new_remaining, 0);
+    let tsc_check_block = builder.create_block();
     builder.ins().brif(
         is_exhausted,
+        quantum_stop_limit_block,
+        &[],
+        tsc_check_block,
+        &[],
+    );
+
+    // Feature #084 — time-budget quantum.  Compare `rt_tsc_now() -
+    // SLICE_START_TSC` against the per-machine `target_cycles` const.
+    // Counter (above) is the coarse upper bound; TSC is the tight one.
+    builder.switch_to_block(tsc_check_block);
+    let rt_funcs = ctx.rt_funcs().clone();
+    let tsc_now_ref = rt_funcs.tsc_now_ref(ctx.module_mut(), &mut builder);
+    let tsc_call = builder.ins().call(tsc_now_ref, &[]);
+    let tsc_now = builder.inst_results(tsc_call)[0];
+    let exec_start_tsc = ctx.exec_start(&mut builder, machine_ctx_var);
+    let slice_start = builder.ins().load(
+        ptr_ty,
+        MemFlags::trusted(),
+        exec_start_tsc,
+        ExecCtxLayout::SLICE_START_TSC,
+    );
+    let elapsed = builder.ins().isub(tsc_now, slice_start);
+    let target = builder.ins().iconst(ptr_ty, target_cycles);
+    let over_budget = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThan, elapsed, target);
+    builder.ins().brif(
+        over_budget,
         quantum_stop_limit_block,
         &[],
         machine_switch_block,
