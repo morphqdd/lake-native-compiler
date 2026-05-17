@@ -29,6 +29,9 @@ pub struct LinuxSyscalls {
     pub sys_exit: i64,
     pub sys_io_uring_setup: i64,
     pub sys_io_uring_enter: i64,
+    pub sys_clone3: i64,
+    pub sys_waitid: i64,
+    pub sys_execve: i64,
 }
 
 impl LinuxSyscalls {
@@ -46,6 +49,9 @@ impl LinuxSyscalls {
         sys_exit: 60,
         sys_io_uring_setup: 425,
         sys_io_uring_enter: 426,
+        sys_clone3: 435,
+        sys_waitid: 247,
+        sys_execve: 59,
     };
 
     /// Linux aarch64 — `asm-generic/unistd.h`-derived (the kernel's
@@ -64,6 +70,9 @@ impl LinuxSyscalls {
         sys_exit: 93,
         sys_io_uring_setup: 425,
         sys_io_uring_enter: 426,
+        sys_clone3: 435,
+        sys_waitid: 95,
+        sys_execve: 221,
     };
 
     /// Pick the table matching the current host architecture.  Lake
