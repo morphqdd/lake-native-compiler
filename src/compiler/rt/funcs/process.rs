@@ -30,6 +30,11 @@ const IORING_OP_POLL_ADD: i64 = 6;
 const POLLIN: i64 = 0x1;
 const SQE_BYTES: i64 = 64;
 
+// waitid id-types and option flags.
+const P_PIDFD: i64 = 3;
+const WEXITED: i64 = 0x4;
+const WNOHANG: i64 = 0x1;
+
 /// `rt_clone3_pidfd(_unused: i64) -> i64`
 ///
 /// Issues clone3 with `CLONE_PIDFD | SIGCHLD`; the kernel writes the pidfd
@@ -329,4 +334,97 @@ fn emit_submit_poll_sqe(
         sh_ctx_start,
         ShedulerCtxLayout::SQE_PENDING,
     );
+}
+
+/// `rt_waitid_pidfd(pidfd: i64) -> i64`
+///
+/// Synchronous `waitid(P_PIDFD, pidfd, &siginfo, WEXITED|WNOHANG, NULL)`.
+/// Called only after rt_pidfd_poll_async woke on POLLIN, so the pidfd is
+/// guaranteed ready and WNOHANG never spins.  Returns child's si_status
+/// (0..=255 for clean exit) on success, or negative errno on failure.
+pub fn define_waitid_pidfd(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
+    let ty = ctx.module().target_config().pointer_type();
+
+    let syscall_id = match ctx.module().get_name("rt_syscall") {
+        Some(FuncOrDataId::Func(id)) => id,
+        _ => return Err(anyhow!("rt_syscall must be declared before rt_waitid_pidfd")),
+    };
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut module_ctx = ctx.module().make_context();
+    let mut builder = FunctionBuilder::new(&mut module_ctx.func, &mut builder_ctx);
+
+    builder.func.signature.params.push(AbiParam::new(ty));
+    builder.func.signature.returns.push(AbiParam::new(ty));
+
+    let entry = builder.create_block();
+    builder.append_block_param(entry, ty);
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+    let pidfd = builder.block_params(entry)[0];
+
+    let syscall_ref = ctx
+        .module_mut()
+        .declare_func_in_func(syscall_id, &mut builder.func);
+
+    // siginfo_t is at most 128 bytes — stack-alloc and zero.
+    let info_slot = builder.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        128,
+        8,
+    ));
+    let info_addr = builder.ins().stack_addr(ty, info_slot, 0);
+    let zero64 = builder.ins().iconst(ty, 0);
+    for i in 0..16 {
+        builder
+            .ins()
+            .store(MemFlags::trusted(), zero64, info_addr, i * 8);
+    }
+
+    let nr = builder
+        .ins()
+        .iconst(ty, LinuxSyscalls::for_host().sys_waitid);
+    let idtype = builder.ins().iconst(ty, P_PIDFD);
+    let options = builder.ins().iconst(ty, WEXITED | WNOHANG);
+    let call = builder.ins().call(
+        syscall_ref,
+        &[nr, idtype, pidfd, info_addr, options, zero64, zero64],
+    );
+    let rv = builder.inst_results(call)[0];
+
+    let err_block = builder.create_block();
+    let ok_block = builder.create_block();
+    let ret_block = builder.create_block();
+    builder.append_block_param(ret_block, ty);
+
+    let is_neg = builder.ins().icmp_imm(IntCC::SignedLessThan, rv, 0);
+    builder
+        .ins()
+        .brif(is_neg, err_block, &[], ok_block, &[]);
+
+    builder.switch_to_block(err_block);
+    builder.seal_block(err_block);
+    builder.ins().jump(ret_block, &[BlockArg::Value(rv)]);
+
+    builder.switch_to_block(ok_block);
+    builder.seal_block(ok_block);
+    // si_status is i32 at offset 24 in SIGCHLD siginfo_t (Linux x86_64).
+    let status32 = builder
+        .ins()
+        .load(types::I32, MemFlags::trusted(), info_addr, 24);
+    let status64 = builder.ins().sextend(ty, status32);
+    builder.ins().jump(ret_block, &[BlockArg::Value(status64)]);
+
+    builder.switch_to_block(ret_block);
+    builder.seal_block(ret_block);
+    let result = builder.block_params(ret_block)[0];
+    builder.ins().return_(&[result]);
+
+    let sig = builder.func.signature.clone();
+    let id = ctx
+        .module_mut()
+        .declare_function("rt_waitid_pidfd", Linkage::Export, &sig)?;
+    ctx.module_mut().define_function(id, &mut module_ctx)?;
+    ctx.module_mut().clear_context(&mut module_ctx);
+    Ok(ctx)
 }

@@ -24,6 +24,7 @@ pub struct RtFuncs {
     pub tsc_now: FuncId,
     pub clone3_pidfd: FuncId,
     pub pidfd_poll_async: FuncId,
+    pub waitid_pidfd: FuncId,
 }
 
 impl RtFuncs {
@@ -44,6 +45,7 @@ impl RtFuncs {
             tsc_now: resolve_func(module, "rt_tsc_now")?,
             clone3_pidfd: resolve_func(module, "rt_clone3_pidfd")?,
             pidfd_poll_async: resolve_func(module, "rt_pidfd_poll_async")?,
+            waitid_pidfd: resolve_func(module, "rt_waitid_pidfd")?,
         })
     }
 
