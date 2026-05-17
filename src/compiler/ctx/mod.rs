@@ -401,7 +401,14 @@ impl CompilerCtx {
     /// All machine functions share the same signature `fn(ctx_fat_ptr: ptr) -> ptr`.
     /// Calling this before the main compilation pass allows any branch to reference
     /// any machine regardless of declaration order in the source file.
+    ///
+    /// Idempotent: re-declaring the same canonical symbol is a no-op so a
+    /// `pub` machine re-exported through multiple modules predeclares once
+    /// (#102 — mold "duplicate symbol" prevention).
     pub fn predeclare_machine(&mut self, name: &str) -> anyhow::Result<()> {
+        if let Some(FuncOrDataId::Func(_)) = self.module.get_name(name) {
+            return Ok(());
+        }
         let ptr_ty = self.module.target_config().pointer_type();
         let mut module_ctx = self.module.make_context();
         module_ctx.func.signature.params.push(AbiParam::new(ptr_ty));
