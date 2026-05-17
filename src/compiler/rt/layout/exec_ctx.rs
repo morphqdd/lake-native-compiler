@@ -8,22 +8,26 @@ use crate::compiler::ctx::CompilerCtx;
 /// Runtime execution context layout.
 /// Single source of truth for all field offsets.
 ///
-/// Memory layout (208 bytes):
-/// +0   branch_id    : i64  — which branch of the machine is active
-/// +8   block_id     : i64  — which block inside the branch to execute next
-/// +16  temp_val     : i64  — scratch register for passing values between blocks
-/// +24  variables    : i64  — fat ptr (start addr) to the variables array
-/// +32  jump_args    : i64  — fat ptr (start addr) to the jump-arguments array
-/// +40  mailbox_fat  : i64  — fat ptr to ring-buffer mailbox (256 × 8 bytes)
-/// +48  mailbox_head : i64  — read index (consumer)
-/// +56  mailbox_tail : i64  — write index (producer)
-/// +64  own_pid      : i64  — process_ctx fat-ptr address of THIS actor.
-/// +72  is_dying     : i64  — non-zero = actor crashed inside a rt-* call and
-///                            must be removed at the next quantum boundary.
-///                            machine.rs::quantum_loop_block reads this and
-///                            returns STOP_DONE so the scheduler unlinks the
-///                            actor without unwinding Cranelift's call stack.
-/// +80  scratch_ring : 8 × {ptr i64, capacity i64} (128 B) — see #082.
+/// Memory layout (216 bytes):
+/// +0   branch_id        : i64  — which branch of the machine is active
+/// +8   block_id         : i64  — which block inside the branch to execute next
+/// +16  temp_val         : i64  — scratch register for passing values between blocks
+/// +24  variables        : i64  — fat ptr (start addr) to the variables array
+/// +32  jump_args        : i64  — fat ptr (start addr) to the jump-arguments array
+/// +40  mailbox_fat      : i64  — fat ptr to ring-buffer mailbox (256 × 8 bytes)
+/// +48  mailbox_head     : i64  — read index (consumer)
+/// +56  mailbox_tail     : i64  — write index (producer)
+/// +64  own_pid          : i64  — process_ctx fat-ptr address of THIS actor.
+/// +72  is_dying         : i64  — non-zero = actor crashed inside a rt-* call and
+///                                must be removed at the next quantum boundary.
+///                                machine.rs::quantum_loop_block reads this and
+///                                returns STOP_DONE so the scheduler unlinks the
+///                                actor without unwinding Cranelift's call stack.
+/// +80  scratch_ring     : 8 × {ptr i64, capacity i64} (128 B) — see #082.
+/// +208 slice_start_tsc  : i64  — TSC snapshot taken by the scheduler at slice
+///                                dispatch (see feature #084).  Quantum check
+///                                compares `rt_tsc_now() - slice_start_tsc`
+///                                against the compile-time target_cycles.
 pub struct ExecCtxLayout;
 
 impl ExecCtxLayout {
@@ -43,7 +47,12 @@ impl ExecCtxLayout {
     pub const SCRATCH_SLOTS: usize = 8;
     pub const SCRATCH_SLOT_SIZE: i32 = 16;
     pub const SCRATCH_RING_BYTES: i32 = 128;
-    pub const SIZE: i32 = 208;
+    /// Feature #084 — time-budget quantum. Scheduler writes
+    /// `rt_tsc_now()` here at slice dispatch; the per-block quantum
+    /// check loads this and compares elapsed cycles against
+    /// `target_cycles_const` baked into compile_machine.
+    pub const SLICE_START_TSC: i32 = 208;
+    pub const SIZE: i32 = 216;
 
     /// Emit a direct load of a field from a raw ctx pointer.
     /// `ctx_ptr` must point to the start of the ExecCtx data (not the fat ptr).
@@ -76,8 +85,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn layout_size_is_208() {
-        assert_eq!(ExecCtxLayout::SIZE, 208);
+    fn layout_size_is_216() {
+        assert_eq!(ExecCtxLayout::SIZE, 216);
     }
 
     #[test]
@@ -93,6 +102,7 @@ mod tests {
         assert_eq!(ExecCtxLayout::OWN_PID, 64);
         assert_eq!(ExecCtxLayout::IS_DYING, 72);
         assert_eq!(ExecCtxLayout::SCRATCH_RING, 80);
+        assert_eq!(ExecCtxLayout::SLICE_START_TSC, 208);
     }
 
     #[test]
@@ -111,7 +121,8 @@ mod tests {
         assert!(ExecCtxLayout::IS_DYING + 8 <= ExecCtxLayout::SIZE);
         assert_eq!(
             ExecCtxLayout::SCRATCH_RING + ExecCtxLayout::SCRATCH_RING_BYTES,
-            ExecCtxLayout::SIZE,
+            ExecCtxLayout::SLICE_START_TSC,
         );
+        assert_eq!(ExecCtxLayout::SLICE_START_TSC + 8, ExecCtxLayout::SIZE);
     }
 }
