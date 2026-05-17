@@ -23,8 +23,10 @@ use anyhow::{Context, Result, bail};
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=external/x86_64/entry.asm");
     println!("cargo:rerun-if-changed=external/x86_64/syscall.asm");
+    println!("cargo:rerun-if-changed=external/x86_64/tsc.asm");
     println!("cargo:rerun-if-changed=external/aarch64/entry.asm");
     println!("cargo:rerun-if-changed=external/aarch64/syscall.asm");
+    println!("cargo:rerun-if-changed=external/aarch64/tsc.asm");
 
     let target_arch =
         std::env::var("CARGO_CFG_TARGET_ARCH").context("CARGO_CFG_TARGET_ARCH not set")?;
@@ -53,7 +55,7 @@ fn main() -> Result<()> {
     let src_dir = PathBuf::from(format!("external/{target_arch}"));
     let out_dir: PathBuf = std::env::var("OUT_DIR").context("OUT_DIR not set")?.into();
 
-    for stem in ["entry", "syscall"] {
+    for stem in ["entry", "syscall", "tsc"] {
         let src = src_dir.join(format!("{stem}.asm"));
         if !src.exists() {
             bail!(
