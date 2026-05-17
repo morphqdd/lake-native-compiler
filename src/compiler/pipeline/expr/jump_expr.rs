@@ -82,6 +82,7 @@ pub fn compile(
     let is_park_aware = matches!(
         *callee_name,
         "rt_io_park_current" | "rt_accept_async" | "rt_send_async" | "rt_recv_async"
+            | "rt_pidfd_poll_async"
     );
     if !is_park_aware
         && ctx.is_declared_rt_func_in_prog(callee_name)
@@ -223,6 +224,7 @@ pub fn compile(
         if matches!(
             *callee_name,
             "rt_io_park_current" | "rt_accept_async" | "rt_send_async" | "rt_recv_async"
+            | "rt_pidfd_poll_async"
         ) {
             let resume_id = builder.ins().iconst(ptr_ty, next_id + 1);
             let exec_start = ctx.exec_start(builder, machine_ctx_var);
@@ -343,6 +345,7 @@ fn compile_fused_rt_call(
     if matches!(
         callee_name,
         "rt_io_park_current" | "rt_accept_async" | "rt_send_async" | "rt_recv_async"
+            | "rt_pidfd_poll_async"
     ) {
         // Fall through to non-fused path by signalling caller via a re-call.
         // Since the slow path is what would have been taken absent this

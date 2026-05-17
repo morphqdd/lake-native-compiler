@@ -17,6 +17,7 @@ mod integration {
     pub mod messaging;
     pub mod regression;
     pub mod self_call;
+    pub mod smoke_099;
     pub mod spawn;
     pub mod tuple_pattern;
     pub mod when_expr;
