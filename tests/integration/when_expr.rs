@@ -167,3 +167,68 @@ fn when_string_no_match_silent() {
     assert_eq!(out.exit_code, 0);
     assert_eq!(out.stdout, b"");
 }
+
+/// #079 — Bare K-table-eligible `when`: dense small-domain numeric
+/// dispatch where every arm body const-folds to i64.  No observable
+/// output — the value lands in TEMP_VAL and the actor terminates
+/// cleanly.  Exit 0 confirms the emitted .rodata + bounds-check +
+/// load path doesn't trap.
+#[test]
+fn when_k_table_bare_exits_zero() {
+    let src = r#"
+        main is { _ -> {
+          when 2 {
+            0 -> { 0 }
+            1 -> { 10 }
+            2 -> { 20 }
+            3 -> { 30 }
+          }
+        } }
+    "#;
+    let out = run(src).unwrap();
+    assert_eq!(out.exit_code, 0, "stderr: {:?}", out.stderr);
+    assert_eq!(out.stdout, b"");
+}
+
+/// #079 — Out-of-range discriminant takes the silent fall-through
+/// path (matches `when_no_match_continues` semantics).
+#[test]
+fn when_k_table_oob_silent_fallthrough() {
+    let src = r#"
+        main is { _ -> {
+          when 99 {
+            0 -> { 0 }
+            1 -> { 10 }
+            2 -> { 20 }
+            3 -> { 30 }
+          }
+        } }
+    "#;
+    let out = run(src).unwrap();
+    assert_eq!(out.exit_code, 0, "stderr: {:?}", out.stderr);
+    assert_eq!(out.stdout, b"");
+}
+
+/// #079 — Chain the K-table output through an outer `when` to assert
+/// the looked-up value reaches TEMP_VAL correctly.  Inner is k-table
+/// eligible; outer's rt_write bodies keep it on the N-way switch path.
+#[test]
+fn when_k_table_dense_value_observed_via_outer() {
+    let src = r#"
+        @rt(rt_write)
+        main is { _ -> {
+          when (when 2 {
+            0 -> { 0 }
+            1 -> { 10 }
+            2 -> { 20 }
+            3 -> { 30 }
+          }) {
+            0  -> { rt_write(1 "zero\n" 5) }
+            10 -> { rt_write(1 "ten\n" 4) }
+            20 -> { rt_write(1 "twenty\n" 7) }
+            30 -> { rt_write(1 "thirty\n" 7) }
+          }
+        } }
+    "#;
+    assert_stdout(src, b"twenty\n");
+}
