@@ -17,7 +17,9 @@ use cranelift::{
 use crate::compiler::{
     ctx::CompilerCtx,
     pipeline::machine::{STOP_DONE, STOP_PARK, STOP_WAIT},
-    rt::layout::{process_ctx::ProcessCtxLayout, sheduler_ctx::ShedulerCtxLayout},
+    rt::layout::{
+        ExecCtxLayout, process_ctx::ProcessCtxLayout, sheduler_ctx::ShedulerCtxLayout,
+    },
 };
 
 pub fn build_scheduler(ctx: &mut CompilerCtx, builder: &mut FunctionBuilder) -> Result<()> {
@@ -157,6 +159,22 @@ pub fn build_scheduler(ctx: &mut CompilerCtx, builder: &mut FunctionBuilder) -> 
     let current = ShedulerCtxLayout::get_current_process(sh_ptr_var, ctx, builder)?;
     let func_addr = ProcessCtxLayout::get_func_addr(current, ctx, builder)?;
     let exec_ctx = ProcessCtxLayout::get_exec_ctx(current, ctx, builder)?;
+
+    // Feature #084 — stamp SLICE_START_TSC on every dispatch.  Quantum
+    // loop in machine.rs compares `rt_tsc_now() - SLICE_START_TSC`
+    // against target_cycles to yield STOP_LIMIT.
+    let tsc_now_ref = rt_funcs.tsc_now_ref(ctx.module_mut(), builder);
+    let tsc_call = builder.ins().call(tsc_now_ref, &[]);
+    let tsc_now = builder.inst_results(tsc_call)[0];
+    let exec_data = builder
+        .ins()
+        .load(ptr_ty, MemFlags::trusted(), exec_ctx, 0);
+    builder.ins().store(
+        MemFlags::trusted(),
+        tsc_now,
+        exec_data,
+        ExecCtxLayout::SLICE_START_TSC,
+    );
 
     let mut machine_sig = ctx.module().make_signature();
     machine_sig.params.push(AbiParam::new(ptr_ty));

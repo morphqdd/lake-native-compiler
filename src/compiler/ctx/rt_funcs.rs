@@ -21,6 +21,7 @@ pub struct RtFuncs {
     pub allocate_raw: FuncId,
     pub free: FuncId,
     pub scratch_buf: FuncId,
+    pub tsc_now: FuncId,
 }
 
 impl RtFuncs {
@@ -38,6 +39,7 @@ impl RtFuncs {
             allocate_raw: resolve_func(module, "rt_allocate_raw")?,
             free: resolve_func(module, "rt_free")?,
             scratch_buf: resolve_func(module, "rt_scratch_buf")?,
+            tsc_now: resolve_func(module, "rt_tsc_now")?,
         })
     }
 
@@ -99,6 +101,16 @@ impl RtFuncs {
         builder: &mut FunctionBuilder,
     ) -> FuncRef {
         module.declare_func_in_func(self.scratch_buf, builder.func)
+    }
+
+    /// Time-budget quantum — see feature #084.
+    /// Reads the host TSC (rdtsc on x86_64, cntvct_el0 on aarch64).
+    pub fn tsc_now_ref(
+        &self,
+        module: &mut ObjectModule,
+        builder: &mut FunctionBuilder,
+    ) -> FuncRef {
+        module.declare_func_in_func(self.tsc_now, builder.func)
     }
 }
 

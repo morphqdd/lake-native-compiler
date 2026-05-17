@@ -29,6 +29,7 @@ use crate::compiler::{
             scratch::define_scratch_buf,
             strings::{define_len, define_str_ptr, define_to_string, define_to_string_with_ln},
             syscall::declare_syscall_wrapper,
+            tsc::declare_tsc_now,
             write::{define_write, define_write_static},
         },
         layout::{FatPtrLayout, sheduler_ctx::ShedulerCtxLayout},
@@ -55,6 +56,8 @@ impl RuntimeBuilder {
         ShedulerCtxLayout::declare_globals(&mut ctx)?;
         debug!("rt: rt_syscall");
         let ctx = declare_syscall_wrapper(ctx)?;
+        debug!("rt: rt_tsc_now");
+        let ctx = declare_tsc_now(ctx)?;
         debug!("rt: rt_exit");
         let ctx = define_exit(ctx)?;
         debug!("rt: rt_mmap + heap globals");
