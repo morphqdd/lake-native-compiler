@@ -841,7 +841,7 @@ dependencies = [
 [[package]]
 name = "lake-frontend"
 version = "0.1.0"
-source = "git+https://github.com/morphqdd/lake_frontend.git?branch=dev#614366712696d43ab9d82b8d4e51d1a482392797"
+source = "git+https://github.com/morphqdd/lake_frontend.git?branch=dev#51dc566d83f662bd54ad2dad07961fca458b5a64"
 dependencies = [
  "ariadne",
  "chrono",

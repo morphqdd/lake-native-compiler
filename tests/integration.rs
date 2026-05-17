@@ -17,5 +17,6 @@ mod integration {
     pub mod regression;
     pub mod self_call;
     pub mod spawn;
+    pub mod tuple_pattern;
     pub mod when_expr;
 }
