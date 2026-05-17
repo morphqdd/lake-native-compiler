@@ -279,3 +279,49 @@ fn issue_103_when_dead_arm_three_sequential_ret_calls() {
     assert!(s.contains("live"), "live arm did not run: {s:?}");
     assert!(!s.contains("never_"), "dead arm leaked output: {s:?}");
 }
+
+/// Bug #122: `alloc_or_die(n)` returned a buf whose fat-ptr `end` reflected
+/// the bucket-rounded capacity (min 16 B), so `size(buf)` over-reported.
+/// `alloc_or_die(0)` → size == 16 broke every empty-sentinel check.
+///
+/// Fixed by setting fat-ptr `end = start + user_size` in both the bump
+/// and pop paths of `rt_allocate`.  See docs/state/bugs/122.
+#[test]
+fn issue_122_alloc_or_die_zero_size_is_zero() {
+    let src = r#"
+        @rt(rt_exit)
+        +std.process.{ alloc_or_die }
+        +std.bytes.{ size }
+        main is { _ -> {
+          let b = alloc_or_die(0)
+          when size(b) == 0 { true -> { rt_exit(42) } _ -> { rt_exit(99) } }
+        } }
+    "#;
+    let out = run(src).unwrap();
+    assert_eq!(
+        out.exit_code, 42,
+        "alloc_or_die(0) size should be 0; stderr: {:?}",
+        out.stderr
+    );
+}
+
+/// Bug #122 follow-up: small under-bucket allocations (n < 16) also
+/// over-reported because the 16-byte minimum bucket leaked into `end`.
+#[test]
+fn issue_122_alloc_or_die_small_size_exact() {
+    let src = r#"
+        @rt(rt_exit)
+        +std.process.{ alloc_or_die }
+        +std.bytes.{ size }
+        main is { _ -> {
+          let b = alloc_or_die(5)
+          when size(b) == 5 { true -> { rt_exit(42) } _ -> { rt_exit(99) } }
+        } }
+    "#;
+    let out = run(src).unwrap();
+    assert_eq!(
+        out.exit_code, 42,
+        "alloc_or_die(5) size should be 5; stderr: {:?}",
+        out.stderr
+    );
+}
