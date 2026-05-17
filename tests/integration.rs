@@ -9,6 +9,7 @@
 mod integration {
     pub mod common;
 
+    pub mod anf_eq_bitwise;
     pub mod basics;
     pub mod guards;
     pub mod messaging;

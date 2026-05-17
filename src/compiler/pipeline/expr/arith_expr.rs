@@ -34,6 +34,16 @@ pub enum BinaryOp {
 ///   rhs_done_id  : load vars[tmp_slot] + TEMP_VAL, compute, → TEMP_VAL, return +1
 ///
 /// Comparison ops produce 0 (false) or 1 (true) as an i64.
+/// Is `e` an ANF-leaf for Eq/bitwise operand position?  Anything that
+/// `pure_expr::fold` can resolve without recursing through CPS blocks
+/// counts — Num / Bool / Var / Atom plus `Neg(leaf)` and `TupleIndex`.
+fn is_anf_leaf(e: &Expr<'_>) -> bool {
+    matches!(
+        e,
+        Expr::Num(..) | Expr::Bool(..) | Expr::Var(..) | Expr::Atom(..)
+    )
+}
+
 pub fn compile<'a>(
     ctx: &mut CompilerCtx,
     builder: &mut FunctionBuilder,
@@ -45,6 +55,28 @@ pub fn compile<'a>(
     rhs: &Expr<'a>,
     op: BinaryOp,
 ) -> Result<StmtOutcome> {
+    // #089 — Phase 1b ANF should have lifted every non-leaf side of
+    // Eq / bitwise into a synthetic `let __anf_tmpN = <subexpr>`.
+    // If we see a non-leaf here, the lowering pass missed a shape;
+    // bail explicitly instead of letting pure_expr panic deeper down.
+    if matches!(
+        op,
+        BinaryOp::Eq | BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge
+    ) {
+        if !is_anf_leaf(lhs) {
+            bail!(
+                "ANF expected: Eq/bitwise lhs must be a leaf (Var/Num/Bool/Atom); got {:?}",
+                lhs
+            );
+        }
+        if !is_anf_leaf(rhs) {
+            bail!(
+                "ANF expected: Eq/bitwise rhs must be a leaf (Var/Num/Bool/Atom); got {:?}",
+                rhs
+            );
+        }
+    }
+
     let ptr_ty = ctx.module().target_config().pointer_type();
 
     // ── Step 1: Compile LHS → TEMP_VAL ───────────────────────────────────────
