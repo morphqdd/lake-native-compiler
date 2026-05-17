@@ -11,6 +11,7 @@ mod integration {
 
     pub mod basics;
     pub mod guards;
+    pub mod mangling;
     pub mod messaging;
     pub mod regression;
     pub mod self_call;
