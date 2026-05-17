@@ -30,3 +30,21 @@ tempfile = "3.24.0"
 [build-dependencies]
 anyhow = "1.0.100"
 
+# Nightly-only: incremental compilation in release mode.  Cuts
+# repeat-build time 5-10× when only a small slice of lake-frontend
+# or src/ changes.  Costs ~5% on first build + a bit of disk.
+[profile.release]
+incremental = true
+
+# Fast iteration profile.  Same correctness as release, lower codegen
+# effort.  Use `cargo build --profile release-fast` /
+# `cargo test --profile release-fast` for dev loops; benchmarks
+# and shipping builds keep the plain `--release` profile.
+[profile.release-fast]
+inherits = "release"
+opt-level = 1
+codegen-units = 256
+lto = false
+debug-assertions = false
+overflow-checks = false
+
