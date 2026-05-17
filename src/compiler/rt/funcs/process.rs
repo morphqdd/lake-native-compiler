@@ -8,11 +8,14 @@ use cranelift::{
     codegen::ir::{BlockArg, StackSlotData, StackSlotKind},
     module::{FuncOrDataId, Linkage, Module},
     prelude::{
-        AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder, IntCC, MemFlags, types,
+        AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder, IntCC, MemFlags, Value,
+        types,
     },
 };
 
-use crate::compiler::{ctx::CompilerCtx, target::LinuxSyscalls};
+use crate::compiler::{
+    ctx::CompilerCtx, rt::layout::sheduler_ctx::ShedulerCtxLayout, target::LinuxSyscalls,
+};
 
 // clone(2) flags + clone_args field offsets.
 const CLONE_PIDFD: i64 = 0x00001000;
@@ -21,6 +24,11 @@ const CLONE_ARGS_SIZE: i64 = 88;
 const CLONE_ARGS_FLAGS: i32 = 0;
 const CLONE_ARGS_PIDFD: i32 = 8;
 const CLONE_ARGS_EXIT_SIGNAL: i32 = 32;
+
+// io_uring SQE opcode + POLL field.
+const IORING_OP_POLL_ADD: i64 = 6;
+const POLLIN: i64 = 0x1;
+const SQE_BYTES: i64 = 64;
 
 /// `rt_clone3_pidfd(_unused: i64) -> i64`
 ///
@@ -152,4 +160,173 @@ pub fn define_clone3_pidfd(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     ctx.module_mut().define_function(id, &mut module_ctx)?;
     ctx.module_mut().clear_context(&mut module_ctx);
     Ok(ctx)
+}
+
+/// `rt_pidfd_poll_async(pidfd: i64) -> i64`
+///
+/// Submits `IORING_OP_POLL_ADD` for `POLLIN` on `pidfd`, stamps the
+/// current proc-ctx fat-ptr into `user_data` (parking variant — wake
+/// machinery routes CQE.res into TEMP_VAL), then parks the actor.
+/// CQE fires when the child exits.
+pub fn define_pidfd_poll_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
+    let ty = ctx.module().target_config().pointer_type();
+
+    let sched_fat_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
+        Some(FuncOrDataId::Data(id)) => id,
+        _ => return Err(anyhow!("sheduler_ctx_fat_ptr global not found")),
+    };
+    let park_id = match ctx.module().get_name("rt_io_park_current") {
+        Some(FuncOrDataId::Func(id)) => id,
+        _ => {
+            return Err(anyhow!(
+                "rt_io_park_current must be declared before rt_pidfd_poll_async"
+            ));
+        }
+    };
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut module_ctx = ctx.module().make_context();
+    let mut builder = FunctionBuilder::new(&mut module_ctx.func, &mut builder_ctx);
+
+    builder.func.signature.params.push(AbiParam::new(ty));
+    builder.func.signature.returns.push(AbiParam::new(ty));
+
+    let entry = builder.create_block();
+    builder.append_block_param(entry, ty);
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+    let pidfd = builder.block_params(entry)[0];
+
+    let sched_gv = ctx
+        .module_mut()
+        .declare_data_in_func(sched_fat_id, &mut builder.func);
+    let park_ref = ctx
+        .module_mut()
+        .declare_func_in_func(park_id, &mut builder.func);
+    let sh_ctx_fat = builder.ins().global_value(ty, sched_gv);
+    let sh_ctx_start = builder.ins().load(ty, MemFlags::trusted(), sh_ctx_fat, 0);
+
+    emit_submit_poll_sqe(sh_ctx_start, pidfd, ty, &mut builder);
+
+    builder.ins().call(park_ref, &[]);
+
+    // Wake path stuffs CQE.res into TEMP_VAL — return value here is a
+    // placeholder cranelift requires for the signature.
+    let zero = builder.ins().iconst(ty, 0);
+    builder.ins().return_(&[zero]);
+
+    let sig = builder.func.signature.clone();
+    let id = ctx
+        .module_mut()
+        .declare_function("rt_pidfd_poll_async", Linkage::Export, &sig)?;
+    ctx.module_mut().define_function(id, &mut module_ctx)?;
+    ctx.module_mut().clear_context(&mut module_ctx);
+    Ok(ctx)
+}
+
+/// POLLADD-shaped SQE — like io_uring.rs:emit_submit_sqe but writes
+/// `poll32_events` @ 28 instead of `len` @ 24.  Stamps proc-ctx fat-ptr
+/// into user_data so emit_wake_by_user_data routes the CQE back.
+fn emit_submit_poll_sqe(
+    sh_ctx_start: Value,
+    fd: Value,
+    ty: cranelift::prelude::Type,
+    builder: &mut FunctionBuilder,
+) {
+    let sq_tail_ptr = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::SQ_TAIL_PTR,
+    );
+    let sq_mask_ptr = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::SQ_MASK_PTR,
+    );
+    let sq_array_ptr = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::SQ_ARRAY_PTR,
+    );
+    let sqe_array_ptr = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::SQE_ARRAY_PTR,
+    );
+
+    let tail = builder
+        .ins()
+        .load(types::I32, MemFlags::trusted(), sq_tail_ptr, 0);
+    let mask = builder
+        .ins()
+        .load(types::I32, MemFlags::trusted(), sq_mask_ptr, 0);
+    let idx32 = builder.ins().band(tail, mask);
+    let idx = builder.ins().uextend(ty, idx32);
+
+    let sqe_offset = builder.ins().imul_imm(idx, SQE_BYTES);
+    let sqe_addr = builder.ins().iadd(sqe_array_ptr, sqe_offset);
+
+    let zero64 = builder.ins().iconst(ty, 0);
+    for i in 0..8 {
+        builder
+            .ins()
+            .store(MemFlags::trusted(), zero64, sqe_addr, i * 8);
+    }
+
+    let opcode = builder.ins().iconst(types::I8, IORING_OP_POLL_ADD);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), opcode, sqe_addr, 0);
+    let fd32 = builder.ins().ireduce(types::I32, fd);
+    builder.ins().store(MemFlags::trusted(), fd32, sqe_addr, 4);
+    let pollin32 = builder.ins().iconst(types::I32, POLLIN);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), pollin32, sqe_addr, 28);
+
+    // user_data = current proc-ctx fat-ptr (parking variant; see #116).
+    let cur_idx = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::CURRENT_PROCESS,
+    );
+    let proc_arr_fat = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::PROCESS_ARR_FAT,
+    );
+    let proc_arr_start = builder.ins().load(ty, MemFlags::trusted(), proc_arr_fat, 0);
+    let cur_off = builder.ins().ishl_imm(cur_idx, 3);
+    let cur_addr = builder.ins().iadd(proc_arr_start, cur_off);
+    let proc_ctx = builder.ins().load(ty, MemFlags::trusted(), cur_addr, 0);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), proc_ctx, sqe_addr, 32);
+
+    let arr_off = builder.ins().ishl_imm(idx, 2);
+    let arr_slot = builder.ins().iadd(sq_array_ptr, arr_off);
+    builder.ins().store(MemFlags::trusted(), idx32, arr_slot, 0);
+    let new_tail = builder.ins().iadd_imm(tail, 1);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), new_tail, sq_tail_ptr, 0);
+    let pending = builder.ins().load(
+        ty,
+        MemFlags::trusted(),
+        sh_ctx_start,
+        ShedulerCtxLayout::SQE_PENDING,
+    );
+    let pending_next = builder.ins().iadd_imm(pending, 1);
+    builder.ins().store(
+        MemFlags::trusted(),
+        pending_next,
+        sh_ctx_start,
+        ShedulerCtxLayout::SQE_PENDING,
+    );
 }

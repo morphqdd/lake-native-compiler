@@ -25,7 +25,7 @@ use crate::compiler::{
                 define_listen_tcp, define_recv_async, define_send_async, define_write_async,
             },
             mmap::{define_init_heap, define_mmap, define_munmap},
-            process::define_clone3_pidfd,
+            process::{define_clone3_pidfd, define_pidfd_poll_async},
             read::define_read,
             scratch::define_scratch_buf,
             strings::{define_len, define_str_ptr, define_to_string, define_to_string_with_ln},
@@ -119,6 +119,8 @@ impl RuntimeBuilder {
         let ctx = define_recv_async(ctx)?;
         debug!("rt: rt_clone3_pidfd");
         let ctx = define_clone3_pidfd(ctx)?;
+        debug!("rt: rt_pidfd_poll_async");
+        let ctx = define_pidfd_poll_async(ctx)?;
         debug!("rt: rt_write");
         let ctx = define_write(ctx)?;
         debug!("rt: rt_read");

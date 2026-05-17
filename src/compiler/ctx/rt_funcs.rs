@@ -23,6 +23,7 @@ pub struct RtFuncs {
     pub scratch_buf: FuncId,
     pub tsc_now: FuncId,
     pub clone3_pidfd: FuncId,
+    pub pidfd_poll_async: FuncId,
 }
 
 impl RtFuncs {
@@ -42,6 +43,7 @@ impl RtFuncs {
             scratch_buf: resolve_func(module, "rt_scratch_buf")?,
             tsc_now: resolve_func(module, "rt_tsc_now")?,
             clone3_pidfd: resolve_func(module, "rt_clone3_pidfd")?,
+            pidfd_poll_async: resolve_func(module, "rt_pidfd_poll_async")?,
         })
     }
 
