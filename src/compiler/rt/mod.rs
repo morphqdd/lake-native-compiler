@@ -26,6 +26,7 @@ use crate::compiler::{
             },
             mmap::{define_init_heap, define_mmap, define_munmap},
             read::define_read,
+            scratch::define_scratch_buf,
             strings::{define_len, define_str_ptr, define_to_string, define_to_string_with_ln},
             syscall::declare_syscall_wrapper,
             write::{define_write, define_write_static},
@@ -126,6 +127,8 @@ impl RuntimeBuilder {
         let ctx = define_to_string_with_ln(ctx)?;
         debug!("rt: to_string");
         let ctx = define_to_string(ctx)?;
+        debug!("rt: rt_scratch_buf");
+        let ctx = define_scratch_buf(ctx)?;
         // Resolve and cache all FuncIds in the context.
         let mut ctx = ctx;
         let rt = RtFuncs::resolve(ctx.module())?;

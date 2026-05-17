@@ -8,25 +8,25 @@ use crate::compiler::ctx::CompilerCtx;
 /// Runtime execution context layout.
 /// Single source of truth for all field offsets.
 ///
-/// Memory layout (80 bytes):
-/// +0  branch_id    : i64  — which branch of the machine is active
-/// +8  block_id     : i64  — which block inside the branch to execute next
-/// +16 temp_val     : i64  — scratch register for passing values between blocks
-/// +24 variables    : i64  — fat ptr (start addr) to the variables array
-/// +32 jump_args    : i64  — fat ptr (start addr) to the jump-arguments array
-/// +40 mailbox_fat  : i64  — fat ptr to ring-buffer mailbox (256 × 8 bytes)
-/// +48 mailbox_head : i64  — read index (consumer)
-/// +56 mailbox_tail : i64  — write index (producer)
-/// +64 own_pid      : i64  — process_ctx fat-ptr address of THIS actor.
-/// +72 is_dying     : i64  — non-zero = actor crashed inside a rt-* call and
+/// Memory layout (208 bytes):
+/// +0   branch_id    : i64  — which branch of the machine is active
+/// +8   block_id     : i64  — which block inside the branch to execute next
+/// +16  temp_val     : i64  — scratch register for passing values between blocks
+/// +24  variables    : i64  — fat ptr (start addr) to the variables array
+/// +32  jump_args    : i64  — fat ptr (start addr) to the jump-arguments array
+/// +40  mailbox_fat  : i64  — fat ptr to ring-buffer mailbox (256 × 8 bytes)
+/// +48  mailbox_head : i64  — read index (consumer)
+/// +56  mailbox_tail : i64  — write index (producer)
+/// +64  own_pid      : i64  — process_ctx fat-ptr address of THIS actor.
+/// +72  is_dying     : i64  — non-zero = actor crashed inside a rt-* call and
 ///                            must be removed at the next quantum boundary.
 ///                            machine.rs::quantum_loop_block reads this and
 ///                            returns STOP_DONE so the scheduler unlinks the
 ///                            actor without unwinding Cranelift's call stack.
+/// +80  scratch_ring : 8 × {ptr i64, capacity i64} (128 B) — see #082.
 pub struct ExecCtxLayout;
 
 impl ExecCtxLayout {
-    pub const SIZE: i32 = 80;
     pub const BRANCH_ID: i32 = 0;
     pub const BLOCK_ID: i32 = 8;
     pub const TEMP_VAL: i32 = 16;
@@ -37,6 +37,13 @@ impl ExecCtxLayout {
     pub const MAILBOX_TAIL: i32 = 56;
     pub const OWN_PID: i32 = 64;
     pub const IS_DYING: i32 = 72;
+    /// Per-actor scratch buffer pool (feature #082).
+    /// 8 slots of `{ptr i64, capacity i64}` immediately after IS_DYING.
+    pub const SCRATCH_RING: i32 = 80;
+    pub const SCRATCH_SLOTS: usize = 8;
+    pub const SCRATCH_SLOT_SIZE: i32 = 16;
+    pub const SCRATCH_RING_BYTES: i32 = 128;
+    pub const SIZE: i32 = 208;
 
     /// Emit a direct load of a field from a raw ctx pointer.
     /// `ctx_ptr` must point to the start of the ExecCtx data (not the fat ptr).
@@ -69,8 +76,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn layout_size_is_80() {
-        assert_eq!(ExecCtxLayout::SIZE, 80);
+    fn layout_size_is_208() {
+        assert_eq!(ExecCtxLayout::SIZE, 208);
     }
 
     #[test]
@@ -85,10 +92,26 @@ mod tests {
         assert_eq!(ExecCtxLayout::MAILBOX_TAIL, 56);
         assert_eq!(ExecCtxLayout::OWN_PID, 64);
         assert_eq!(ExecCtxLayout::IS_DYING, 72);
+        assert_eq!(ExecCtxLayout::SCRATCH_RING, 80);
+    }
+
+    #[test]
+    fn scratch_ring_constants() {
+        assert_eq!(ExecCtxLayout::SCRATCH_SLOTS, 8);
+        assert_eq!(ExecCtxLayout::SCRATCH_SLOT_SIZE, 16);
+        assert_eq!(ExecCtxLayout::SCRATCH_RING_BYTES, 128);
+        assert_eq!(
+            ExecCtxLayout::SCRATCH_RING_BYTES,
+            (ExecCtxLayout::SCRATCH_SLOTS as i32) * ExecCtxLayout::SCRATCH_SLOT_SIZE,
+        );
     }
 
     #[test]
     fn last_field_fits_within_size() {
         assert!(ExecCtxLayout::IS_DYING + 8 <= ExecCtxLayout::SIZE);
+        assert_eq!(
+            ExecCtxLayout::SCRATCH_RING + ExecCtxLayout::SCRATCH_RING_BYTES,
+            ExecCtxLayout::SIZE,
+        );
     }
 }

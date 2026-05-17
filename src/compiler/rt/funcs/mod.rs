@@ -5,6 +5,7 @@ pub mod exit;
 pub mod io_uring;
 pub mod mmap;
 pub mod read;
+pub mod scratch;
 pub mod strings;
 pub mod syscall;
 pub mod write;
