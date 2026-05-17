@@ -172,6 +172,13 @@ fn define_allocate_impl(
     // free_list[bucket] = next
     builder.ins().store(MemFlags::trusted(), next, head_addr, 0);
 
+    // Rewrite the recycled fat-ptr's end to user_size (see #122).  The prior
+    // allocation left this as bucket-rounded — would over-report size().
+    let visible_end_pop = builder.ins().iadd(payload_addr, user_size);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), visible_end_pop, head, 8);
+
     if zero_on_pop {
         // Zero the recycled payload so callers see fresh memory (matches the
         // bump-from-mmap path's implicit zero-init).  We only need to clear the
@@ -508,14 +515,17 @@ fn define_allocate_impl(
     let _ = TrapCode::HEAP_OUT_OF_BOUNDS;
 
     // Write the fat-pointer header at heap_curr_addr.
+    // See docs/state/bugs/122_alloc_or_die_size_capacity.md: fat-ptr end
+    // reflects the user-requested length, not the bucket-rounded capacity.
+    let visible_end = builder.ins().iadd(aligned_user_ptr, user_size);
     builder
         .ins()
         .store(MemFlags::trusted(), aligned_user_ptr, heap_curr_addr, 0);
     builder
         .ins()
-        .store(MemFlags::trusted(), end_addr, heap_curr_addr, 8);
+        .store(MemFlags::trusted(), visible_end, heap_curr_addr, 8);
 
-    // Advance heap_curr to end_addr.
+    // Advance heap_curr to end_addr (bucket-rounded — bookkeeping only).
     builder
         .ins()
         .store(MemFlags::trusted(), end_addr, heap_curr_ptr, 0);
@@ -531,6 +541,9 @@ fn define_allocate_impl(
     //             fat_ptr_addr                    fat_ptr.start (= addr + 32)
     // fat_ptr.end = mmap_addr + mmap_size — this lets `rt_free` recover the
     // exact mmap_size as `end - fat_ptr_addr` to pass to `rt_munmap`.
+    // TODO #122: still bucket-rounded — size(b) for >16 MiB returns the
+    // page-aligned mmap_size, not user_size.  Fix when rt_free learns to
+    // recover mmap_size from a header word instead of `end - fat_ptr`.
     builder.switch_to_block(huge_block);
     builder.seal_block(huge_block);
 
