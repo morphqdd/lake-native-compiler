@@ -621,29 +621,10 @@ pub fn define_write_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .ins()
         .store(MemFlags::trusted(), len32, sqe_addr, 24);
 
-    // user_data @ 32 (u64) = current proc-ctx fat-ptr.  Echoed verbatim in
-    // the CQE, used by `emit_wake_by_user_data` to wake the right actor.
-    let cur_idx = builder.ins().load(
-        ty,
-        MemFlags::trusted(),
-        sh_ctx_start,
-        ShedulerCtxLayout::CURRENT_PROCESS,
-    );
-    let proc_arr_fat_for_ud = builder.ins().load(
-        ty,
-        MemFlags::trusted(),
-        sh_ctx_start,
-        ShedulerCtxLayout::PROCESS_ARR_FAT,
-    );
-    let proc_arr_start_for_ud = builder
-        .ins()
-        .load(ty, MemFlags::trusted(), proc_arr_fat_for_ud, 0);
-    let cur_off = builder.ins().ishl_imm(cur_idx, 3);
-    let cur_addr = builder.ins().iadd(proc_arr_start_for_ud, cur_off);
-    let cur_proc_ctx = builder.ins().load(ty, MemFlags::trusted(), cur_addr, 0);
+    // user_data=0: rt_write_async is fire-and-forget. See docs/state/bugs/116_spawned_print_lost.md
     builder
         .ins()
-        .store(MemFlags::trusted(), cur_proc_ctx, sqe_addr, 32);
+        .store(MemFlags::trusted(), zero64, sqe_addr, 32);
 
     // SQ.array[idx] = idx — the indirect submission queue.
     let arr_offset = builder.ins().ishl_imm(idx, 2);
