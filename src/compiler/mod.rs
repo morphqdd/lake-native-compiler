@@ -14,7 +14,7 @@ use lake_frontend::{
     },
     prelude::{build_program, load_and_build},
 };
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 
 use crate::compiler::{
     ctx::{CompilerCtx, OptLevel, registry::GuardValue},
@@ -223,7 +223,20 @@ fn compute_target_cycles() -> i64 {
                 .and_then(|s| s.trim().parse().ok())
         })
         .unwrap_or(3_000_000);
-    // cycles = us × (tsc_khz / 1000)
+    // See docs/state/bugs/120_target_cycles_u32_overflow.md — heads-up for
+    // users picking quantum so large the TSC check is effectively disabled.
+    if us > 100_000 {
+        warn!(
+            "LAKE_QUANTUM_US={us} is unusually high (>100ms); TSC budget \
+             will rarely fire — consider the block-counter quantum instead"
+        );
+    }
+    target_cycles_from(us, tsc_khz)
+}
+
+/// Pure helper for `compute_target_cycles` — `us × (tsc_khz / 1000)` with
+/// saturating multiply.  Split out for unit tests of the i64-vs-u32 path.
+pub fn target_cycles_from(us: i64, tsc_khz: i64) -> i64 {
     let cycles = us.saturating_mul(tsc_khz) / 1000;
     cycles.max(1)
 }
@@ -478,4 +491,30 @@ pub(crate) fn hash_call_args(
         canon.hash(&mut hasher);
     }
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::target_cycles_from;
+
+    /// Bug #120 — `LAKE_QUANTUM_US × tsc_khz / 1000` must stay full i64.
+    /// At ~4.4GHz, 1s quantum lands at 4.4e9 which overflows u32 (4.29e9);
+    /// the historical bug was the immediate getting truncated to its low
+    /// 32 bits.  These cases pin the pure arithmetic.
+    #[test]
+    fn target_cycles_no_u32_truncation() {
+        // Small quantum — well within i32, no overflow concern.
+        assert_eq!(target_cycles_from(10, 4_400_000), 44_000);
+        // Default-ish: 200µs at 4.4GHz.
+        assert_eq!(target_cycles_from(200, 4_400_000), 880_000);
+        // 1ms — still i32-safe.
+        assert_eq!(target_cycles_from(1_000, 4_400_000), 4_400_000);
+        // 1s at 4.4GHz: 4_400_000_000 — overflows u32, must remain i64.
+        let big = target_cycles_from(1_000_000, 4_400_000);
+        assert_eq!(big, 4_400_000_000_i64);
+        assert!(big > u32::MAX as i64, "must exceed u32::MAX");
+        // Saturating-mul guard: extreme inputs don't wrap to a tiny value.
+        let huge = target_cycles_from(i64::MAX / 2, 4_400_000);
+        assert!(huge > 0, "saturating-mul prevents wrap-to-negative");
+    }
 }

@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use cranelift::{
     codegen::ir::BlockArg,
     frontend::Switch,
-    module::{Linkage, Module},
+    module::{DataDescription, Linkage, Module},
     prelude::{AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder, IntCC, MemFlags},
 };
 use lake_frontend::api::ast::{Machine, MachineItem};
@@ -235,7 +235,24 @@ pub fn compile_machine(
         ExecCtxLayout::SLICE_START_TSC,
     );
     let elapsed = builder.ins().isub(tsc_now, slice_start);
-    let target = builder.ins().iconst(ptr_ty, target_cycles);
+    // See docs/state/bugs/120_target_cycles_u32_overflow.md — load wide
+    // target_cycles from rodata to defeat any imm32 narrowing in the cmp.
+    let target = if (i32::MIN as i64..=i32::MAX as i64).contains(&target_cycles) {
+        builder.ins().iconst(ptr_ty, target_cycles)
+    } else {
+        let data_name = format!("tgt_cycles_{machine_ident}");
+        let data_id = ctx
+            .module_mut()
+            .declare_data(&data_name, Linkage::Local, false, false)?;
+        let mut desc = DataDescription::new();
+        desc.define(target_cycles.to_le_bytes().to_vec().into_boxed_slice());
+        ctx.module_mut().define_data(data_id, &desc)?;
+        let gv = ctx
+            .module_mut()
+            .declare_data_in_func(data_id, builder.func);
+        let base = builder.ins().global_value(ptr_ty, gv);
+        builder.ins().load(ptr_ty, MemFlags::trusted(), base, 0)
+    };
     let over_budget = builder
         .ins()
         .icmp(IntCC::UnsignedGreaterThan, elapsed, target);
