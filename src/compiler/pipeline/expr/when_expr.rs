@@ -17,6 +17,153 @@ use crate::compiler::{
 
 use super::{BranchState, compile_expr};
 
+/// Feature #079 — K-table lookup for dense small-domain numeric `when`.
+/// See docs/state/features/079_*.md.
+fn const_fold_i64(expr: &Expr<'_>) -> Option<i64> {
+    match expr {
+        Expr::Num(s, _) => lake_frontend::api::expr::parse_int_literal(s).ok(),
+        Expr::Bool(b) => Some(if *b { 1 } else { 0 }),
+        Expr::Neg(inner) => const_fold_i64(&inner.inner).map(|v| v.wrapping_neg()),
+        Expr::Add(l, r) => Some(const_fold_i64(&l.inner)?.wrapping_add(const_fold_i64(&r.inner)?)),
+        Expr::Sub(l, r) => Some(const_fold_i64(&l.inner)?.wrapping_sub(const_fold_i64(&r.inner)?)),
+        Expr::Mul(l, r) => Some(const_fold_i64(&l.inner)?.wrapping_mul(const_fold_i64(&r.inner)?)),
+        Expr::Div(l, r) => {
+            let rv = const_fold_i64(&r.inner)?;
+            if rv == 0 {
+                None
+            } else {
+                Some(const_fold_i64(&l.inner)?.wrapping_div(rv))
+            }
+        }
+        Expr::BAnd(l, r) => Some(const_fold_i64(&l.inner)? & const_fold_i64(&r.inner)?),
+        Expr::BOr(l, r) => Some(const_fold_i64(&l.inner)? | const_fold_i64(&r.inner)?),
+        Expr::BXor(l, r) => Some(const_fold_i64(&l.inner)? ^ const_fold_i64(&r.inner)?),
+        Expr::Shl(l, r) => {
+            let rv = const_fold_i64(&r.inner)?;
+            if !(0..64).contains(&rv) {
+                None
+            } else {
+                Some(const_fold_i64(&l.inner)?.wrapping_shl(rv as u32))
+            }
+        }
+        Expr::Shr(l, r) => {
+            let rv = const_fold_i64(&r.inner)?;
+            if !(0..64).contains(&rv) {
+                None
+            } else {
+                Some((const_fold_i64(&l.inner)? as u64).wrapping_shr(rv as u32) as i64)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Detector: returns `Some(values)` iff every arm key is an i64 `Num`,
+/// keys form exactly `0..N`, no wildcard, and every arm body is one
+/// const-foldable i64 expression.
+fn try_build_k_table<'a>(branches: &[(Expr<'a>, Vec<Expr<'a>>)]) -> Option<Vec<i64>> {
+    if branches.len() < 2 {
+        return None;
+    }
+    let n = branches.len() as i64;
+    let mut values = vec![0i64; branches.len()];
+    let mut seen = vec![false; branches.len()];
+    for (cond, body) in branches.iter() {
+        if is_wildcard(cond) {
+            return None;
+        }
+        let key = match cond {
+            Expr::Num(s, _) => lake_frontend::api::expr::parse_int_literal(s).ok()?,
+            _ => return None,
+        };
+        if !(0..n).contains(&key) {
+            return None;
+        }
+        let idx = key as usize;
+        if seen[idx] {
+            return None;
+        }
+        seen[idx] = true;
+        if body.len() != 1 {
+            return None;
+        }
+        values[idx] = const_fold_i64(&body[0])?;
+    }
+    if !seen.iter().all(|&s| s) {
+        return None;
+    }
+    Some(values)
+}
+
+/// Emit the K-table lookup path.  Assumes the discriminant has already
+/// been compiled and lands at `disc_done_id`.  Returns the `after_when_id`
+/// to use as the continuation point.
+fn emit_k_table(
+    ctx: &mut CompilerCtx,
+    builder: &mut FunctionBuilder,
+    machine_ctx_var: Variable,
+    outer_switch: &mut Switch,
+    disc_done_id: i64,
+    values: &[i64],
+) -> Result<i64> {
+    let ptr_ty = ctx.module().target_config().pointer_type();
+    let after_when_id = disc_done_id + 1;
+    let n = values.len() as i64;
+
+    // Declare a Local .rodata symbol holding the i64 table.
+    let data_name = format!("ktbl_{disc_done_id}");
+    let data_id = ctx
+        .module_mut()
+        .declare_data(&data_name, Linkage::Local, false, false)?;
+    let mut bytes: Vec<u8> = Vec::with_capacity(values.len() * 8);
+    for v in values {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    let mut desc = DataDescription::new();
+    desc.define(bytes.into_boxed_slice());
+    ctx.module_mut().define_data(data_id, &desc)?;
+
+    let b_lookup = builder.create_block();
+    let b_inrange = builder.create_block();
+    let b_oob = builder.create_block();
+
+    // Lookup block — load disc from TEMP_VAL, bounds-check, branch.
+    // Block sealing is deferred to `seal_all_blocks()` at the end of
+    // machine compilation: sealing locally with zero predecessors
+    // (the branch_switch jumps to b_lookup get added later) would
+    // make `use_var(machine_ctx_var)` resolve to undef (0) because
+    // the SSA reconstruction can't see backward through the not-yet
+    // -emitted switch.
+    builder.switch_to_block(b_lookup);
+    let exec_start = ctx.exec_start(builder, machine_ctx_var);
+    let disc = ExecCtxLayout::load(builder, ptr_ty, exec_start, ExecCtxLayout::TEMP_VAL);
+    let in_range = builder.ins().icmp_imm(IntCC::UnsignedLessThan, disc, n);
+    builder.ins().brif(in_range, b_inrange, &[], b_oob, &[]);
+
+    // In-range: load values[disc], store to TEMP_VAL, continue.
+    builder.switch_to_block(b_inrange);
+    let kt_gv = ctx
+        .module_mut()
+        .declare_data_in_func(data_id, builder.func);
+    let kt_base = builder.ins().global_value(ptr_ty, kt_gv);
+    let off = builder.ins().imul_imm(disc, 8);
+    let addr = builder.ins().iadd(kt_base, off);
+    let val = builder.ins().load(ptr_ty, MemFlags::trusted(), addr, 0);
+    let exec_start2 = ctx.exec_start(builder, machine_ctx_var);
+    ExecCtxLayout::store(builder, val, exec_start2, ExecCtxLayout::TEMP_VAL);
+    let qb = ctx.quantum_block();
+    let after_v = builder.ins().iconst(ptr_ty, after_when_id);
+    builder.ins().jump(qb, &[BlockArg::Value(after_v)]);
+
+    // OOB: silent fall-through, matches when_no_match_continues semantics.
+    builder.switch_to_block(b_oob);
+    let after_v2 = builder.ins().iconst(ptr_ty, after_when_id);
+    builder.ins().jump(qb, &[BlockArg::Value(after_v2)]);
+
+    outer_switch.set_entry(disc_done_id as u128, b_lookup);
+    Ok(after_when_id)
+}
+
 enum WhenBranchType {
     Simple,
     Ptr,
@@ -58,6 +205,36 @@ pub fn compile<'a>(
         }
         positions.into_iter().next()
     };
+
+    // #079 — Detect the K-table fast path BEFORE creating the
+    // N-way-switch helper blocks: those blocks would otherwise be
+    // dangling (created but never filled) when we return early.
+    if let Some(values) = try_build_k_table(&branches) {
+        let disc_done_id = match compile_expr(
+            ctx,
+            builder,
+            machine_ctx_var,
+            block_id,
+            outer_switch,
+            state,
+            cond_expr,
+            None,
+            None,
+            false,
+        )? {
+            StmtOutcome::Continue(id) => id,
+            other => bail!("`when` discriminant cannot be a terminal: {:?}", other),
+        };
+        let after_when_id = emit_k_table(
+            ctx,
+            builder,
+            machine_ctx_var,
+            outer_switch,
+            disc_done_id,
+            &values,
+        )?;
+        return Ok(StmtOutcome::Continue(after_when_id));
+    }
 
     let b_check = builder.create_block();
     let b_ret: Vec<_> = (0..branches.len())
