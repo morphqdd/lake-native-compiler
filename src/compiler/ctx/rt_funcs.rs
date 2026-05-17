@@ -22,6 +22,7 @@ pub struct RtFuncs {
     pub free: FuncId,
     pub scratch_buf: FuncId,
     pub tsc_now: FuncId,
+    pub clone3_pidfd: FuncId,
 }
 
 impl RtFuncs {
@@ -40,6 +41,7 @@ impl RtFuncs {
             free: resolve_func(module, "rt_free")?,
             scratch_buf: resolve_func(module, "rt_scratch_buf")?,
             tsc_now: resolve_func(module, "rt_tsc_now")?,
+            clone3_pidfd: resolve_func(module, "rt_clone3_pidfd")?,
         })
     }
 
