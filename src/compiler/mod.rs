@@ -50,11 +50,17 @@ pub fn compile<SP: AsRef<Path>>(
     // ── Phase 2: parse → populate registry → resolve → typecheck ───────────
     let lake_program = build_program(&sources).map_err(|errs| {
         pb.finish_and_clear();
-        // Render diagnostics against every loaded file in turn; spans
-        // outside the file's range simply don't render.
-        for f in sources.files() {
-            errs.display(&f.src, &f.source_path);
-        }
+        // Route each diagnostic to the file its span belongs to.  Old
+        // code looped every loaded file and re-rendered all errors
+        // against each — a span valid for file B would get sliced
+        // into file A's bytes and ariadne would panic on a mid-
+        // multibyte-char boundary.  See bug #126.
+        let files: Vec<(&Path, &str)> = sources
+            .files()
+            .iter()
+            .map(|f| (f.source_path.as_path(), f.src.as_str()))
+            .collect();
+        errs.display_multi(&files);
         anyhow!("Failed while build ast!")
     })?;
 
