@@ -1,0 +1,41 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: install rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+
+      - name: build lakec
+        run: cargo build --release --bin lakec
+
+      - name: pack
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          install -m 0755 target/release/lakec dist/lakec
+          tar -czf "lakec-${VER}-linux-x86_64.tar.gz" -C dist lakec
+
+      - name: upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: lakec-*-linux-x86_64.tar.gz
+          fail_on_unmatched_files: true
