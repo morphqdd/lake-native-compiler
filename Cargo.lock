@@ -185,7 +185,7 @@ dependencies = [
 [[package]]
 name = "chumsky"
 version = "0.13.0"
-source = "git+https://github.com/zesterer/chumsky.git#345191037ec76e5abfff228c7e35e6dd75e924ed"
+source = "git+https://github.com/zesterer/chumsky.git#4879268c589b18927df6ec21331e66d7fb56df86"
 dependencies = [
  "hashbrown 0.15.5",
  "regex-automata 0.3.9",
@@ -841,7 +841,7 @@ dependencies = [
 [[package]]
 name = "lake-frontend"
 version = "0.1.0"
-source = "git+https://github.com/morphqdd/lake_frontend.git?branch=dev#e308b46f63ceba32d4dd7f894f358af1f089ea44"
+source = "git+https://github.com/morphqdd/lake_frontend.git?branch=dev#09fdbd8d8e9c35934fdcc115af3fe147303089d1"
 dependencies = [
  "ariadne",
  "chrono",
