@@ -116,12 +116,23 @@ impl BranchState {
         &self.lake_types
     }
 
-    /// Number of variables currently tracked (= number of occupied slots).
+    /// Number of variable slots currently occupied — equivalent to the
+    /// index of the next free slot.  This is the slot count, not the
+    /// unique-name count: a shadow-rebind (`let p = ...; let p = ...`)
+    /// allocates a new slot each time, so `len()` must reflect every
+    /// slot ever allocated, not the HashMap's entry count.
+    ///
+    /// Wait dequeue (`wait_expr.rs::var_base`) and the per-branch
+    /// VARIABLES sizing (`branch.rs::update_branch_var_count`) both
+    /// depend on this returning the next free index.  Returning the
+    /// HashMap entry count caused wait dequeues to write into still-
+    /// live earlier slots whenever a name was shadowed, corrupting the
+    /// filter pid and causing the wait to never fire (#132).
     pub fn len(&self) -> usize {
-        self.vars.len()
+        self.next_index()
     }
 
-    fn next_index(&self) -> usize {
+    pub fn next_index(&self) -> usize {
         self.vars.values().map(|(_, i)| i + 1).max().unwrap_or(0)
     }
 
