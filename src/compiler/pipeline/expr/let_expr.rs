@@ -100,13 +100,24 @@ pub fn compile(
     builder.switch_to_block(b);
 
     // Register the variable and get its slot index.  Composite types
-    // (Struct/Tuple, atom) all live as fat-pointer i64s at runtime, so
-    // collapse them to "i64" before the type-map lookup; the surface
-    // string is still kept as the Lake-level type for downstream
-    // diagnostics via `lake_type_of`.
+    // (Struct/Tuple, atom, user-defined records) all live as fat-
+    // pointer-sized i64s at runtime, so collapse them to "i64" before
+    // the type-map lookup; the surface string is still kept as the
+    // Lake-level type for downstream diagnostics via `lake_type_of`.
+    // A `Type::Named` for any non-builtin (i.e. typeck-accepted record
+    // name) falls into the same i64 slot since Lake's ABI is uniformly
+    // pointer-sized for reference types.  #058 followup.
     let lookup_key = match ty {
         Type::Struct(_) => "i64".to_string(),
         Type::Named(ident) if ident.inner.0 == "atom" => "i64".to_string(),
+        Type::Named(ident) => {
+            let n = ident.inner.0;
+            if ctx.lookup_type(n).is_some() {
+                n.to_string()
+            } else {
+                "i64".to_string()
+            }
+        }
         _ => ty.to_string(),
     };
     let cranelift_ty = ctx
@@ -235,6 +246,17 @@ fn compile_pure_let(
     let lookup_key = match ty {
         Type::Struct(_) => "i64".to_string(),
         Type::Named(ident) if ident.inner.0 == "atom" => "i64".to_string(),
+        Type::Named(ident) => {
+            let n = ident.inner.0;
+            if ctx.lookup_type(n).is_some() {
+                n.to_string()
+            } else {
+                // Unknown name reaches codegen only after typeck
+                // accepted it — must be a user-defined record.
+                // ABI is uniformly pointer-sized.  #058 followup.
+                "i64".to_string()
+            }
+        }
         _ => ty.to_string(),
     };
     let cranelift_ty = ctx
