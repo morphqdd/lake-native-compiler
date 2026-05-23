@@ -467,6 +467,14 @@ pub(crate) fn hash_call_args(
             // receiver's `Struct(fields)` annotation.  Lets Go-style
             // error pipelines (`call(prev.1)`) compute a stable call
             // hash that matches the callee's branch sig.
+            //
+            // Records (#058): receiver tagged `Type::Named(record_name)`
+            // by the resolver after a record-returning ret-machine's
+            // let-binding flows into the wait handler.  Skip these
+            // here — var_types doesn't carry the field schema; the
+            // current pattern-hash uses the record's source name only.
+            // For typeck call-arg matching see typeck::expr_type_str
+            // which queries the registry directly.
             Expr::TupleIndex { receiver, index } => {
                 if let Expr::Var(_, Type::Struct(fields)) = &receiver.inner {
                     if let Some(field) = fields.get(*index) {
