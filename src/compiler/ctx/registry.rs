@@ -90,6 +90,7 @@ impl MachineInfo {
     pub fn max_var_count(&self) -> usize {
         self.by_id.values().map(|b| b.var_count).max().unwrap_or(0)
     }
+
 }
 
 /// Registry for all machines and their branches.

@@ -48,3 +48,9 @@ lto = false
 debug-assertions = false
 overflow-checks = false
 
+
+# Local path override while the cross-module record fix (frontend
+# commit a446836) is unpushed.  Remove once `dev` is up to date.
+[patch."https://github.com/morphqdd/lake_frontend.git"]
+lake-frontend = { path = "../lake-frontend" }
+

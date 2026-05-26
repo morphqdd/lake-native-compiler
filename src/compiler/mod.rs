@@ -433,6 +433,31 @@ pub(crate) fn hash_pattern(patterns: &[Pattern<'_>]) -> (u64, usize) {
 /// declared in the enclosing branch pattern.  When the frontend emits `{}`
 /// for a variable whose type is actually known (e.g. `n` declared as `i64`),
 /// the map is used to recover the correct type string.
+/// Walk a (possibly chained) TupleIndex expression and return the
+/// declared type at the chain's end.  Terminates at a `Var` whose
+/// `ty` is `Type::Struct(fields)`; each intermediate TupleIndex
+/// step indexes through the field list.  Returns `None` when the
+/// chain breaks (non-Var leaf, type not Struct, index out of
+/// bounds).  Used by `hash_call_args` to classify TupleIndex args
+/// without consulting the registry — the frontend resolver deeply
+/// expands record-typed Vars so every step lands in a Struct.
+pub(crate) fn tuple_index_chain_type<'a, 'src>(
+    expr: &'a Expr<'src>,
+) -> Option<&'a Type<'src>> {
+    match expr {
+        Expr::Var(_, ty) => Some(ty),
+        Expr::TupleIndex { receiver, index } => {
+            let recv_ty = tuple_index_chain_type(&receiver.inner)?;
+            if let Type::Struct(fields) = recv_ty {
+                fields.get(*index).map(|f| &f.inner)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn hash_call_args(
     args: &[lake_frontend::api::expr::Expr<'_>],
     var_types: &std::collections::HashMap<String, String>,
@@ -463,25 +488,17 @@ pub(crate) fn hash_call_args(
                 Expr::Var(_, ty) => ty.to_string(),
                 _ => continue,
             },
-            // `tuple.idx` argument: read the element type from the
-            // receiver's `Struct(fields)` annotation.  Lets Go-style
-            // error pipelines (`call(prev.1)`) compute a stable call
-            // hash that matches the callee's branch sig.
-            //
-            // Records (#058): receiver tagged `Type::Named(record_name)`
-            // by the resolver after a record-returning ret-machine's
-            // let-binding flows into the wait handler.  Skip these
-            // here — var_types doesn't carry the field schema; the
-            // current pattern-hash uses the record's source name only.
-            // For typeck call-arg matching see typeck::expr_type_str
-            // which queries the registry directly.
-            Expr::TupleIndex { receiver, index } => {
-                if let Expr::Var(_, Type::Struct(fields)) = &receiver.inner {
-                    if let Some(field) = fields.get(*index) {
-                        field.inner.to_string()
-                    } else {
-                        continue;
-                    }
+            // `tuple.idx` argument: walk the (possibly chained)
+            // receiver chain looking for the leaf Var whose `ty` is a
+            // `Type::Struct(fields)`.  Each step indexes through the
+            // corresponding field list.  Lets Go-style pipelines and
+            // `r.method.inner`-style chained dot access compute a
+            // stable call hash without registry access — the frontend
+            // resolver deeply expands record-typed Vars so every step
+            // lands in a `Type::Struct`.
+            Expr::TupleIndex { .. } => {
+                if let Some(ty) = tuple_index_chain_type(arg) {
+                    ty.to_string()
                 } else {
                     continue;
                 }
