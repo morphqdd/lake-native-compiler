@@ -655,6 +655,34 @@ impl ShedulerCtxLayout {
             Self::clear_pid(sh_ctx_ptr, dead_pid, ctx, builder);
         }
 
+        // ── Reclaim the actor's arena (feature #138 phase 1) ─────────────
+        // Read OWNED_ARENA_FAT before freeing process_ctx (which would
+        // clobber its payload).  Skip the free if the field is zero —
+        // an actor spawned via `init_main_process` may not have an
+        // arena (main runs in a pre-allocated process slot).
+        let arena_off = builder
+            .ins()
+            .iconst(ptr_ty, ProcessCtxLayout::OWNED_ARENA_FAT as i64);
+        let call_arena = builder
+            .ins()
+            .call(load_ref, &[process_ctx_fat_ptr, arena_off]);
+        let arena_fat_ptr = builder.inst_results(call_arena)[0];
+
+        let arena_is_set_block = builder.create_block();
+        let frees_block = builder.create_block();
+        let arena_present = builder.ins().icmp_imm(IntCC::NotEqual, arena_fat_ptr, 0);
+        builder
+            .ins()
+            .brif(arena_present, arena_is_set_block, &[], frees_block, &[]);
+
+        builder.switch_to_block(arena_is_set_block);
+        builder.seal_block(arena_is_set_block);
+        builder.ins().call(free_ref, &[arena_fat_ptr]);
+        builder.ins().jump(frees_block, &[]);
+
+        builder.switch_to_block(frees_block);
+        builder.seal_block(frees_block);
+
         // Free leaf allocations first, then the containers.
         builder.ins().call(free_ref, &[vars_fat_ptr]);
         builder.ins().call(free_ref, &[args_fat_ptr]);

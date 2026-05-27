@@ -165,6 +165,26 @@ pub fn compile_spawn(
     let proc_ctx_fat_ptr =
         ProcessCtxLayout::init_ctx(ctx, builder, machine_name, exec_ctx_fat_ptr)?;
 
+    // ── Allocate per-actor arena (feature #138 phase 1).  One 64 KB
+    // mmap per spawned actor; freed atomically by `free_process_resources`
+    // so every allocation the actor ever made gets reclaimed in one shot.
+    // The arena's start/end fat-pointer fields ARE the bump pointer: each
+    // `rt_arena_alloc` advances `arena.start` past the carved-out chunk
+    // until it meets `arena.end`, at which point arena is full and the
+    // caller falls back to `rt_allocate` (legacy bucket allocator).
+    const ARENA_DEFAULT_BYTES: i64 = 64 * 1024;
+    let arena_size = builder.ins().iconst(ptr_ty, ARENA_DEFAULT_BYTES);
+    let call_arena = builder.ins().call(allocate_ref, &[arena_size]);
+    let arena_fat_ptr = builder.inst_results(call_arena)[0];
+    // Store arena fat-ptr in proc_ctx.OWNED_ARENA_FAT for later reclaim.
+    let store_ref_arena = rt_funcs.store_ref(ctx.module_mut(), builder);
+    let arena_off = builder.ins().iconst(ptr_ty, ProcessCtxLayout::OWNED_ARENA_FAT as i64);
+    let arena_field_size = builder.ins().iconst(ptr_ty, 8);
+    builder.ins().call(
+        store_ref_arena,
+        &[proc_ctx_fat_ptr, arena_fat_ptr, arena_field_size, arena_off],
+    );
+
     let sched_data_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
         Some(FuncOrDataId::Data(id)) => id,
         _ => bail!("sheduler_ctx_fat_ptr global not found"),

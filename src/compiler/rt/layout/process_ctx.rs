@@ -9,7 +9,6 @@ use crate::compiler::{ctx::CompilerCtx, rt::layout::ExecCtxLayout};
 pub struct ProcessCtxLayout;
 
 impl ProcessCtxLayout {
-    pub const SIZE: i32 = 24;
     pub const FUNC_PTR: i32 = 0;
     pub const EXEC_CTX: i32 = 8;
     /// Slot index in `sh_ctx.io_parked` while this actor is parked, or
@@ -17,6 +16,13 @@ impl ProcessCtxLayout {
     /// `rt_io_park_current` (write on park) and `emit_wake_by_user_data`
     /// (used to swap-and-pop in O(1) without scanning `io_parked`).
     pub const IO_PARKED_IDX: i32 = 16;
+    /// Per-actor arena (feature #138).  Fat-ptr to a single mmap'd region
+    /// (default 64 KB) from which user-side `rt_arena_alloc` bumps.
+    /// Initialised in `spawn_expr` when arena mode is on; zero otherwise.
+    /// Reclaimed by `free_process_resources` via a single `rt_free` call,
+    /// freeing every allocation the actor made in one shot.
+    pub const OWNED_ARENA_FAT: i32 = 24;
+    pub const SIZE: i32 = 32;
 
     pub fn init_ctx(
         ctx: &mut CompilerCtx,
@@ -62,6 +68,14 @@ impl ProcessCtxLayout {
         builder
             .ins()
             .call(store_ref, &[process_ctx_ptr, zero, ptr_size, io_idx_offset]);
+
+        // Initialise OWNED_ARENA_FAT to 0.  `spawn_expr` overwrites it with
+        // the actor's arena when arena mode is on; left as 0 the
+        // `free_process_resources` path skips the arena-free call.
+        let arena_off = builder.ins().iconst(ptr_ty, Self::OWNED_ARENA_FAT as i64);
+        builder
+            .ins()
+            .call(store_ref, &[process_ctx_ptr, zero, ptr_size, arena_off]);
 
         Ok(process_ctx_ptr)
     }
