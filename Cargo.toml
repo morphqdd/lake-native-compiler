@@ -12,14 +12,14 @@ log = "0.4"
 env_logger = "0.11"
 base64ct = {version = "1.8.2", features = ['alloc']}
 # blink = { git = "https://github.com/morphqdd/blink", version = "0.0.0" }
-# Stays on 0.127 until a wasmtime release ships the
-# Aarch64AdrPrelPgHi21 ObjectModule relocation handler that lives on
-# `main` today.  Upgrading to git main also breaks MemFlags →
-# MemFlagsData (≈30+ call sites) plus other internals — out of scope
-# for the ARM-port batch.  Track upstream wasmtime cranelift-v0.132
-# (or later) and bump together with the rename migration.
-cranelift = { version = "0.127.0", features = ["module", "native", "object"] }
-cranelift-wasm = "0.112.3"
+# 0.132 unblocks aarch64 codegen — earlier versions panicked on the
+# Aarch64AdrPrelPgHi21 relocation in cranelift-object's ELF emitter.
+# Feared MemFlags → MemFlagsData rename was on wasmtime main but
+# never shipped in a tagged release, so this bump was a no-op API-wise.
+cranelift = { version = "0.132.0", features = ["module", "native", "object"] }
+# arch backends live on cranelift-codegen, not on the cranelift facade
+cranelift-codegen = { version = "0.132.0", features = ["arm64"] }
+target-lexicon = "0.13"
 chumsky = { git = "https://github.com/zesterer/chumsky.git", features = ["pratt"] }
 lake-frontend = { git = "https://github.com/morphqdd/lake_frontend.git", branch = "dev" }
 num_cpus = "1.17.0"

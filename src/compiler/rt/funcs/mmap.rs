@@ -70,7 +70,7 @@ pub fn define_mmap(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .declare_func_in_func(syscall_id, &mut builder.func);
 
     let length = builder.block_params(entry)[0];
-    let sys_mmap = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_mmap);
+    let sys_mmap = builder.ins().iconst(ty, ctx.syscalls().sys_mmap);
     let addr = builder.ins().iconst(ty, 0);
     let prot = builder.ins().iconst(ty, PROT_READ | PROT_WRITE);
     let flags = builder
@@ -130,7 +130,7 @@ pub fn define_munmap(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let length = builder.block_params(entry)[1];
     let sys_munmap = builder
         .ins()
-        .iconst(ty, LinuxSyscalls::for_host().sys_munmap);
+        .iconst(ty, ctx.syscalls().sys_munmap);
     let zero = builder.ins().iconst(ty, 0);
 
     // rt_syscall takes 7 fixed args; munmap uses only nr+addr+length.

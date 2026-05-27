@@ -13,7 +13,7 @@ use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
-use lakec::compiler::{compile, ctx::OptLevel, link};
+use lakec::compiler::{compile_for_target, ctx::OptLevel, link, target::TargetArch};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Opt {
@@ -64,6 +64,15 @@ struct Cli {
     /// `src/main.lake` → `<out>/main`).
     #[arg(short = 'o', long = "out")]
     out_dir: Option<String>,
+
+    /// Target architecture for cross-compilation.  Accepts bare arch
+    /// names (`x86_64`, `aarch64`) or rustc-style triples
+    /// (`aarch64-unknown-linux-gnu`).  Defaults to the host arch.
+    /// Cross-compile requires a matching linker — set `--linker` to
+    /// `aarch64-linux-gnu-ld` (or mold with aarch64 support) when
+    /// targeting aarch64 from an x86_64 host.
+    #[arg(long = "target")]
+    target: Option<String>,
 }
 
 /// Run `work` while showing an animated progress bar.
@@ -147,9 +156,16 @@ fn main() -> Result<()> {
         mode,
     );
 
+    let target_arch = match &cli.target {
+        Some(t) => TargetArch::parse(t)?,
+        None => TargetArch::host(),
+    };
+
     let src_path_owned = src_path.to_path_buf();
     let t0 = Instant::now();
-    let obj_bytes = with_progress("building", 300, move |pb| compile(pb, &src_path_owned, opt));
+    let obj_bytes = with_progress("building", 300, move |pb| {
+        compile_for_target(pb, &src_path_owned, opt, target_arch)
+    });
     let obj_bytes = obj_bytes?;
     let build_ms = t0.elapsed().as_millis();
     println!(

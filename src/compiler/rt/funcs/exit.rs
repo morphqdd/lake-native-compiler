@@ -31,7 +31,7 @@ pub fn define_exit(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .declare_func_in_func(syscall_id, &mut builder.func);
 
     let code = builder.block_params(entry)[0];
-    let sys_exit = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_exit);
+    let sys_exit = builder.ins().iconst(ty, ctx.syscalls().sys_exit);
     let zero = builder.ins().iconst(ty, 0);
     builder
         .ins()

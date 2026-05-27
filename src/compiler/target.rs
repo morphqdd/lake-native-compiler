@@ -79,13 +79,69 @@ impl LinuxSyscalls {
     /// today is JIT/AOT-on-host, so target == host.  When a `--target`
     /// flag lands, swap this for a parameterised lookup.
     pub fn for_host() -> Self {
+        Self::for_target(TargetArch::host())
+    }
+
+    /// Pick the table for an explicit target.
+    pub fn for_target(target: TargetArch) -> Self {
+        match target {
+            TargetArch::X86_64 => Self::X86_64,
+            TargetArch::Aarch64 => Self::AARCH64,
+        }
+    }
+}
+
+/// Cross-compile target arch.  Resolved from `--target` CLI arg or
+/// defaults to host.  Lake supports Linux x86_64 and Linux aarch64.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetArch {
+    X86_64,
+    Aarch64,
+}
+
+impl TargetArch {
+    /// Pick the arch matching the running compiler's host.  Used as
+    /// the default when `--target` is not supplied.
+    pub fn host() -> Self {
         match std::env::consts::ARCH {
             "x86_64" => Self::X86_64,
-            "aarch64" => Self::AARCH64,
+            "aarch64" => Self::Aarch64,
             other => panic!(
-                "lake-native-compiler: target arch '{other}' not supported \
+                "lake-native-compiler: host arch '{other}' not supported \
                  (only linux/x86_64 and linux/aarch64)"
             ),
+        }
+    }
+
+    /// Parse a target string accepted by the `--target` CLI flag.
+    /// Accepts bare arch names (`x86_64`, `aarch64`) and the more
+    /// rustc-like triples (`x86_64-linux`, `aarch64-linux`,
+    /// `aarch64-unknown-linux-gnu`).
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        let arch = s.split('-').next().unwrap_or(s);
+        match arch {
+            "x86_64" => Ok(Self::X86_64),
+            "aarch64" | "arm64" => Ok(Self::Aarch64),
+            other => anyhow::bail!(
+                "unsupported target arch '{other}' (expected x86_64 or aarch64)"
+            ),
+        }
+    }
+
+    /// Lowercase canonical name used by CARGO_CFG_TARGET_ARCH and
+    /// `@cfg(arch="...")` lookups.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::X86_64 => "x86_64",
+            Self::Aarch64 => "aarch64",
+        }
+    }
+
+    /// Target triple string suitable for cranelift's `isa::lookup`.
+    pub fn triple(self) -> &'static str {
+        match self {
+            Self::X86_64 => "x86_64-unknown-linux-gnu",
+            Self::Aarch64 => "aarch64-unknown-linux-gnu",
         }
     }
 }

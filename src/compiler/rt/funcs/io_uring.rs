@@ -214,7 +214,7 @@ pub fn define_io_uring_setup(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let remaining = builder.block_params(try_block)[0];
     let nr = builder
         .ins()
-        .iconst(ty, LinuxSyscalls::for_host().sys_io_uring_setup);
+        .iconst(ty, ctx.syscalls().sys_io_uring_setup);
     let entries = builder.ins().iconst(ty, RING_ENTRIES);
     let call_setup = builder.ins().call(
         syscall_ref,
@@ -246,7 +246,7 @@ pub fn define_io_uring_setup(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     builder.seal_block(do_sleep_block);
     let nano_nr = builder
         .ins()
-        .iconst(ty, LinuxSyscalls::for_host().sys_nanosleep);
+        .iconst(ty, ctx.syscalls().sys_nanosleep);
     builder.ins().call(
         syscall_ref,
         &[nano_nr, ts_addr, zero64, zero64, zero64, zero64, zero64],
@@ -299,7 +299,7 @@ pub fn define_io_uring_setup(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let cq_off_cqes_ext = builder.ins().uextend(ty, cq_off_cqes);
 
     // ── 5. mmap three regions ────────────────────────────────────────────────
-    let nr_mmap = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_mmap);
+    let nr_mmap = builder.ins().iconst(ty, ctx.syscalls().sys_mmap);
     let prot = builder.ins().iconst(ty, PROT_READ | PROT_WRITE);
     let flags_mmap = builder.ins().iconst(ty, MAP_SHARED | MAP_POPULATE);
 
@@ -476,7 +476,7 @@ pub fn define_io_uring_flush(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     );
     let nr_enter = builder
         .ins()
-        .iconst(ty, LinuxSyscalls::for_host().sys_io_uring_enter);
+        .iconst(ty, ctx.syscalls().sys_io_uring_enter);
     let zero64 = builder.ins().iconst(ty, 0);
     let _ = builder.ins().call(
         syscall_ref,
@@ -665,7 +665,7 @@ pub fn define_write_async(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     builder.seal_block(flush_block);
     let nr_enter = builder
         .ins()
-        .iconst(ty, LinuxSyscalls::for_host().sys_io_uring_enter);
+        .iconst(ty, ctx.syscalls().sys_io_uring_enter);
     let _ = builder.ins().call(
         syscall_ref,
         &[
@@ -929,7 +929,7 @@ pub fn define_io_uring_wait_cqe(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     //                flags=IORING_ENTER_GETEVENTS)
     let nr = builder
         .ins()
-        .iconst(ty, LinuxSyscalls::for_host().sys_io_uring_enter);
+        .iconst(ty, ctx.syscalls().sys_io_uring_enter);
     let zero = builder.ins().iconst(ty, 0);
     let one = builder.ins().iconst(ty, 1);
     let flags = builder.ins().iconst(ty, 1); // IORING_ENTER_GETEVENTS = 1
@@ -1289,7 +1289,7 @@ pub fn define_listen_tcp(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     // socket(AF_INET, SOCK_STREAM, 0) → fd
     let nr_socket = builder
         .ins()
-        .iconst(ty, LinuxSyscalls::for_host().sys_socket);
+        .iconst(ty, ctx.syscalls().sys_socket);
     let af = builder.ins().iconst(ty, AF_INET);
     let sock_stream = builder.ins().iconst(ty, SOCK_STREAM);
     let call_sock = builder.ins().call(
@@ -1305,7 +1305,7 @@ pub fn define_listen_tcp(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     // setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &1, 4)
     let nr_setsockopt = builder
         .ins()
-        .iconst(ty, LinuxSyscalls::for_host().sys_setsockopt);
+        .iconst(ty, ctx.syscalls().sys_setsockopt);
     let sol = builder.ins().iconst(ty, SOL_SOCKET);
     let reuse = builder.ins().iconst(ty, SO_REUSEADDR);
     let four = builder.ins().iconst(ty, 4);
@@ -1315,7 +1315,7 @@ pub fn define_listen_tcp(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     );
 
     // bind(fd, sa, 16)
-    let nr_bind = builder.ins().iconst(ty, LinuxSyscalls::for_host().sys_bind);
+    let nr_bind = builder.ins().iconst(ty, ctx.syscalls().sys_bind);
     let sixteen = builder.ins().iconst(ty, 16);
     let call_bind = builder.ins().call(
         syscall_ref,
@@ -1330,7 +1330,7 @@ pub fn define_listen_tcp(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     // listen(fd, 4096)
     let nr_listen = builder
         .ins()
-        .iconst(ty, LinuxSyscalls::for_host().sys_listen);
+        .iconst(ty, ctx.syscalls().sys_listen);
     let backlog = builder.ins().iconst(ty, 4096);
     let _ = builder.ins().call(
         syscall_ref,
@@ -1376,7 +1376,7 @@ pub fn define_close(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .declare_func_in_func(syscall_id, &mut builder.func);
     let nr = builder
         .ins()
-        .iconst(ty, LinuxSyscalls::for_host().sys_close);
+        .iconst(ty, ctx.syscalls().sys_close);
     let zero = builder.ins().iconst(ty, 0);
     let _ = builder
         .ins()

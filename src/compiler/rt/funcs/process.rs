@@ -111,7 +111,7 @@ pub fn define_clone3_pidfd(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
     let nr = builder
         .ins()
-        .iconst(ty, LinuxSyscalls::for_host().sys_clone3);
+        .iconst(ty, ctx.syscalls().sys_clone3);
     let size = builder.ins().iconst(ty, CLONE_ARGS_SIZE);
     let call = builder.ins().call(
         syscall_ref,
@@ -383,7 +383,7 @@ pub fn define_waitid_pidfd(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
 
     let nr = builder
         .ins()
-        .iconst(ty, LinuxSyscalls::for_host().sys_waitid);
+        .iconst(ty, ctx.syscalls().sys_waitid);
     let idtype = builder.ins().iconst(ty, P_PIDFD);
     let options = builder.ins().iconst(ty, WEXITED | WNOHANG);
     let call = builder.ins().call(

@@ -20,6 +20,8 @@ use compiler_type::CompilerType;
 use registry::MachineRegistry;
 use rt_funcs::RtFuncs;
 
+use crate::compiler::target::{LinuxSyscalls, TargetArch};
+
 pub struct CompilerCtx {
     module: ObjectModule,
     /// Registry of all machines and their branch metadata.
@@ -79,6 +81,11 @@ pub struct CompilerCtx {
     /// callers so that each call site gets unique data-section names
     /// (`guard_disp_<n>`, `guard_keys_<n>`, …).
     next_dispatch_id: i64,
+    /// Target architecture for codegen.  Defaults to host, overridable
+    /// via the `--target` CLI flag.  Read by rt-fn emission to pick
+    /// the right Linux syscall numbers and by ObjectModule setup to
+    /// emit the right ISA-flavoured ELF.
+    target_arch: TargetArch,
 }
 
 /// Cranelift optimisation level.
@@ -108,15 +115,37 @@ impl Default for CompilerCtx {
 
 impl CompilerCtx {
     pub fn new(opt: OptLevel) -> Self {
+        Self::new_for_target(opt, TargetArch::host())
+    }
+
+    pub fn new_for_target(opt: OptLevel, target_arch: TargetArch) -> Self {
         let mut flag_builder = settings::builder();
         flag_builder.set("opt_level", opt.as_str()).unwrap();
         flag_builder.set("use_colocated_libcalls", "false").unwrap();
         flag_builder.set("is_pic", "false").unwrap();
-        let isa_builder =
-            native::builder().unwrap_or_else(|msg| panic!("Host machine is not supported: {msg}"));
-        let isa = isa_builder
-            .finish(settings::Flags::new(flag_builder))
-            .unwrap();
+        let host_arch = TargetArch::host();
+        let isa = if target_arch == host_arch {
+            // Host-targeting: use cranelift_native to pick up CPU features.
+            let isa_builder = native::builder()
+                .unwrap_or_else(|msg| panic!("Host machine is not supported: {msg}"));
+            isa_builder
+                .finish(settings::Flags::new(flag_builder))
+                .unwrap()
+        } else {
+            // Cross-compile: look up the explicit target triple.
+            let triple: target_lexicon::Triple = target_arch
+                .triple()
+                .parse()
+                .expect("known triple should parse");
+            let isa_builder = cranelift::codegen::isa::lookup(triple)
+                .unwrap_or_else(|e| panic!(
+                    "lake-native-compiler: cranelift has no backend for target '{}': {e}",
+                    target_arch.triple(),
+                ));
+            isa_builder
+                .finish(settings::Flags::new(flag_builder))
+                .unwrap()
+        };
         let builder = ObjectBuilder::new(isa, "lake-program", default_libcall_names()).unwrap();
         let module = ObjectModule::new(builder);
         Self {
@@ -141,7 +170,20 @@ impl CompilerCtx {
             current_branch_entry_block: None,
             current_branch_id: None,
             next_dispatch_id: 0,
+            target_arch,
         }
+    }
+
+    /// Linux syscall table matching the target arch.  All rt-fn
+    /// emission should query this instead of `LinuxSyscalls::for_host`
+    /// so that cross-compile works.
+    pub fn syscalls(&self) -> LinuxSyscalls {
+        LinuxSyscalls::for_target(self.target_arch)
+    }
+
+    /// Target architecture for this compilation unit.
+    pub fn target_arch(&self) -> TargetArch {
+        self.target_arch
     }
 
     /// Hand out a fresh id for a guard-dispatch call site.  Used to namespace

@@ -33,6 +33,15 @@ pub fn compile<SP: AsRef<Path>>(
     source_path: SP,
     opt: OptLevel,
 ) -> Result<Vec<u8>> {
+    compile_for_target(pb, source_path, opt, target::TargetArch::host())
+}
+
+pub fn compile_for_target<SP: AsRef<Path>>(
+    pb: ProgressBar,
+    source_path: SP,
+    opt: OptLevel,
+    target_arch: target::TargetArch,
+) -> Result<Vec<u8>> {
     let path = source_path.as_ref();
     info!("compile: {} (opt={})", path.display(), opt.as_str());
 
@@ -78,7 +87,7 @@ pub fn compile<SP: AsRef<Path>>(
         item_count
     );
 
-    let mut ctx = CompilerCtx::new(opt);
+    let mut ctx = CompilerCtx::new_for_target(opt, target_arch);
 
     info!("initializing runtime");
     ctx = RuntimeBuilder::init(ctx)?;
