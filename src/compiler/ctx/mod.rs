@@ -157,6 +157,13 @@ impl CompilerCtx {
                 ("str".into(), CompilerType::Simple(Type::int(64).unwrap())),
                 ("buf".into(), CompilerType::Simple(Type::int(64).unwrap())),
                 ("pid".into(), CompilerType::Simple(Type::int(64).unwrap())),
+                // The unit type `{}` (used as `ret {}` on void-returning
+                // ret-machines like `die`) is storage-compatible with i64
+                // at the ABI level — the rt-fn returns nothing but the
+                // tuple-ABI wrap still synthesises a zero fat-ptr.  Listing
+                // it here lets `let __lift_X = die()` lifted forms compile
+                // (relift in #145 phase 3 may lift void-returning calls).
+                ("{}".into(), CompilerType::Simple(Type::int(64).unwrap())),
             ]),
             rt_funcs: None,
             func_ref_cache: HashMap::new(),
