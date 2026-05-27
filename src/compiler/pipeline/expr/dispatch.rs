@@ -24,6 +24,33 @@ pub fn find_first_guard_pos(candidates: &[BranchInfo]) -> usize {
         .unwrap_or(0)
 }
 
+/// Find the most-discriminating guard position across `candidates` — i.e.
+/// the position with the greatest number of distinct literal values.  Ties
+/// are broken in favor of the leftmost position.  This avoids MPHF
+/// duplicate-key panics when all branches share a literal at the first
+/// guard position (e.g. all routes start with `"GET"`).
+pub fn find_best_guard_pos(candidates: &[BranchInfo]) -> usize {
+    if candidates.is_empty() {
+        return 0;
+    }
+    let max_arity = candidates.iter().map(|c| c.guards.len()).max().unwrap_or(0);
+    let mut best_pos = find_first_guard_pos(candidates);
+    let mut best_distinct = 0usize;
+    for pos in 0..max_arity {
+        let mut seen: std::collections::HashSet<&GuardValue> = std::collections::HashSet::new();
+        for c in candidates {
+            if let Some(Some(g)) = c.guards.get(pos) {
+                seen.insert(g);
+            }
+        }
+        if seen.len() > best_distinct {
+            best_distinct = seen.len();
+            best_pos = pos;
+        }
+    }
+    best_pos
+}
+
 /// Returns the kind of guard present in the candidates at the first guard
 /// position, or `None` if no candidate has any guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,7 +60,7 @@ pub enum GuardKind {
 }
 
 pub fn guard_kind(candidates: &[BranchInfo]) -> Option<GuardKind> {
-    let pos = find_first_guard_pos(candidates);
+    let pos = find_best_guard_pos(candidates);
     for branch in candidates {
         match branch.guards.get(pos).and_then(|g| g.as_ref()) {
             Some(GuardValue::Int(_)) => return Some(GuardKind::Int),
@@ -164,7 +191,7 @@ pub fn emit_str_guard_select(
     let mut str_branches: Vec<(usize, &BranchInfo, Vec<u8>)> = Vec::new();
     let mut wildcard: Option<&BranchInfo> = None;
 
-    let pos = find_first_guard_pos(candidates);
+    let pos = find_best_guard_pos(candidates);
     for branch in candidates {
         match branch.guards.get(pos).and_then(|g| g.as_ref()) {
             Some(GuardValue::Str(s)) => {

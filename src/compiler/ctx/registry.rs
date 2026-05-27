@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::{Result, anyhow};
 
 /// A compile-time literal guard value for a single branch parameter.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum GuardValue {
     Int(i64),
     Str(String),

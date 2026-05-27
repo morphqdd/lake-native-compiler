@@ -496,7 +496,7 @@ fn compile_fused_self_call(
     let same_branch = single_candidate && Some(candidates[0].branch_id) == ctx.current_branch_id();
 
     let branch_id_val = if !single_candidate {
-        let disc_pos = dispatch::find_first_guard_pos(&candidates);
+        let disc_pos = dispatch::find_best_guard_pos(&candidates);
         let disc = builder
             .ins()
             .load(ptr_ty, MemFlags::trusted(), vars_start, disc_pos as i32 * 8);

@@ -82,7 +82,7 @@ pub fn compile(
     }
 
     let branch_id_val = if needs_guard_dispatch {
-        let disc_pos = dispatch::find_first_guard_pos(&candidates);
+        let disc_pos = dispatch::find_best_guard_pos(&candidates);
         let disc = builder.ins().load(
             ptr_ty,
             MemFlags::trusted(),
