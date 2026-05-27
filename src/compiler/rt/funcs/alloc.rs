@@ -359,19 +359,22 @@ fn define_allocate_impl(
         let result = builder.block_params(merge_block)[0];
 
         if func_name == "rt_allocate" {
-            let alloc_raw_id = match ctx.module().get_name("rt_allocate_raw") {
+            // Tuple wrapper {atom buf} via arena — reclaimed on actor
+            // death, eliminating the 16-byte-per-call leak previously
+            // observed with rt_allocate_raw.
+            let arena_alloc_id = match ctx.module().get_name("rt_arena_alloc") {
                 Some(FuncOrDataId::Func(id)) => id,
                 _ => {
                     return Err(anyhow!(
-                        "rt_allocate_raw missing for rt_allocate tuple wrap (slab)"
+                        "rt_arena_alloc missing for rt_allocate tuple wrap (slab)"
                     ));
                 }
             };
-            let alloc_raw_ref = ctx
+            let arena_alloc_ref = ctx
                 .module_mut()
-                .declare_func_in_func(alloc_raw_id, &mut builder.func);
+                .declare_func_in_func(arena_alloc_id, &mut builder.func);
             let sixteen_v = builder.ins().iconst(ty, 16);
-            let call = builder.ins().call(alloc_raw_ref, &[sixteen_v]);
+            let call = builder.ins().call(arena_alloc_ref, &[sixteen_v]);
             let tuple_fp = builder.inst_results(call)[0];
             let tuple_start = builder.ins().load(ty, MemFlags::trusted(), tuple_fp, 0);
             let ok_a = builder.ins().iconst(ty, atom_id("ok"));
@@ -828,22 +831,23 @@ fn define_allocate_impl(
 
     if is_tuple_abi {
         // Wrap the buf fat-ptr in a 2-slot tuple `{:ok buf}`.  The
-        // 16-byte tuple itself is allocated via the raw allocator so
-        // user code can `let r = rt_allocate(N); when r.0 { :ok -> r.1
-        // _ -> ... }` without an extra layer of unwrapping.
-        let alloc_raw_id = match ctx.module().get_name("rt_allocate_raw") {
+        // 16-byte tuple lives in the actor's arena — reclaimed on
+        // actor death.  Previously this routed through rt_allocate_raw
+        // which had no scheduler-side free, leaking 16 B per
+        // rt_allocate call.
+        let arena_alloc_id = match ctx.module().get_name("rt_arena_alloc") {
             Some(FuncOrDataId::Func(id)) => id,
             _ => {
                 return Err(anyhow!(
-                    "rt_allocate_raw missing for rt_allocate tuple wrap"
+                    "rt_arena_alloc missing for rt_allocate tuple wrap"
                 ));
             }
         };
-        let alloc_raw_ref = ctx
+        let arena_alloc_ref = ctx
             .module_mut()
-            .declare_func_in_func(alloc_raw_id, &mut builder.func);
+            .declare_func_in_func(arena_alloc_id, &mut builder.func);
         let sixteen = builder.ins().iconst(ty, 16);
-        let call = builder.ins().call(alloc_raw_ref, &[sixteen]);
+        let call = builder.ins().call(arena_alloc_ref, &[sixteen]);
         let tuple_fp = builder.inst_results(call)[0];
         let tuple_start = builder.ins().load(ty, MemFlags::trusted(), tuple_fp, 0);
         let ok_a = builder.ins().iconst(ty, atom_id("ok"));

@@ -82,20 +82,19 @@ impl RuntimeBuilder {
         let ctx = define_allocate_slab(ctx)?;
         debug!("rt: rt_free_slab");
         let ctx = define_free_slab(ctx)?;
-        // `rt_allocate_raw` first so the user-facing `rt_allocate`
-        // (which returns the tuple `{atom buf}`) can call into the raw
-        // variant for its 16-byte tuple wrapper without forward refs.
+        // `rt_allocate_raw` first.  `rt_arena_alloc` is declared
+        // before `rt_allocate` so the user-facing tuple-ABI wrapper
+        // can route its 16-byte `{atom buf}` header through the
+        // actor's arena (reclaimed on death) instead of leaking via
+        // raw heap.  See docs/state/bugs — tuple-wrapper-leak.
         debug!("rt: rt_allocate_raw");
         let ctx = define_allocate_raw(ctx)?;
+        debug!("rt: rt_arena_alloc");
+        let ctx = define_arena_alloc(ctx)?;
         debug!("rt: rt_allocate");
         let ctx = define_allocate(ctx)?;
         debug!("rt: rt_free");
         let ctx = define_free(ctx)?;
-        // rt_arena_alloc is feature #138 — per-actor arena bump path.
-        // Must be declared AFTER rt_allocate (it falls back when the
-        // arena is exhausted or absent).
-        debug!("rt: rt_arena_alloc");
-        let ctx = define_arena_alloc(ctx)?;
         debug!("rt: rt_store");
         let ctx = define_store(ctx)?;
         debug!("rt: rt_load_u{{8,16,32,64}}");
