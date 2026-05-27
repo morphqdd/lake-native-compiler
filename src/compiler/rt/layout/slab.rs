@@ -79,14 +79,28 @@ impl SlabLayout {
         1usize << (class_idx + 4)
     }
 
-    /// How many chunks of class `class_idx` fit in a default-sized slab,
-    /// after accounting for the header + bitmap + 16-byte payload alignment.
+    /// Per-class slab size, in bytes.  For class < 12 → `DEFAULT_SLAB_SIZE`
+    /// (64 KiB).  For class ≥ 12 → `2 * class_size` (one chunk per slab,
+    /// next-pow-2 envelope giving room for header + padding).  Always
+    /// a power of two so `chunk_addr & !(slab_size - 1)` recovers the
+    /// slab base; always a multiple of 64 KiB so the 64-KiB mask trick
+    /// in `define_free_slab` finds a unique slab base for any class.
     ///
-    /// Returns 0 if even one chunk does not fit — those classes need a
-    /// per-class oversized slab (designed in phase 2).
+    /// See docs/state/features/150_allocator_rewrite.md → phase 5.
+    pub const fn slab_size_for_class(class_idx: usize) -> usize {
+        let class_size = Self::class_size(class_idx);
+        let default = Self::DEFAULT_SLAB_SIZE as usize;
+        if class_size * 2 > default { class_size * 2 } else { default }
+    }
+
+    /// How many chunks of class `class_idx` fit in a slab of size
+    /// `slab_size_for_class(class_idx)`, after accounting for header +
+    /// bitmap + 16-byte payload alignment.
+    ///
+    /// Always > 0 (phase 5: oversized slabs carry 1 chunk).
     pub fn chunks_per_slab(class_idx: usize) -> usize {
         let chunk_size = Self::class_size(class_idx);
-        let slab_size = Self::DEFAULT_SLAB_SIZE as usize;
+        let slab_size = Self::slab_size_for_class(class_idx);
         let header = Self::HDR_FIXED_BYTES as usize;
         let align = Self::CHUNK_ALIGN as usize;
 
@@ -137,16 +151,24 @@ mod tests {
         );
     }
 
-    /// Class 12 = 64 KiB chunks; a 64 KiB slab can't fit even one
-    /// (header + bitmap + chunk > slab_size).  Must report 0 so phase 2
-    /// can route through an oversized-slab path.
+    /// Phase 5: class ≥ 12 carries one chunk per oversized slab
+    /// (slab_size = 2 × class_size).  Free path needs chunks_per_slab > 0
+    /// so the bit-flip + free-count check works.
     #[test]
-    fn class_12_needs_custom_slab_size() {
-        assert_eq!(
-            SlabLayout::chunks_per_slab(12),
-            0,
-            "class 12 (64 KiB chunks) cannot fit in a 64 KiB default slab",
-        );
+    fn class_12_oversized_one_chunk() {
+        assert_eq!(SlabLayout::chunks_per_slab(12), 1);
+        assert_eq!(SlabLayout::slab_size_for_class(12), 128 * 1024);
+    }
+
+    /// Per-class slab size is always pow2 and ≥ 64 KiB so the
+    /// 64 KiB-mask trick in `define_free_slab` lands on a unique slab base.
+    #[test]
+    fn slab_size_pow2_and_ge_64kib() {
+        for i in 0..SlabLayout::NUM_CLASSES {
+            let s = SlabLayout::slab_size_for_class(i);
+            assert!(s >= SlabLayout::DEFAULT_SLAB_SIZE as usize);
+            assert!(s.is_power_of_two(), "class {i} slab_size {s} not pow2");
+        }
     }
 
     /// Small classes (≤ 1 KiB) must always fit at least one chunk.
@@ -193,19 +215,16 @@ mod tests {
         );
     }
 
-    /// Identify (don't fix) the classes that need a custom slab size.
-    /// This is the working-set for phase 2.
+    /// Phase 5: every class fits ≥ 1 chunk.  Verifies no class ends up
+    /// in the "needs custom slab size" bucket any more.
     #[test]
-    fn report_classes_needing_custom_slab_size() {
-        let mut needs_custom = Vec::new();
+    fn every_class_fits_at_least_one_chunk() {
         for i in 0..SlabLayout::NUM_CLASSES {
-            if SlabLayout::chunks_per_slab(i) == 0 {
-                needs_custom.push((i, SlabLayout::class_size(i)));
-            }
+            assert!(
+                SlabLayout::chunks_per_slab(i) > 0,
+                "class {i} ({} B) should fit ≥1 chunk after phase 5",
+                SlabLayout::class_size(i),
+            );
         }
-        // Sanity: at least the very-large classes (≥ slab_size) must be
-        // in this set.
-        assert!(!needs_custom.is_empty(),
-            "expected at least one class to need a custom slab size");
     }
 }

@@ -191,8 +191,10 @@ fn define_allocate_impl(
         let slab_log2_ceil = builder.ins().isub(total_bits, slab_lz);
         let slab_class_idx = builder.ins().iadd_imm(slab_log2_ceil, -4);
 
-        // slab_supported = slab_class_idx <= 11
-        let max_slab_class = builder.ins().iconst(ty, 11);
+        // Phase 5: slab handles every supported class (0..20 = ≤ 16 MiB).
+        // Larger requests still fall through to the direct-mmap huge_block
+        // path.  max_slab_class = NUM_CLASSES - 1 = 20.
+        let max_slab_class = builder.ins().iconst(ty, (SlabLayout::NUM_CLASSES - 1) as i64);
         let slab_supported = builder.ins().icmp(
             IntCC::UnsignedLessThanOrEqual,
             slab_class_idx,
@@ -970,8 +972,9 @@ pub fn define_free(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         let slab_log2_ceil = builder.ins().isub(total_bits, slab_lz);
         let slab_class_idx = builder.ins().iadd_imm(slab_log2_ceil, -4);
 
-        // slab_supported = slab_class_idx <= 11
-        let max_slab = builder.ins().iconst(ty, 11);
+        // Phase 5: free routes ≤ class 20 (≤ 16 MiB) through slab path —
+        // matches alloc-side widening.
+        let max_slab = builder.ins().iconst(ty, (SlabLayout::NUM_CLASSES - 1) as i64);
         let slab_supported = builder.ins().icmp(
             IntCC::UnsignedLessThanOrEqual,
             slab_class_idx,
@@ -1864,16 +1867,16 @@ fn emit_create_new_slab(
     class_idx_val: Value,
     chunks_per_slab_val: Value,
     num_words_val: Value,
+    slab_size_val: Value,
     mmap_ref: cranelift::codegen::ir::FuncRef,
     munmap_ref: cranelift::codegen::ir::FuncRef,
     success_block: cranelift::prelude::Block,
     fail_block: cranelift::prelude::Block,
 ) {
     let _ = ctx;
-    let slab_size = SlabLayout::DEFAULT_SLAB_SIZE;
 
     // raw = mmap(2 * slab_size)
-    let double_size = builder.ins().iconst(ty, 2 * slab_size);
+    let double_size = builder.ins().ishl_imm(slab_size_val, 1);
     let call = builder.ins().call(mmap_ref, &[double_size]);
     let raw = builder.inst_results(call)[0];
 
@@ -1887,9 +1890,10 @@ fn emit_create_new_slab(
     builder.seal_block(ok_block);
 
     // aligned = (raw + slab_size - 1) & !(slab_size - 1)
-    let raw_plus = builder.ins().iadd_imm(raw, slab_size - 1);
-    let align_mask = builder.ins().iconst(ty, !(slab_size - 1));
-    let aligned = builder.ins().band(raw_plus, align_mask);
+    let slab_size_minus_one = builder.ins().iadd_imm(slab_size_val, -1);
+    let raw_plus = builder.ins().iadd(raw, slab_size_minus_one);
+    let inv_mask = builder.ins().bnot(slab_size_minus_one);
+    let aligned = builder.ins().band(raw_plus, inv_mask);
 
     // prefix_len = aligned - raw
     let prefix_len = builder.ins().isub(aligned, raw);
@@ -1912,9 +1916,8 @@ fn emit_create_new_slab(
     // total raw = 2*slab_size starting at `raw`; aligned region occupies
     // [aligned, aligned + slab_size).  Suffix length = raw + 2*slab_size -
     // (aligned + slab_size) = slab_size - prefix_len.
-    let slab_size_v = builder.ins().iconst(ty, slab_size);
-    let suffix_start = builder.ins().iadd(aligned, slab_size_v);
-    let suffix_len = builder.ins().isub(slab_size_v, prefix_len);
+    let suffix_start = builder.ins().iadd(aligned, slab_size_val);
+    let suffix_len = builder.ins().isub(slab_size_val, prefix_len);
     let suffix_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, suffix_len, 0);
     let suffix_unmap = builder.create_block();
     let after_suffix = builder.create_block();
@@ -2059,6 +2062,9 @@ pub fn define_allocate_slab(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .collect();
     let payload_table: Vec<i64> = (0..n).map(|i| payload_offset(i) as i64).collect();
     let words_table: Vec<i64> = (0..n).map(|i| num_words(i) as i64).collect();
+    let slab_size_table: Vec<i64> = (0..n)
+        .map(|i| SlabLayout::slab_size_for_class(i) as i64)
+        .collect();
 
     let mut declare_const_table = |name: &str, vals: &[i64]| -> Result<cranelift::module::DataId> {
         let id = ctx
@@ -2072,6 +2078,7 @@ pub fn define_allocate_slab(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let chunks_table_id = declare_const_table("slab_chunks_per_class", &chunks_table)?;
     let payload_table_id = declare_const_table("slab_payload_offset", &payload_table)?;
     let words_table_id = declare_const_table("slab_num_words", &words_table)?;
+    let slab_size_table_id = declare_const_table("slab_size_per_class", &slab_size_table)?;
 
     // ── Function body ──────────────────────────────────────────────────
     let mut builder_ctx = FunctionBuilderContext::new();
@@ -2100,6 +2107,9 @@ pub fn define_allocate_slab(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let words_gv = ctx
         .module_mut()
         .declare_data_in_func(words_table_id, &mut builder.func);
+    let slab_size_gv = ctx
+        .module_mut()
+        .declare_data_in_func(slab_size_table_id, &mut builder.func);
 
     let mmap_ref = ctx
         .module_mut()
@@ -2115,6 +2125,7 @@ pub fn define_allocate_slab(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let chunks_base = builder.ins().global_value(ty, chunks_gv);
     let payload_base = builder.ins().global_value(ty, payload_gv);
     let words_base = builder.ins().global_value(ty, words_gv);
+    let slab_size_base = builder.ins().global_value(ty, slab_size_gv);
 
     // cs_entry = cs_base + class_idx * 24
     let cs_off = builder
@@ -2127,6 +2138,7 @@ pub fn define_allocate_slab(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let chunks_addr = builder.ins().iadd(chunks_base, idx_x8);
     let payload_addr = builder.ins().iadd(payload_base, idx_x8);
     let words_addr = builder.ins().iadd(words_base, idx_x8);
+    let slab_size_addr = builder.ins().iadd(slab_size_base, idx_x8);
 
     let chunks_per_slab_val =
         builder.ins().load(ty, MemFlags::trusted(), chunks_addr, 0);
@@ -2134,6 +2146,8 @@ pub fn define_allocate_slab(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         builder.ins().load(ty, MemFlags::trusted(), payload_addr, 0);
     let num_words_val =
         builder.ins().load(ty, MemFlags::trusted(), words_addr, 0);
+    let slab_size_val =
+        builder.ins().load(ty, MemFlags::trusted(), slab_size_addr, 0);
 
     // class_size = 1 << (class_idx + 4)
     let four = builder.ins().iconst(ty, 4);
@@ -2297,6 +2311,7 @@ pub fn define_allocate_slab(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         class_idx,
         chunks_per_slab_val,
         num_words_val,
+        slab_size_val,
         mmap_ref,
         munmap_ref,
         new_slab_block,
@@ -2426,6 +2441,14 @@ pub fn define_free_slab(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
             ));
         }
     };
+    let slab_size_table_id = match ctx.module().get_name("slab_size_per_class") {
+        Some(FuncOrDataId::Data(id)) => id,
+        _ => {
+            return Err(anyhow!(
+                "slab_size_per_class must be declared before rt_free_slab (phase 5)"
+            ));
+        }
+    };
     let munmap_id = match ctx.module().get_name("rt_munmap") {
         Some(FuncOrDataId::Func(id)) => id,
         _ => return Err(anyhow!("rt_munmap must be declared before rt_free_slab")),
@@ -2453,6 +2476,9 @@ pub fn define_free_slab(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let payload_gv = ctx
         .module_mut()
         .declare_data_in_func(payload_table_id, &mut builder.func);
+    let slab_size_gv = ctx
+        .module_mut()
+        .declare_data_in_func(slab_size_table_id, &mut builder.func);
     let munmap_ref = ctx
         .module_mut()
         .declare_func_in_func(munmap_id, &mut builder.func);
@@ -2460,6 +2486,7 @@ pub fn define_free_slab(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     let cs_base = builder.ins().global_value(ty, cs_gv);
     let chunks_base = builder.ins().global_value(ty, chunks_gv);
     let payload_base = builder.ins().global_value(ty, payload_gv);
+    let slab_size_base = builder.ins().global_value(ty, slab_size_gv);
 
     // ── 1. Recover owning slab via address masking ─────────────────────
     // slab = chunk_addr & !(DEFAULT_SLAB_SIZE - 1).
@@ -2630,12 +2657,14 @@ pub fn define_free_slab(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     builder.switch_to_block(after_clear_block);
     builder.seal_block(after_clear_block);
 
-    // munmap(slab, DEFAULT_SLAB_SIZE).  Phase 2 always overallocates and
-    // trims down to DEFAULT_SLAB_SIZE — class >= 12 would need a
-    // per-class slab size, but phase 2 dies the actor before getting
-    // here, so this constant matches every reachable allocation.
-    let slab_size_v = builder.ins().iconst(ty, SlabLayout::DEFAULT_SLAB_SIZE);
-    builder.ins().call(munmap_ref, &[slab, slab_size_v]);
+    // munmap(slab, slab_size_per_class[class_id]).  #150 phase 5 —
+    // class >= 12 uses oversized slabs (slab_size = 2 * class_size),
+    // class < 12 still uses DEFAULT_SLAB_SIZE.  Table lookup picks
+    // the matching value baked at compile time.
+    let slab_size_addr = builder.ins().iadd(slab_size_base, idx_x8);
+    let slab_size_for_munmap =
+        builder.ins().load(ty, MemFlags::trusted(), slab_size_addr, 0);
+    builder.ins().call(munmap_ref, &[slab, slab_size_for_munmap]);
     builder.ins().jump(done_block, &[]);
 
     builder.switch_to_block(done_block);
