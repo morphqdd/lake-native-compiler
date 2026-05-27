@@ -10,8 +10,9 @@ use crate::compiler::{
     rt::{
         funcs::{
             alloc::{
-                define_allocate, define_allocate_raw, define_arena_alloc, define_copy_bytes,
-                define_copy_to_arena, define_free, define_loads, define_store,
+                define_allocate, define_allocate_raw, define_allocate_slab, define_arena_alloc,
+                define_copy_bytes, define_copy_to_arena, define_free, define_free_slab,
+                define_loads, define_store,
             },
             die::define_die_actor,
             env::{
@@ -67,6 +68,20 @@ impl RuntimeBuilder {
         let ctx = define_munmap(ctx)?;
         debug!("rt: rt_init_heap");
         let ctx = define_init_heap(ctx)?;
+        // #150 phase 4 — slab path defined BEFORE the legacy bucket
+        // allocator so the latter can optionally route through it when
+        // `LAKE_SLAB_ALLOC=1` is set at lakec invocation.  Order:
+        //   rt_die_actor (slab OOM path)
+        //     → rt_allocate_slab → rt_free_slab
+        //       → rt_allocate_raw → rt_allocate → rt_free
+        // rt_die_actor only needs rt_syscall + sheduler_ctx_fat_ptr,
+        // both already declared above.
+        debug!("rt: rt_die_actor");
+        let ctx = define_die_actor(ctx)?;
+        debug!("rt: rt_allocate_slab");
+        let ctx = define_allocate_slab(ctx)?;
+        debug!("rt: rt_free_slab");
+        let ctx = define_free_slab(ctx)?;
         // `rt_allocate_raw` first so the user-facing `rt_allocate`
         // (which returns the tuple `{atom buf}`) can call into the raw
         // variant for its 16-byte tuple wrapper without forward refs.
@@ -74,8 +89,6 @@ impl RuntimeBuilder {
         let ctx = define_allocate_raw(ctx)?;
         debug!("rt: rt_allocate");
         let ctx = define_allocate(ctx)?;
-        debug!("rt: rt_die_actor");
-        let ctx = define_die_actor(ctx)?;
         debug!("rt: rt_free");
         let ctx = define_free(ctx)?;
         // rt_arena_alloc is feature #138 — per-actor arena bump path.

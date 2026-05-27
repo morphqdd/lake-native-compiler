@@ -47,6 +47,24 @@ pub fn define_mmap(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     ctx.module_mut()
         .define_data(free_list_id, &free_list_desc)?;
 
+    // ── Slab class state table (#150 phase 2) ────────────────────────────
+    // 21 classes × 24 B per class (slabs_head, current_slab, padding).
+    // Used by `rt_allocate_slab` / `rt_free_slab` — see SlabLayout in
+    // `rt/layout/slab.rs`.  Zero-init: empty class = both pointers null.
+    let class_state_id = ctx.module_mut().declare_data(
+        "slab_class_state",
+        Linkage::Export,
+        true,
+        false,
+    )?;
+    let mut class_state_desc = DataDescription::new();
+    use crate::compiler::rt::layout::slab::SlabLayout;
+    class_state_desc.define_zeroinit(
+        (SlabLayout::NUM_CLASSES as usize) * (SlabLayout::CLASS_STATE_SIZE as usize),
+    );
+    ctx.module_mut()
+        .define_data(class_state_id, &class_state_desc)?;
+
     // ── rt_mmap function ──────────────────────────────────────────────────────
     let syscall_id = match ctx.module().get_name("rt_syscall") {
         Some(FuncOrDataId::Func(id)) => id,
