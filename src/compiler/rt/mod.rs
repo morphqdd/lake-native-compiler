@@ -10,8 +10,8 @@ use crate::compiler::{
     rt::{
         funcs::{
             alloc::{
-                define_allocate, define_allocate_raw, define_copy_bytes, define_free, define_loads,
-                define_store,
+                define_allocate, define_allocate_raw, define_arena_alloc, define_copy_bytes,
+                define_free, define_loads, define_store,
             },
             die::define_die_actor,
             env::{
@@ -78,6 +78,11 @@ impl RuntimeBuilder {
         let ctx = define_die_actor(ctx)?;
         debug!("rt: rt_free");
         let ctx = define_free(ctx)?;
+        // rt_arena_alloc is feature #138 — per-actor arena bump path.
+        // Must be declared AFTER rt_allocate (it falls back when the
+        // arena is exhausted or absent).
+        debug!("rt: rt_arena_alloc");
+        let ctx = define_arena_alloc(ctx)?;
         debug!("rt: rt_store");
         let ctx = define_store(ctx)?;
         debug!("rt: rt_load_u{{8,16,32,64}}");

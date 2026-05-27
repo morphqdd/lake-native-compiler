@@ -22,7 +22,17 @@ impl ProcessCtxLayout {
     /// Reclaimed by `free_process_resources` via a single `rt_free` call,
     /// freeing every allocation the actor made in one shot.
     pub const OWNED_ARENA_FAT: i32 = 24;
-    pub const SIZE: i32 = 32;
+    /// Current bump cursor (raw address into the arena region).
+    /// `rt_arena_alloc` carves [bump .. bump+16+size] for one alloc,
+    /// builds the fat-ptr header at `bump`, advances bump past the
+    /// payload, returns `bump` to the caller.  Initialised in spawn
+    /// to `*arena_fat` (= arena base); zero when arena mode is off.
+    pub const OWNED_ARENA_BUMP: i32 = 32;
+    /// Cached end address of the arena region (= `*(arena_fat + 8)`).
+    /// `rt_arena_alloc` compares `new_bump <= end` to detect arena
+    /// exhaustion and fall back to the legacy bucket allocator.
+    pub const OWNED_ARENA_END: i32 = 40;
+    pub const SIZE: i32 = 48;
 
     pub fn init_ctx(
         ctx: &mut CompilerCtx,
@@ -76,6 +86,17 @@ impl ProcessCtxLayout {
         builder
             .ins()
             .call(store_ref, &[process_ctx_ptr, zero, ptr_size, arena_off]);
+        // Init bump and end to 0 — overwritten by spawn_expr when the
+        // arena is set.  `rt_arena_alloc` treats `bump == 0` as "no
+        // arena, fall back to rt_allocate".
+        let bump_off = builder.ins().iconst(ptr_ty, Self::OWNED_ARENA_BUMP as i64);
+        builder
+            .ins()
+            .call(store_ref, &[process_ctx_ptr, zero, ptr_size, bump_off]);
+        let end_off = builder.ins().iconst(ptr_ty, Self::OWNED_ARENA_END as i64);
+        builder
+            .ins()
+            .call(store_ref, &[process_ctx_ptr, zero, ptr_size, end_off]);
 
         Ok(process_ctx_ptr)
     }

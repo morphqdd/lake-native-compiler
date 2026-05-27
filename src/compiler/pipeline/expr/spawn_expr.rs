@@ -176,13 +176,33 @@ pub fn compile_spawn(
     let arena_size = builder.ins().iconst(ptr_ty, ARENA_DEFAULT_BYTES);
     let call_arena = builder.ins().call(allocate_ref, &[arena_size]);
     let arena_fat_ptr = builder.inst_results(call_arena)[0];
-    // Store arena fat-ptr in proc_ctx.OWNED_ARENA_FAT for later reclaim.
+    // Load the arena's base and end addresses from the fat-ptr header.
+    let arena_base = builder
+        .ins()
+        .load(ptr_ty, MemFlags::trusted(), arena_fat_ptr, 0);
+    let arena_end_addr = builder
+        .ins()
+        .load(ptr_ty, MemFlags::trusted(), arena_fat_ptr, 8);
     let store_ref_arena = rt_funcs.store_ref(ctx.module_mut(), builder);
-    let arena_off = builder.ins().iconst(ptr_ty, ProcessCtxLayout::OWNED_ARENA_FAT as i64);
     let arena_field_size = builder.ins().iconst(ptr_ty, 8);
+    // Store arena fat-ptr in proc_ctx.OWNED_ARENA_FAT for later reclaim.
+    let arena_off = builder.ins().iconst(ptr_ty, ProcessCtxLayout::OWNED_ARENA_FAT as i64);
     builder.ins().call(
         store_ref_arena,
         &[proc_ctx_fat_ptr, arena_fat_ptr, arena_field_size, arena_off],
+    );
+    // Initialise bump cursor at base of arena payload.
+    let bump_off = builder.ins().iconst(ptr_ty, ProcessCtxLayout::OWNED_ARENA_BUMP as i64);
+    builder.ins().call(
+        store_ref_arena,
+        &[proc_ctx_fat_ptr, arena_base, arena_field_size, bump_off],
+    );
+    // Cache arena end address — `rt_arena_alloc` checks
+    // `new_bump <= end` to detect exhaustion.
+    let end_off = builder.ins().iconst(ptr_ty, ProcessCtxLayout::OWNED_ARENA_END as i64);
+    builder.ins().call(
+        store_ref_arena,
+        &[proc_ctx_fat_ptr, arena_end_addr, arena_field_size, end_off],
     );
 
     let sched_data_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {

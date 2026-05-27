@@ -977,3 +977,165 @@ pub fn define_copy_bytes(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     ctx.module_mut().clear_context(&mut module_ctx);
     Ok(ctx)
 }
+
+/// Build `rt_arena_alloc(size: i64) -> i64` — feature #138 per-actor
+/// arena bump allocator.
+///
+/// Returns a fat-pointer address (same ABI as `rt_allocate`) pointing
+/// at a freshly-carved 16-byte header inside the current actor's
+/// arena, followed by `size` bytes of payload.  When the arena is
+/// exhausted or absent (e.g. `main`'s init process), falls back to
+/// `rt_allocate` so callers see no semantic difference.
+///
+/// The arena itself is one `rt_allocate_raw(64 KB)` per spawned actor
+/// (see `spawn_expr`).  Bump cursor + end live in `proc_ctx` fields
+/// `OWNED_ARENA_BUMP` / `OWNED_ARENA_END`.  On actor death,
+/// `free_process_resources` calls `rt_free` on the whole arena —
+/// every allocation made via this path is reclaimed in one shot,
+/// eliminating the user-side "I forgot rt_free()" leak.
+pub fn define_arena_alloc(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
+    let ptr_ty = ctx.module().target_config().pointer_type();
+
+    let sched_data_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
+        Some(FuncOrDataId::Data(id)) => id,
+        _ => {
+            return Err(anyhow!(
+                "sheduler_ctx_fat_ptr must be declared before rt_arena_alloc"
+            ));
+        }
+    };
+    let rt_allocate_raw_id = match ctx.module().get_name("rt_allocate_raw") {
+        Some(FuncOrDataId::Func(id)) => id,
+        _ => {
+            return Err(anyhow!(
+                "rt_allocate_raw must be declared before rt_arena_alloc"
+            ));
+        }
+    };
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut module_ctx = ctx.module().make_context();
+    let mut builder = FunctionBuilder::new(&mut module_ctx.func, &mut builder_ctx);
+
+    builder.func.signature.params.push(AbiParam::new(ptr_ty));
+    builder.func.signature.returns.push(AbiParam::new(ptr_ty));
+
+    let entry = builder.create_block();
+    builder.append_block_param(entry, ptr_ty);
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+
+    let user_size = builder.block_params(entry)[0];
+
+    // ── Locate the current actor's proc_ctx via the scheduler ──────────
+    let sched_gv = ctx
+        .module_mut()
+        .declare_data_in_func(sched_data_id, &mut builder.func);
+    let sh_ctx_ptr = builder.ins().global_value(ptr_ty, sched_gv);
+    let sh_data = builder
+        .ins()
+        .load(ptr_ty, MemFlags::trusted(), sh_ctx_ptr, 0);
+    let cur_idx = builder.ins().load(
+        ptr_ty,
+        MemFlags::trusted(),
+        sh_data,
+        ShedulerCtxLayout::CURRENT_PROCESS,
+    );
+    let proc_arr_fat = builder.ins().load(
+        ptr_ty,
+        MemFlags::trusted(),
+        sh_data,
+        ShedulerCtxLayout::PROCESS_ARR_FAT,
+    );
+    let proc_arr = builder
+        .ins()
+        .load(ptr_ty, MemFlags::trusted(), proc_arr_fat, 0);
+    let entry_off = builder.ins().imul_imm(cur_idx, 8);
+    let entry_addr = builder.ins().iadd(proc_arr, entry_off);
+    let proc_ctx_fat = builder
+        .ins()
+        .load(ptr_ty, MemFlags::trusted(), entry_addr, 0);
+    let proc_ctx = builder
+        .ins()
+        .load(ptr_ty, MemFlags::trusted(), proc_ctx_fat, 0);
+
+    // Load bump + end from proc_ctx fields.
+    let bump = builder.ins().load(
+        ptr_ty,
+        MemFlags::trusted(),
+        proc_ctx,
+        ProcessCtxLayout::OWNED_ARENA_BUMP,
+    );
+    let arena_end = builder.ins().load(
+        ptr_ty,
+        MemFlags::trusted(),
+        proc_ctx,
+        ProcessCtxLayout::OWNED_ARENA_END,
+    );
+
+    // Compute needed bytes: 16 (header) + align_up(size, 8).  Bitwise
+    // align: (size + 7) & ~7.
+    let plus_seven = builder.ins().iadd_imm(user_size, 7);
+    let mask = builder.ins().iconst(ptr_ty, !7i64);
+    let aligned_size = builder.ins().band(plus_seven, mask);
+    let needed = builder.ins().iadd_imm(aligned_size, 16);
+    let new_bump = builder.ins().iadd(bump, needed);
+
+    // Fall back to rt_allocate when:
+    //   1. The actor has no arena (bump == 0 — init_main_process
+    //      doesn't allocate one).
+    //   2. The arena is exhausted (new_bump > arena_end).
+    let has_arena = builder.ins().icmp_imm(IntCC::NotEqual, bump, 0);
+    let fits = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThanOrEqual, new_bump, arena_end);
+    let use_arena = builder.ins().band(has_arena, fits);
+
+    let bump_block = builder.create_block();
+    let fallback_block = builder.create_block();
+    builder
+        .ins()
+        .brif(use_arena, bump_block, &[], fallback_block, &[]);
+
+    // ── bump_block: carve the chunk + advance cursor ───────────────────
+    builder.switch_to_block(bump_block);
+    builder.seal_block(bump_block);
+
+    // Header layout: [start, end] at `bump`, then `size` payload bytes.
+    let payload_start = builder.ins().iadd_imm(bump, 16);
+    let payload_end = builder.ins().iadd(payload_start, user_size);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), payload_start, bump, 0);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), payload_end, bump, 8);
+
+    // Advance bump cursor in proc_ctx.
+    builder.ins().store(
+        MemFlags::trusted(),
+        new_bump,
+        proc_ctx,
+        ProcessCtxLayout::OWNED_ARENA_BUMP,
+    );
+
+    builder.ins().return_(&[bump]);
+
+    // ── fallback_block: route through legacy bucket allocator ──────────
+    builder.switch_to_block(fallback_block);
+    builder.seal_block(fallback_block);
+    let alloc_raw_ref = ctx
+        .module_mut()
+        .declare_func_in_func(rt_allocate_raw_id, &mut builder.func);
+    let call_alloc = builder.ins().call(alloc_raw_ref, &[user_size]);
+    let result = builder.inst_results(call_alloc)[0];
+    builder.ins().return_(&[result]);
+
+    let sig = builder.func.signature.clone();
+    let id = ctx
+        .module_mut()
+        .declare_function("rt_arena_alloc", Linkage::Export, &sig)?;
+    ctx.module_mut().define_function(id, &mut module_ctx)?;
+    ctx.module_mut().clear_context(&mut module_ctx);
+    Ok(ctx)
+}
