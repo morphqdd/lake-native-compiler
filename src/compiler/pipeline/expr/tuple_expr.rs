@@ -94,6 +94,13 @@ pub fn compile(
     // wasted bandwidth; (b) since the tuple-ABI refactor `rt_allocate`
     // returns `{atom buf}` and the codegen path needs a plain buf
     // address.  Tuple literals never escape this allocator.
+    //
+    // TODO(#138): route through rt_arena_alloc once it's verified
+    // safe for tuple/record literals — first attempt broke
+    // lake-server right after `Lake server listening on :8060`,
+    // suggests a code path where the current actor's arena_fat isn't
+    // set yet (scheduler internals, init paths).  Tuple-expr
+    // allocations stay on the bucket allocator for now.
     let alloc_ref = ctx.get_func(builder, "rt_allocate_raw")?;
     let payload_size = builder.ins().iconst(ptr_ty, (elems.len() as i64) * 8);
     let call_alloc = builder.ins().call(alloc_ref, &[payload_size]);

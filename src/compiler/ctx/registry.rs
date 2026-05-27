@@ -43,6 +43,12 @@ impl BranchInfo {
 pub struct MachineInfo {
     by_id: HashMap<u128, BranchInfo>,
     by_hash: HashMap<u64, Vec<u128>>,
+    /// `true` when at least one branch declares an explicit `ret <ty>`.
+    /// Callers (`let x = M(...)` / `pin M(...)`) wait synchronously for
+    /// the spawned actor to return.  Used by `spawn_expr` to decide
+    /// whether to inherit the caller's per-actor arena (sync case,
+    /// #138 phase 2c) or allocate a fresh one (fire-and-forget).
+    pub is_ret_machine: bool,
 }
 
 impl MachineInfo {
@@ -105,6 +111,22 @@ impl MachineRegistry {
         self.machines
             .entry(name.to_string())
             .or_insert_with(MachineInfo::default);
+    }
+
+    /// Mark a machine as ret-typed (at least one branch declares
+    /// `ret <ty>`).  Set during the index pre-pass; used by spawn_expr.
+    pub fn set_ret_machine(&mut self, name: &str) {
+        if let Some(m) = self.machines.get_mut(name) {
+            m.is_ret_machine = true;
+        }
+    }
+
+    /// True when the named machine has ret-typed branches.
+    pub fn is_ret_machine(&self, name: &str) -> bool {
+        self.machines
+            .get(name)
+            .map(|m| m.is_ret_machine)
+            .unwrap_or(false)
     }
 
     /// Insert a branch into an already-registered machine.

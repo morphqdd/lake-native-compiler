@@ -165,45 +165,103 @@ pub fn compile_spawn(
     let proc_ctx_fat_ptr =
         ProcessCtxLayout::init_ctx(ctx, builder, machine_name, exec_ctx_fat_ptr)?;
 
-    // ── Allocate per-actor arena (feature #138 phase 1).  One 64 KB
-    // mmap per spawned actor; freed atomically by `free_process_resources`
-    // so every allocation the actor ever made gets reclaimed in one shot.
-    // The arena's start/end fat-pointer fields ARE the bump pointer: each
-    // `rt_arena_alloc` advances `arena.start` past the carved-out chunk
-    // until it meets `arena.end`, at which point arena is full and the
-    // caller falls back to `rt_allocate` (legacy bucket allocator).
-    const ARENA_DEFAULT_BYTES: i64 = 64 * 1024;
-    let arena_size = builder.ins().iconst(ptr_ty, ARENA_DEFAULT_BYTES);
-    let call_arena = builder.ins().call(allocate_ref, &[arena_size]);
-    let arena_fat_ptr = builder.inst_results(call_arena)[0];
-    // Load the arena's base and end addresses from the fat-ptr header.
-    let arena_base = builder
-        .ins()
-        .load(ptr_ty, MemFlags::trusted(), arena_fat_ptr, 0);
-    let arena_end_addr = builder
-        .ins()
-        .load(ptr_ty, MemFlags::trusted(), arena_fat_ptr, 8);
+    // ── Per-actor arena setup (feature #138).  Two cases:
+    //
+    //   * **Sync ret-machine spawn** — caller waits for ret value.
+    //     Inherit caller's arena_fat: child writes into the SAME
+    //     fat-ptr that holds the bump cursor in its `start` field,
+    //     so the buffer the child returns lives on past the child's
+    //     death — caller still owns the arena.  No allocation.
+    //
+    //   * **Async (fire-and-forget) spawn** — caller doesn't wait.
+    //     Child owns its own arena: one 64 KB mmap, freed atomically
+    //     in `free_process_resources` when the child dies.
     let store_ref_arena = rt_funcs.store_ref(ctx.module_mut(), builder);
     let arena_field_size = builder.ins().iconst(ptr_ty, 8);
-    // Store arena fat-ptr in proc_ctx.OWNED_ARENA_FAT for later reclaim.
-    let arena_off = builder.ins().iconst(ptr_ty, ProcessCtxLayout::OWNED_ARENA_FAT as i64);
-    builder.ins().call(
-        store_ref_arena,
-        &[proc_ctx_fat_ptr, arena_fat_ptr, arena_field_size, arena_off],
-    );
-    // Initialise bump cursor at base of arena payload.
-    let bump_off = builder.ins().iconst(ptr_ty, ProcessCtxLayout::OWNED_ARENA_BUMP as i64);
-    builder.ins().call(
-        store_ref_arena,
-        &[proc_ctx_fat_ptr, arena_base, arena_field_size, bump_off],
-    );
-    // Cache arena end address — `rt_arena_alloc` checks
-    // `new_bump <= end` to detect exhaustion.
-    let end_off = builder.ins().iconst(ptr_ty, ProcessCtxLayout::OWNED_ARENA_END as i64);
-    builder.ins().call(
-        store_ref_arena,
-        &[proc_ctx_fat_ptr, arena_end_addr, arena_field_size, end_off],
-    );
+    let arena_fat_off = builder.ins().iconst(ptr_ty, ProcessCtxLayout::OWNED_ARENA_FAT as i64);
+    let arena_base_off = builder.ins().iconst(ptr_ty, ProcessCtxLayout::OWNED_ARENA_BASE as i64);
+
+    if ctx.is_ret_machine(machine_name) {
+        // Inherit caller's arena.  Load caller's OWNED_ARENA_FAT,
+        // write into spawned proc_ctx.  OWNED_ARENA_BASE stays 0 —
+        // signals `free_process_resources` not to free.
+        let caller_ctx_ptr = builder.use_var(machine_ctx_var);
+        let load_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
+        // caller_ctx_ptr is the address of caller's exec_ctx fat-ptr;
+        // we need caller's proc_ctx instead.  The scheduler gives us
+        // proc_ctx via the current_process slot.
+        let sched_data_for_arena = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
+            Some(FuncOrDataId::Data(id)) => id,
+            _ => bail!("sheduler_ctx_fat_ptr global not found"),
+        };
+        let sched_gv_a = ctx
+            .module_mut()
+            .declare_data_in_func(sched_data_for_arena, &mut builder.func);
+        let sched_fat = builder.ins().global_value(ptr_ty, sched_gv_a);
+        let sched_start = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), sched_fat, 0);
+        let cur_idx = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            sched_start,
+            ShedulerCtxLayout::CURRENT_PROCESS,
+        );
+        let proc_arr_fat = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            sched_start,
+            ShedulerCtxLayout::PROCESS_ARR_FAT,
+        );
+        let proc_arr = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), proc_arr_fat, 0);
+        let cur_off = builder.ins().imul_imm(cur_idx, 8);
+        let cur_entry_addr = builder.ins().iadd(proc_arr, cur_off);
+        let caller_proc_ctx_fat = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), cur_entry_addr, 0);
+        let caller_arena_fat_offset = builder
+            .ins()
+            .iconst(ptr_ty, ProcessCtxLayout::OWNED_ARENA_FAT as i64);
+        let call_caller_arena = builder
+            .ins()
+            .call(load_ref, &[caller_proc_ctx_fat, caller_arena_fat_offset]);
+        let inherited_arena_fat = builder.inst_results(call_caller_arena)[0];
+
+        let _ = allocate_ref;
+        builder.ins().call(
+            store_ref_arena,
+            &[proc_ctx_fat_ptr, inherited_arena_fat, arena_field_size, arena_fat_off],
+        );
+        // OWNED_ARENA_BASE = 0 (inherited — don't free on death).
+        let zero_arena = builder.ins().iconst(ptr_ty, 0);
+        builder.ins().call(
+            store_ref_arena,
+            &[proc_ctx_fat_ptr, zero_arena, arena_field_size, arena_base_off],
+        );
+    } else {
+        // Own arena: alloc fresh 64 KB region.
+        const ARENA_DEFAULT_BYTES: i64 = 64 * 1024;
+        let arena_size = builder.ins().iconst(ptr_ty, ARENA_DEFAULT_BYTES);
+        let call_arena = builder.ins().call(allocate_ref, &[arena_size]);
+        let arena_fat_ptr = builder.inst_results(call_arena)[0];
+        // Read original base — stored in OWNED_ARENA_BASE for later
+        // restore + munmap.  Fat-ptr's `start` field will be mutated
+        // by rt_arena_alloc bumps, so we capture the pristine value
+        // here.
+        let arena_base = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), arena_fat_ptr, 0);
+        builder.ins().call(
+            store_ref_arena,
+            &[proc_ctx_fat_ptr, arena_fat_ptr, arena_field_size, arena_fat_off],
+        );
+        builder.ins().call(
+            store_ref_arena,
+            &[proc_ctx_fat_ptr, arena_base, arena_field_size, arena_base_off],
+        );
+    }
 
     let sched_data_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {
         Some(FuncOrDataId::Data(id)) => id,

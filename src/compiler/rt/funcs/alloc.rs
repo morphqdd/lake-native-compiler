@@ -1059,45 +1059,49 @@ pub fn define_arena_alloc(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .ins()
         .load(ptr_ty, MemFlags::trusted(), proc_ctx_fat, 0);
 
-    // Load bump + end from proc_ctx fields.
-    let bump = builder.ins().load(
+    // Load arena fat-ptr from proc_ctx.  When zero — no arena → fallback.
+    let arena_fat = builder.ins().load(
         ptr_ty,
         MemFlags::trusted(),
         proc_ctx,
-        ProcessCtxLayout::OWNED_ARENA_BUMP,
-    );
-    let arena_end = builder.ins().load(
-        ptr_ty,
-        MemFlags::trusted(),
-        proc_ctx,
-        ProcessCtxLayout::OWNED_ARENA_END,
+        ProcessCtxLayout::OWNED_ARENA_FAT,
     );
 
-    // Compute needed bytes: 16 (header) + align_up(size, 8).  Bitwise
-    // align: (size + 7) & ~7.
+    let has_arena_block = builder.create_block();
+    let fallback_block = builder.create_block();
+    let has_arena = builder.ins().icmp_imm(IntCC::NotEqual, arena_fat, 0);
+    builder
+        .ins()
+        .brif(has_arena, has_arena_block, &[], fallback_block, &[]);
+
+    builder.switch_to_block(has_arena_block);
+    builder.seal_block(has_arena_block);
+
+    // Bump cursor IS the fat-ptr's `start` field — mutated in-place
+    // so child ret-machines that inherit the same fat-ptr (sync
+    // spawn, phase 2c) see the same allocator state.
+    let bump = builder
+        .ins()
+        .load(ptr_ty, MemFlags::trusted(), arena_fat, 0);
+    let arena_end = builder
+        .ins()
+        .load(ptr_ty, MemFlags::trusted(), arena_fat, 8);
+
     let plus_seven = builder.ins().iadd_imm(user_size, 7);
     let mask = builder.ins().iconst(ptr_ty, !7i64);
     let aligned_size = builder.ins().band(plus_seven, mask);
     let needed = builder.ins().iadd_imm(aligned_size, 16);
     let new_bump = builder.ins().iadd(bump, needed);
 
-    // Fall back to rt_allocate when:
-    //   1. The actor has no arena (bump == 0 — init_main_process
-    //      doesn't allocate one).
-    //   2. The arena is exhausted (new_bump > arena_end).
-    let has_arena = builder.ins().icmp_imm(IntCC::NotEqual, bump, 0);
+    // Arena exhaustion → fallback.
     let fits = builder
         .ins()
         .icmp(IntCC::UnsignedLessThanOrEqual, new_bump, arena_end);
-    let use_arena = builder.ins().band(has_arena, fits);
-
     let bump_block = builder.create_block();
-    let fallback_block = builder.create_block();
     builder
         .ins()
-        .brif(use_arena, bump_block, &[], fallback_block, &[]);
+        .brif(fits, bump_block, &[], fallback_block, &[]);
 
-    // ── bump_block: carve the chunk + advance cursor ───────────────────
     builder.switch_to_block(bump_block);
     builder.seal_block(bump_block);
 
@@ -1111,13 +1115,11 @@ pub fn define_arena_alloc(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         .ins()
         .store(MemFlags::trusted(), payload_end, bump, 8);
 
-    // Advance bump cursor in proc_ctx.
-    builder.ins().store(
-        MemFlags::trusted(),
-        new_bump,
-        proc_ctx,
-        ProcessCtxLayout::OWNED_ARENA_BUMP,
-    );
+    // Advance bump in the fat-ptr's `start` field (shared with all
+    // actors that inherited this arena fat-ptr).
+    builder
+        .ins()
+        .store(MemFlags::trusted(), new_bump, arena_fat, 0);
 
     builder.ins().return_(&[bump]);
 

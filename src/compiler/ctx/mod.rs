@@ -181,6 +181,18 @@ impl CompilerCtx {
         LinuxSyscalls::for_target(self.target_arch)
     }
 
+    /// Mark a machine as ret-typed.  Set in `index_machine` when at
+    /// least one branch declares `ret <ty>`.
+    pub fn set_ret_machine(&mut self, name: &str) {
+        self.registry.set_ret_machine(name);
+    }
+
+    /// Query whether a machine has at least one ret-typed branch.
+    /// Used by `spawn_expr` to decide arena inheritance (#138 phase 2c).
+    pub fn is_ret_machine(&self, name: &str) -> bool {
+        self.registry.is_ret_machine(name)
+    }
+
     /// Target architecture for this compilation unit.
     pub fn target_arch(&self) -> TargetArch {
         self.target_arch

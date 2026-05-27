@@ -264,8 +264,12 @@ fn index_machine(
     machine: &lake_frontend::api::ast::Machine<'_>,
 ) -> Result<()> {
     let name = machine.ident.to_string();
+    let mut any_ret = false;
     for (branch_id, item) in machine.items.iter().enumerate() {
         if let MachineItem::Branch(ref branch) = item.inner {
+            if branch.ret_ty.is_some() {
+                any_ret = true;
+            }
             let patterns = Clean::<Vec<Pattern<'_>>>::clean(branch);
             let (hash, param_count) = hash_pattern(&patterns);
             let var_count = count_branch_vars(branch);
@@ -294,6 +298,9 @@ fn index_machine(
                 guards,
             )?;
         }
+    }
+    if any_ret {
+        ctx.set_ret_machine(&name);
     }
     Ok(())
 }

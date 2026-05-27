@@ -517,6 +517,41 @@ impl ShedulerCtxLayout {
 
         let process_ctx = ProcessCtxLayout::init_ctx(ctx, builder, "main", main_ctx_fat_ptr)?;
 
+        // Give main its own arena (#138).  Main is the root actor —
+        // arena reclaimed at process exit by the OS, so it's
+        // effectively a global heap.  Without an arena, every
+        // tuple/record literal and every ret-machine-helper alloc
+        // (concat / slice / int_to_buf, …) made by main would fall
+        // back to rt_allocate_raw and accumulate as leaks for the
+        // process lifetime.
+        const MAIN_ARENA_BYTES: i64 = 64 * 1024;
+        let allocate_raw_ref = ctx
+            .rt_funcs()
+            .clone()
+            .allocate_raw_ref(ctx.module_mut(), builder);
+        let main_arena_size = builder.ins().iconst(ptr_ty, MAIN_ARENA_BYTES);
+        let call_main_arena = builder.ins().call(allocate_raw_ref, &[main_arena_size]);
+        let main_arena_fat = builder.inst_results(call_main_arena)[0];
+        let main_arena_base = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), main_arena_fat, 0);
+        let main_store_ref = ctx.rt_funcs().clone().store_ref(ctx.module_mut(), builder);
+        let main_field_size = builder.ins().iconst(ptr_ty, 8);
+        let main_arena_fat_off = builder
+            .ins()
+            .iconst(ptr_ty, ProcessCtxLayout::OWNED_ARENA_FAT as i64);
+        builder.ins().call(
+            main_store_ref,
+            &[process_ctx, main_arena_fat, main_field_size, main_arena_fat_off],
+        );
+        let main_arena_base_off = builder
+            .ins()
+            .iconst(ptr_ty, ProcessCtxLayout::OWNED_ARENA_BASE as i64);
+        builder.ins().call(
+            main_store_ref,
+            &[process_ctx, main_arena_base, main_field_size, main_arena_base_off],
+        );
+
         // Assign monotonic pid to main and stash it in OWN_PID.  Source-
         // level `self` reads return this pid; sends look it up in the
         // pid_table to find main's proc_ctx.
@@ -655,28 +690,41 @@ impl ShedulerCtxLayout {
             Self::clear_pid(sh_ctx_ptr, dead_pid, ctx, builder);
         }
 
-        // ── Reclaim the actor's arena (feature #138 phase 1) ─────────────
-        // Read OWNED_ARENA_FAT before freeing process_ctx (which would
-        // clobber its payload).  Skip the free if the field is zero —
-        // an actor spawned via `init_main_process` may not have an
-        // arena (main runs in a pre-allocated process slot).
-        let arena_off = builder
+        // ── Reclaim the actor's arena (#138).  Only the owning actor
+        // frees — inherited arenas (sync ret-machine spawns share the
+        // caller's arena, phase 2c) are owned by the caller and left
+        // alone here.  OWNED_ARENA_BASE != 0 marks ownership.
+        let arena_fat_off = builder
             .ins()
             .iconst(ptr_ty, ProcessCtxLayout::OWNED_ARENA_FAT as i64);
-        let call_arena = builder
+        let arena_base_off = builder
             .ins()
-            .call(load_ref, &[process_ctx_fat_ptr, arena_off]);
-        let arena_fat_ptr = builder.inst_results(call_arena)[0];
+            .iconst(ptr_ty, ProcessCtxLayout::OWNED_ARENA_BASE as i64);
+        let call_arena_fat = builder
+            .ins()
+            .call(load_ref, &[process_ctx_fat_ptr, arena_fat_off]);
+        let arena_fat_ptr = builder.inst_results(call_arena_fat)[0];
+        let call_arena_base = builder
+            .ins()
+            .call(load_ref, &[process_ctx_fat_ptr, arena_base_off]);
+        let arena_base = builder.inst_results(call_arena_base)[0];
 
-        let arena_is_set_block = builder.create_block();
+        let arena_owned_block = builder.create_block();
         let frees_block = builder.create_block();
-        let arena_present = builder.ins().icmp_imm(IntCC::NotEqual, arena_fat_ptr, 0);
+        let owns_arena = builder.ins().icmp_imm(IntCC::NotEqual, arena_base, 0);
         builder
             .ins()
-            .brif(arena_present, arena_is_set_block, &[], frees_block, &[]);
+            .brif(owns_arena, arena_owned_block, &[], frees_block, &[]);
 
-        builder.switch_to_block(arena_is_set_block);
-        builder.seal_block(arena_is_set_block);
+        builder.switch_to_block(arena_owned_block);
+        builder.seal_block(arena_owned_block);
+        // Restore the fat-ptr's start to the original base — bump
+        // mutations made `start` point mid-arena.  rt_free reads
+        // start/end to compute the bucket size; with mid-arena start
+        // it would mis-classify.
+        builder
+            .ins()
+            .store(MemFlags::trusted(), arena_base, arena_fat_ptr, 0);
         builder.ins().call(free_ref, &[arena_fat_ptr]);
         builder.ins().jump(frees_block, &[]);
 

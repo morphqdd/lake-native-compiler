@@ -16,23 +16,24 @@ impl ProcessCtxLayout {
     /// `rt_io_park_current` (write on park) and `emit_wake_by_user_data`
     /// (used to swap-and-pop in O(1) without scanning `io_parked`).
     pub const IO_PARKED_IDX: i32 = 16;
-    /// Per-actor arena (feature #138).  Fat-ptr to a single mmap'd region
-    /// (default 64 KB) from which user-side `rt_arena_alloc` bumps.
-    /// Initialised in `spawn_expr` when arena mode is on; zero otherwise.
-    /// Reclaimed by `free_process_resources` via a single `rt_free` call,
-    /// freeing every allocation the actor made in one shot.
+    /// Per-actor arena fat-ptr (feature #138).  The fat-ptr's `start`
+    /// field doubles as the bump cursor — `rt_arena_alloc` reads it,
+    /// advances it, writes it back.  The `end` field is the arena
+    /// boundary, set once at spawn.
+    ///
+    /// For inherited arenas (sync ret-machine spawns share the
+    /// caller's arena — see #138 phase 2c), this field holds the
+    /// SAME pointer as the caller's, so a child's bump automatically
+    /// propagates back to the parent.  No writeback step needed —
+    /// it's literally the same memory.
     pub const OWNED_ARENA_FAT: i32 = 24;
-    /// Current bump cursor (raw address into the arena region).
-    /// `rt_arena_alloc` carves [bump .. bump+16+size] for one alloc,
-    /// builds the fat-ptr header at `bump`, advances bump past the
-    /// payload, returns `bump` to the caller.  Initialised in spawn
-    /// to `*arena_fat` (= arena base); zero when arena mode is off.
-    pub const OWNED_ARENA_BUMP: i32 = 32;
-    /// Cached end address of the arena region (= `*(arena_fat + 8)`).
-    /// `rt_arena_alloc` compares `new_bump <= end` to detect arena
-    /// exhaustion and fall back to the legacy bucket allocator.
-    pub const OWNED_ARENA_END: i32 = 40;
-    pub const SIZE: i32 = 48;
+    /// Original arena base address (= `*OWNED_ARENA_FAT` at spawn
+    /// time, before any bumps).  Non-zero means "this actor owns the
+    /// arena" — `free_process_resources` restores the fat-ptr's
+    /// `start` to this value and calls `rt_free`.  Zero means
+    /// "inherited from caller, don't free".
+    pub const OWNED_ARENA_BASE: i32 = 32;
+    pub const SIZE: i32 = 40;
 
     pub fn init_ctx(
         ctx: &mut CompilerCtx,
@@ -79,24 +80,20 @@ impl ProcessCtxLayout {
             .ins()
             .call(store_ref, &[process_ctx_ptr, zero, ptr_size, io_idx_offset]);
 
-        // Initialise OWNED_ARENA_FAT to 0.  `spawn_expr` overwrites it with
-        // the actor's arena when arena mode is on; left as 0 the
-        // `free_process_resources` path skips the arena-free call.
+        // Initialise arena fields to 0.  `spawn_expr` overwrites
+        // them — either with this actor's own arena fat-ptr (when
+        // spawning a non-ret machine) or with the caller's arena
+        // fat-ptr (when spawning a sync ret-machine, sharing the
+        // caller's allocator).  `rt_arena_alloc` treats `arena_fat
+        // == 0` as "no arena, fall back to rt_allocate_raw".
         let arena_off = builder.ins().iconst(ptr_ty, Self::OWNED_ARENA_FAT as i64);
         builder
             .ins()
             .call(store_ref, &[process_ctx_ptr, zero, ptr_size, arena_off]);
-        // Init bump and end to 0 — overwritten by spawn_expr when the
-        // arena is set.  `rt_arena_alloc` treats `bump == 0` as "no
-        // arena, fall back to rt_allocate".
-        let bump_off = builder.ins().iconst(ptr_ty, Self::OWNED_ARENA_BUMP as i64);
+        let base_off = builder.ins().iconst(ptr_ty, Self::OWNED_ARENA_BASE as i64);
         builder
             .ins()
-            .call(store_ref, &[process_ctx_ptr, zero, ptr_size, bump_off]);
-        let end_off = builder.ins().iconst(ptr_ty, Self::OWNED_ARENA_END as i64);
-        builder
-            .ins()
-            .call(store_ref, &[process_ctx_ptr, zero, ptr_size, end_off]);
+            .call(store_ref, &[process_ctx_ptr, zero, ptr_size, base_off]);
 
         Ok(process_ctx_ptr)
     }
