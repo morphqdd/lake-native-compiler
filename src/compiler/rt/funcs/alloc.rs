@@ -705,6 +705,77 @@ pub fn define_free(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     builder
         .ins()
         .store(MemFlags::trusted(), fat_ptr_addr, head_addr, 0);
+
+    // ── #150: return committed pages to OS for chunks >= 16 KB ───────────
+    // The chunk stays linked into the free-list (allocator bookkeeping
+    // intact) but its underlying physical pages get released via
+    // madvise(MADV_DONTNEED).  RSS drops; next alloc that touches the
+    // region faults zero-fill pages back in.
+    //
+    // Page-alignment: payload_start is 16-byte aligned (not page-aligned)
+    // and bytes [payload_start .. +8) hold the free-list chain pointer.
+    // We round the advise address UP to the next page boundary that's at
+    // or after `payload_start + 8`, then madvise the remaining
+    // page-aligned tail (rounded down).  This guarantees:
+    //   * chain pointer page is NEVER advised (chain survives)
+    //   * advise address + length are page-aligned (madvise's EINVAL)
+    // For 64 KB arena allocs (typical): ~56-60 KB returned per free.
+    let page_size = builder.ins().iconst(ty, 4096);
+    let two_pages = builder.ins().iconst(ty, 8192);
+    let bucket_log = builder.ins().iadd_imm(bucket_idx, 4);
+    let one_v = builder.ins().iconst(ty, 1);
+    let bucket_size = builder.ins().ishl(one_v, bucket_log);
+    // Madvise when the chunk spans at least 2 pages so the chain-page
+    // skip + alignment slack still leaves at least 1 page to advise.
+    let big_enough = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, bucket_size, two_pages);
+    let madvise_block = builder.create_block();
+    let return_block = builder.create_block();
+    builder
+        .ins()
+        .brif(big_enough, madvise_block, &[], return_block, &[]);
+
+    builder.switch_to_block(madvise_block);
+    builder.seal_block(madvise_block);
+    // advise_addr = round_up_to_page(payload_start + 8)
+    let after_chain = builder.ins().iadd_imm(payload_start, 8);
+    let plus_4095 = builder.ins().iadd_imm(after_chain, 4095);
+    let page_mask = builder.ins().iconst(ty, !4095i64);
+    let advise_addr = builder.ins().band(plus_4095, page_mask);
+    // tail_len = (payload_start + bucket_size) - advise_addr, rounded down
+    let chunk_end = builder.ins().iadd(payload_start, bucket_size);
+    let tail = builder.ins().isub(chunk_end, advise_addr);
+    let advise_len = builder.ins().band(tail, page_mask);
+    // Guard: if advise_len < page_size, skip (no full page to advise).
+    let has_page = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, advise_len, page_size);
+    let do_advise_block = builder.create_block();
+    builder
+        .ins()
+        .brif(has_page, do_advise_block, &[], return_block, &[]);
+
+    builder.switch_to_block(do_advise_block);
+    builder.seal_block(do_advise_block);
+    let madvise_nr = builder.ins().iconst(ty, ctx.syscalls().sys_madvise);
+    let madv_dontneed = builder.ins().iconst(ty, 4);
+    let z = builder.ins().iconst(ty, 0);
+    let syscall_id = match ctx.module().get_name("rt_syscall") {
+        Some(FuncOrDataId::Func(id)) => id,
+        _ => return Err(anyhow!("rt_syscall must be declared before rt_free")),
+    };
+    let syscall_ref = ctx
+        .module_mut()
+        .declare_func_in_func(syscall_id, &mut builder.func);
+    builder.ins().call(
+        syscall_ref,
+        &[madvise_nr, advise_addr, advise_len, madv_dontneed, z, z, z],
+    );
+    builder.ins().jump(return_block, &[]);
+
+    builder.switch_to_block(return_block);
+    builder.seal_block(return_block);
     builder.ins().return_(&[]);
 
     // ── huge_free_block: munmap the whole region ────────────────────────────
