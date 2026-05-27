@@ -288,21 +288,19 @@ impl ShedulerCtxLayout {
     /// and return the packed pid `(gen << 32) | slot`.  The first
     /// real pid has gen=1 (slot 0's gen=0 stays reserved as the null
     /// sentinel).
-    /// Slim pid-table design: bump-only allocation, never recycle slots.
-    /// Each entry is a single 8-byte `proc_ctx_fat_ptr` (no gen tag).
     ///
-    /// Safety rationale:
-    ///   - Stale pid (recipient already died) → pid_table[slot] was set
-    ///     to 0 by `clear_pid` on death → `lookup_proc_ctx` returns 0 →
-    ///     send-expr null-checks → silent drop.
-    ///   - Slots are never reused, so a recycled pid cannot ever
-    ///     accidentally route to a different live actor.
+    /// Generation-tagged design (restored from the original #74
+    /// design after the slim variant was found to leak ~566 B/req
+    /// in lake-server via monotonic pid_table growth).  Each entry
+    /// is 16 bytes `{gen, proc_ctx}` — gen survives slot recycling
+    /// so a stale pid resolves to a 0 proc_ctx (silent send drop),
+    /// not to a different live actor.
     ///
-    /// Trade-off: pid_table grows monotonically with total spawn count.
-    /// For typical workloads (10⁵–10⁷ total spawns over a process
-    /// lifetime) this is well below the per-actor memory footprint.  A
-    /// 24/7 server processing 10⁹ spawns/day would need opt-in slot
-    /// reuse — defer to future work.
+    /// Allocation order: pop from `free_slots` if non-empty;
+    /// otherwise consume a fresh slot from `PID_TABLE_LEN`.  Both
+    /// paths increment the slot's gen before writing the new
+    /// proc_ctx, ensuring any stale pids carrying the old gen
+    /// fail the `lookup_proc_ctx` check.
     pub fn assign_pid(
         sh_ctx_ptr: Value,
         proc_ctx_fat_ptr: Value,
@@ -311,27 +309,24 @@ impl ShedulerCtxLayout {
     ) -> Value {
         let ptr_ty = ctx.module().target_config().pointer_type();
 
+        // Acquire slot — pop from free_slots if any, else bump LEN.
+        let slot = Self::emit_acquire_slot(sh_ctx_ptr, ctx, builder);
+
         // Inline load: sh_ctx_ptr is a fat-ptr addr; deref once.
         let sh_data = builder
             .ins()
             .load(ptr_ty, MemFlags::trusted(), sh_ctx_ptr, 0);
 
-        // slot = pid_table_len; pid_table_len += 1
-        let slot = builder
-            .ins()
-            .load(ptr_ty, MemFlags::trusted(), sh_data, Self::PID_TABLE_LEN);
-        let new_len = builder.ins().iadd_imm(slot, 1);
-        builder
-            .ins()
-            .store(MemFlags::trusted(), new_len, sh_data, Self::PID_TABLE_LEN);
-
-        // Grow pid_table so the entry at slot fits (stride 8 = log_stride 3).
+        // Grow pid_table so the entry at `slot` fits (stride 16 = log_stride 4).
+        // Pass `slot + 1` as the high-water-mark — emit_grow_array_if_full_strided
+        // doubles when `mark >= cap`.
+        let mark = builder.ins().iadd_imm(slot, 1);
         let pid_table_fat = Self::emit_grow_array_if_full_strided(
             sh_ctx_ptr,
             Self::PID_TABLE_FAT,
             Self::PID_TABLE_CAP,
-            new_len,
-            3,
+            mark,
+            4,
             ctx,
             builder,
         );
@@ -339,31 +334,34 @@ impl ShedulerCtxLayout {
             .ins()
             .load(ptr_ty, MemFlags::trusted(), pid_table_fat, 0);
 
-        // entry_addr = pid_table[slot]; entry is the proc_ctx_fat_ptr (i64).
-        let entry_off = builder.ins().imul_imm(slot, 8);
+        // entry_addr = pid_table[slot * 16]
+        let entry_off = builder.ins().imul_imm(slot, 16);
         let entry_addr = builder.ins().iadd(pid_table, entry_off);
+
+        // Bump the slot's generation: new_gen = old_gen + 1.
+        let old_gen = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), entry_addr, 0);
+        let new_gen = builder.ins().iadd_imm(old_gen, 1);
         builder
             .ins()
-            .store(MemFlags::trusted(), proc_ctx_fat_ptr, entry_addr, 0);
+            .store(MemFlags::trusted(), new_gen, entry_addr, 0);
+        // Write the new proc_ctx at offset 8.
+        builder
+            .ins()
+            .store(MemFlags::trusted(), proc_ctx_fat_ptr, entry_addr, 8);
 
-        // pid = slot (high 32 bits reserved for future use, currently 0).
-        slot
+        // Pack pid = (new_gen << 32) | slot.
+        let _ = sh_data;
+        let gen_shifted = builder.ins().ishl_imm(new_gen, 32);
+        builder.ins().bor(gen_shifted, slot)
     }
 
     /// Look up `proc_ctx_fat_ptr` for a given pid, or return 0 if the pid
-    /// is dead / null / out of range.  The generation half of the pid is
-    /// compared against `pid_table[slot].gen` — a mismatch (recycled
+    /// is dead / null / out of range.  The generation half of the pid
+    /// is compared against `pid_table[slot].gen` — a mismatch (recycled
     /// slot, stale pid from a dead actor) yields 0 so sends silently
     /// drop instead of waking the wrong actor (#73).
-    /// Look up a recipient's `proc_ctx_fat_ptr` via the slim pid_table.
-    /// Returns 0 if the actor has died (slot's proc_ctx was zeroed) or
-    /// if the pid is null.  Per send-expr's existing null check, callers
-    /// drop messages bound for a 0 lookup.
-    ///
-    /// Per #74 (gen-tag), this used to also gen-match; the slim design
-    /// removes that because slots are never recycled — stale pids can
-    /// only ever resolve to the same actor's slot (which is zero once
-    /// the actor died), never to a different live actor.
     pub fn lookup_proc_ctx(
         sh_ctx_ptr: Value,
         pid: Value,
@@ -384,26 +382,33 @@ impl ShedulerCtxLayout {
             .ins()
             .load(ptr_ty, MemFlags::trusted(), pid_table_fat, 0);
 
-        // pid = slot (high 32 bits reserved; mask for forward compatibility).
+        // Unpack pid → (gen, slot).
         let slot = builder.ins().band_imm(pid, Self::SLOT_MASK);
-        let entry_off = builder.ins().imul_imm(slot, 8);
+        let pid_gen = builder.ins().ushr_imm(pid, 32);
+
+        let entry_off = builder.ins().imul_imm(slot, 16);
         let entry_addr = builder.ins().iadd(pid_table, entry_off);
-        let _ = ctx;
-        builder
+
+        let stored_gen = builder
             .ins()
-            .load(ptr_ty, MemFlags::trusted(), entry_addr, 0)
+            .load(ptr_ty, MemFlags::trusted(), entry_addr, 0);
+        let proc_ctx = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), entry_addr, 8);
+
+        // gen mismatch → return 0 (stale pid, slot was recycled).
+        let gen_ok = builder.ins().icmp(IntCC::Equal, stored_gen, pid_gen);
+        let zero = builder.ins().iconst(ptr_ty, 0);
+        let result = builder.ins().select(gen_ok, proc_ctx, zero);
+        let _ = ctx;
+        result
     }
 
     /// Mark `pid` as dead and push its slot onto `free_slots` for reuse.
-    /// Idempotent against stale pids — the gen check guards against
-    /// double-free corrupting an already-recycled slot.  Called by
-    /// `free_process_resources` during reclamation.
-    /// Mark `pid` as dead by zeroing its proc_ctx slot.  After this,
-    /// subsequent sends to `pid` resolve to 0 (null) via
-    /// [`lookup_proc_ctx`] and are silently dropped.
-    ///
-    /// Per the slim pid_table design (see [`assign_pid`]), the slot is
-    /// NOT pushed back onto a free list — slots are never recycled.
+    /// The slot's gen counter is left unchanged so subsequent
+    /// `lookup_proc_ctx` with the now-stale pid still fails the gen
+    /// check (`assign_pid` bumps gen on next reuse).  Slot 0 is the
+    /// null sentinel — never recycled.
     pub fn clear_pid(
         sh_ctx_ptr: Value,
         pid: Value,
@@ -411,6 +416,10 @@ impl ShedulerCtxLayout {
         builder: &mut FunctionBuilder,
     ) {
         let ptr_ty = ctx.module().target_config().pointer_type();
+        let rt_funcs = ctx.rt_funcs().clone();
+        let load_ref = rt_funcs.load_u64_ref(ctx.module_mut(), builder);
+        let store_ref = rt_funcs.store_ref(ctx.module_mut(), builder);
+        let ptr_size = builder.ins().iconst(ptr_ty, ptr_ty.bytes() as i64);
 
         let slot = builder.ins().band_imm(pid, Self::SLOT_MASK);
 
@@ -426,15 +435,54 @@ impl ShedulerCtxLayout {
             .ins()
             .load(ptr_ty, MemFlags::trusted(), pid_table_fat, 0);
 
-        let entry_off = builder.ins().imul_imm(slot, 8);
+        // entry = pid_table[slot * 16]; zero proc_ctx (offset 8), keep gen.
+        let entry_off = builder.ins().imul_imm(slot, 16);
         let entry_addr = builder.ins().iadd(pid_table, entry_off);
-
-        // Zero proc_ctx so a concurrent in-flight send sees null.
         let zero = builder.ins().iconst(ptr_ty, 0);
         builder
             .ins()
-            .store(MemFlags::trusted(), zero, entry_addr, 0);
-        let _ = ctx;
+            .store(MemFlags::trusted(), zero, entry_addr, 8);
+
+        // Slot 0 = null sentinel; never push back.
+        let is_real = builder.ins().icmp_imm(IntCC::NotEqual, slot, 0);
+        let push_block = builder.create_block();
+        let done_block = builder.create_block();
+        builder
+            .ins()
+            .brif(is_real, push_block, &[], done_block, &[]);
+
+        // Push slot onto free_slots stack — grow if at cap.
+        builder.switch_to_block(push_block);
+        builder.seal_block(push_block);
+        let fs_len_off = builder.ins().iconst(ptr_ty, Self::FREE_SLOTS_LEN as i64);
+        let call_fs_len = builder.ins().call(load_ref, &[sh_ctx_ptr, fs_len_off]);
+        let fs_len = builder.inst_results(call_fs_len)[0];
+        let new_fs_len = builder.ins().iadd_imm(fs_len, 1);
+        let free_slots_fat = Self::emit_grow_array_if_full_strided(
+            sh_ctx_ptr,
+            Self::FREE_SLOTS_FAT,
+            Self::FREE_SLOTS_CAP,
+            new_fs_len,
+            3,
+            ctx,
+            builder,
+        );
+        let free_slots = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), free_slots_fat, 0);
+        let push_off = builder.ins().imul_imm(fs_len, 8);
+        let push_addr = builder.ins().iadd(free_slots, push_off);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), slot, push_addr, 0);
+        builder.ins().call(
+            store_ref,
+            &[sh_ctx_ptr, new_fs_len, ptr_size, fs_len_off],
+        );
+        builder.ins().jump(done_block, &[]);
+
+        builder.switch_to_block(done_block);
+        builder.seal_block(done_block);
     }
 
     pub fn init_main_process(
