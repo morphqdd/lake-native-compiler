@@ -540,6 +540,80 @@ pub(crate) fn hash_call_args(
     hasher.finish()
 }
 
+/// Compute the per-arg type strings for a call.  Mirrors the type
+/// resolution path of `hash_call_args` but returns the canonical
+/// type strings (one per arg, empty string for skip-cases) so
+/// callers can dispatch per-arg behaviour — e.g. `compile_spawn`
+/// uses these to decide which buf args need cross-actor copy when
+/// async-spawning (#138 phase 2d).
+pub(crate) fn expr_type_strs(
+    args: &[lake_frontend::api::expr::Expr<'_>],
+    var_types: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    use lake_frontend::api::expr::Expr;
+    args.iter()
+        .map(|arg| -> String {
+            match arg {
+                Expr::Var(name, ty) => {
+                    let raw = ty.to_string();
+                    if raw == "?" {
+                        var_types
+                            .get(name.to_string().as_str())
+                            .cloned()
+                            .unwrap_or_else(|| "?".to_string())
+                    } else {
+                        raw
+                    }
+                }
+                Expr::Num(_, ty) | Expr::String(_, ty) => ty.to_string(),
+                Expr::Jump { ident, .. } => match &ident.inner {
+                    Expr::Var(_, ty) => ty.to_string(),
+                    _ => String::new(),
+                },
+                Expr::TupleIndex { .. } => tuple_index_chain_type(arg)
+                    .map(|ty| ty.to_string())
+                    .unwrap_or_default(),
+                Expr::Add(_, _)
+                | Expr::Sub(_, _)
+                | Expr::Mul(_, _)
+                | Expr::Div(_, _)
+                | Expr::Neg(_)
+                | Expr::Le(_, _)
+                | Expr::Ge(_, _)
+                | Expr::Eq(_, _)
+                | Expr::Lt(_, _)
+                | Expr::Gt(_, _) => "i64".to_string(),
+                Expr::Bool(_) => "i64".to_string(),
+                _ => String::new(),
+            }
+        })
+        .collect()
+}
+
+/// True when the canonical type string denotes a pointer-shaped
+/// allocation (fat-pointer ABI: buf, str, named records).  i64 /
+/// atom / pid / bool are value types — passed by value across
+/// async-spawn boundaries with no copy needed.
+pub(crate) fn is_pointer_like_type(ty: &str) -> bool {
+    // Canonicalise to lowercase token, strip any whitespace.
+    let t = ty.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t == "buf" || t == "str" {
+        return true;
+    }
+    // Primitive value types we know about.
+    matches!(t, "i64" | "i32" | "atom" | "pid" | "bool" | "?")
+        .then(|| false)
+        .unwrap_or_else(|| {
+            // Anything else — record name (`HTTPRequest`, `User`),
+            // `{atom buf}` tuple, `Struct(...)`-shaped value — treated as
+            // pointer-like.  Records lower to fat-ptr (#058); tuples too.
+            true
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::target_cycles_from;

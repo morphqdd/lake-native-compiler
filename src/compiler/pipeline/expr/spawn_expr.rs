@@ -32,6 +32,7 @@ pub fn compile_spawn(
     machine_name: &str,
     call_hash: u64,
     jump_args_base: usize,
+    arg_types: &[String],
 ) -> Result<StmtOutcome> {
     let ptr_ty = ctx.module().target_config().pointer_type();
     let rt_funcs = ctx.rt_funcs().clone();
@@ -94,21 +95,10 @@ pub fn compile_spawn(
         None
     };
 
-    if arg_count > 0 {
-        let ja_start = spawning_ja_start.unwrap();
-        let vars_start = FatPtrLayout::load_start(builder, ptr_ty, vars_fat_ptr);
-        for i in 0..arg_count {
-            let val = builder.ins().load(
-                ptr_ty,
-                MemFlags::new(),
-                ja_start,
-                (jump_args_base + i) as i32 * 8,
-            );
-            builder
-                .ins()
-                .store(MemFlags::new(), val, vars_start, i as i32 * 8);
-        }
-    }
+    // Arg copy to spawned `vars[]` deferred to after proc_ctx + arena
+    // setup so async-spawn buf args can be copied into the spawned
+    // actor's arena (#138 phase 2d).  See arg-copy block below the
+    // arena setup.
 
     let branch_id_val = if needs_guard_dispatch {
         let disc_pos = dispatch::find_best_guard_pos(&candidates);
@@ -261,6 +251,53 @@ pub fn compile_spawn(
             store_ref_arena,
             &[proc_ctx_fat_ptr, arena_base, arena_field_size, arena_base_off],
         );
+    }
+
+    // ── Copy args from spawning JUMP_ARGS to spawned VARIABLES.
+    // For sync ret-machine spawn (inherits arena), pass values as-is
+    // — the spawned actor reads through the same arena cursor and
+    // arg lifetimes match.  For async spawn (owned arena), buf-typed
+    // args must be deep-copied via `rt_copy_to_arena` so the spawned
+    // actor's reads survive the spawner's death.  Standard actor-
+    // model semantics — async spawn = "send" + cross-actor copy.
+    if arg_count > 0 {
+        let ja_start = spawning_ja_start.unwrap();
+        let vars_start = FatPtrLayout::load_start(builder, ptr_ty, vars_fat_ptr);
+        let is_async = !ctx.is_ret_machine(machine_name);
+        // Resolve rt_copy_to_arena once if we'll need it.
+        let copy_to_arena_ref = if is_async {
+            let id = match ctx.module().get_name("rt_copy_to_arena") {
+                Some(FuncOrDataId::Func(id)) => id,
+                _ => bail!("rt_copy_to_arena not declared"),
+            };
+            Some(
+                ctx.module_mut()
+                    .declare_func_in_func(id, &mut builder.func),
+            )
+        } else {
+            None
+        };
+        for i in 0..arg_count {
+            let val = builder.ins().load(
+                ptr_ty,
+                MemFlags::new(),
+                ja_start,
+                (jump_args_base + i) as i32 * 8,
+            );
+            // Decide per-arg: pointer-like + async → copy; else as-is.
+            let stored = match (is_async, arg_types.get(i)) {
+                (true, Some(ty)) if crate::compiler::is_pointer_like_type(ty) => {
+                    let call_copy = builder
+                        .ins()
+                        .call(copy_to_arena_ref.unwrap(), &[val, proc_ctx_fat_ptr]);
+                    builder.inst_results(call_copy)[0]
+                }
+                _ => val,
+            };
+            builder
+                .ins()
+                .store(MemFlags::new(), stored, vars_start, i as i32 * 8);
+        }
     }
 
     let sched_data_id = match ctx.module().get_name("sheduler_ctx_fat_ptr") {

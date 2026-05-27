@@ -1141,3 +1141,156 @@ pub fn define_arena_alloc(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
     ctx.module_mut().clear_context(&mut module_ctx);
     Ok(ctx)
 }
+
+/// Build `rt_copy_to_arena(src_fat_ptr, target_proc_ctx) -> i64` — copy
+/// the bytes of `src` into `target`'s arena (#138 phase 2d).
+///
+/// Async spawn argument-copy primitive: when caller A spawns
+/// non-ret machine B with a buf argument, A's arena outlive can
+/// outpace B's reads.  Copying the bytes into B's arena gives B an
+/// independent copy whose lifetime matches its own actor.  Standard
+/// actor-model semantics — Erlang's `spawn` copies args between
+/// processes for the same reason.
+///
+/// `target_proc_ctx` is a fat-ptr address to the target actor's
+/// proc_ctx (where OWNED_ARENA_FAT lives).  Falls back to
+/// `rt_allocate_raw(size)` + memcpy when the target arena is
+/// exhausted or absent.
+///
+/// Returns a fresh fat-ptr address into target's arena, ABI-equivalent
+/// to `rt_allocate_raw`.
+pub fn define_copy_to_arena(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
+    let ptr_ty = ctx.module().target_config().pointer_type();
+
+    let rt_allocate_raw_id = match ctx.module().get_name("rt_allocate_raw") {
+        Some(FuncOrDataId::Func(id)) => id,
+        _ => {
+            return Err(anyhow!(
+                "rt_allocate_raw must be declared before rt_copy_to_arena"
+            ));
+        }
+    };
+    let rt_copy_bytes_id = match ctx.module().get_name("rt_copy_bytes") {
+        Some(FuncOrDataId::Func(id)) => id,
+        _ => {
+            return Err(anyhow!(
+                "rt_copy_bytes must be declared before rt_copy_to_arena"
+            ));
+        }
+    };
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut module_ctx = ctx.module().make_context();
+    let mut builder = FunctionBuilder::new(&mut module_ctx.func, &mut builder_ctx);
+
+    // (src_fat_ptr, target_proc_ctx_fat_ptr) -> i64
+    builder.func.signature.params.push(AbiParam::new(ptr_ty));
+    builder.func.signature.params.push(AbiParam::new(ptr_ty));
+    builder.func.signature.returns.push(AbiParam::new(ptr_ty));
+
+    let entry = builder.create_block();
+    builder.append_block_param(entry, ptr_ty);
+    builder.append_block_param(entry, ptr_ty);
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+
+    let src_fat = builder.block_params(entry)[0];
+    let target_proc_ctx_fat = builder.block_params(entry)[1];
+
+    // size = src.end - src.start
+    let src_start = builder.ins().load(ptr_ty, MemFlags::trusted(), src_fat, 0);
+    let src_end = builder.ins().load(ptr_ty, MemFlags::trusted(), src_fat, 8);
+    let size = builder.ins().isub(src_end, src_start);
+
+    // Resolve target's arena_fat: deref target_proc_ctx, load arena field.
+    let target_proc_ctx = builder
+        .ins()
+        .load(ptr_ty, MemFlags::trusted(), target_proc_ctx_fat, 0);
+    let target_arena_fat = builder.ins().load(
+        ptr_ty,
+        MemFlags::trusted(),
+        target_proc_ctx,
+        ProcessCtxLayout::OWNED_ARENA_FAT,
+    );
+
+    let has_arena_block = builder.create_block();
+    let fallback_block = builder.create_block();
+    let has_arena = builder
+        .ins()
+        .icmp_imm(IntCC::NotEqual, target_arena_fat, 0);
+    builder
+        .ins()
+        .brif(has_arena, has_arena_block, &[], fallback_block, &[]);
+
+    // ── has_arena: bump from target arena ─────────────────────────────
+    builder.switch_to_block(has_arena_block);
+    builder.seal_block(has_arena_block);
+
+    let bump = builder
+        .ins()
+        .load(ptr_ty, MemFlags::trusted(), target_arena_fat, 0);
+    let arena_end = builder
+        .ins()
+        .load(ptr_ty, MemFlags::trusted(), target_arena_fat, 8);
+    let plus_seven = builder.ins().iadd_imm(size, 7);
+    let mask = builder.ins().iconst(ptr_ty, !7i64);
+    let aligned_size = builder.ins().band(plus_seven, mask);
+    let needed = builder.ins().iadd_imm(aligned_size, 16);
+    let new_bump = builder.ins().iadd(bump, needed);
+    let fits = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThanOrEqual, new_bump, arena_end);
+    let copy_block = builder.create_block();
+    builder
+        .ins()
+        .brif(fits, copy_block, &[], fallback_block, &[]);
+
+    builder.switch_to_block(copy_block);
+    builder.seal_block(copy_block);
+    let payload_start = builder.ins().iadd_imm(bump, 16);
+    let payload_end = builder.ins().iadd(payload_start, size);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), payload_start, bump, 0);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), payload_end, bump, 8);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), new_bump, target_arena_fat, 0);
+
+    // memcpy src → new chunk via rt_copy_bytes(dst_fat, 0, src_fat, 0, size).
+    let copy_ref = ctx
+        .module_mut()
+        .declare_func_in_func(rt_copy_bytes_id, &mut builder.func);
+    let zero = builder.ins().iconst(ptr_ty, 0);
+    builder
+        .ins()
+        .call(copy_ref, &[bump, zero, src_fat, zero, size]);
+    builder.ins().return_(&[bump]);
+
+    // ── fallback: rt_allocate_raw + memcpy ────────────────────────────
+    builder.switch_to_block(fallback_block);
+    builder.seal_block(fallback_block);
+    let alloc_raw_ref = ctx
+        .module_mut()
+        .declare_func_in_func(rt_allocate_raw_id, &mut builder.func);
+    let call_alloc = builder.ins().call(alloc_raw_ref, &[size]);
+    let dst_fat = builder.inst_results(call_alloc)[0];
+    let copy_ref_fb = ctx
+        .module_mut()
+        .declare_func_in_func(rt_copy_bytes_id, &mut builder.func);
+    let zero_fb = builder.ins().iconst(ptr_ty, 0);
+    builder
+        .ins()
+        .call(copy_ref_fb, &[dst_fat, zero_fb, src_fat, zero_fb, size]);
+    builder.ins().return_(&[dst_fat]);
+
+    let sig = builder.func.signature.clone();
+    let id = ctx
+        .module_mut()
+        .declare_function("rt_copy_to_arena", Linkage::Export, &sig)?;
+    ctx.module_mut().define_function(id, &mut module_ctx)?;
+    ctx.module_mut().clear_context(&mut module_ctx);
+    Ok(ctx)
+}

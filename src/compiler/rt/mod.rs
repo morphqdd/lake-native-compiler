@@ -11,7 +11,7 @@ use crate::compiler::{
         funcs::{
             alloc::{
                 define_allocate, define_allocate_raw, define_arena_alloc, define_copy_bytes,
-                define_free, define_loads, define_store,
+                define_copy_to_arena, define_free, define_loads, define_store,
             },
             die::define_die_actor,
             env::{
@@ -89,6 +89,11 @@ impl RuntimeBuilder {
         let ctx = define_loads(ctx)?;
         debug!("rt: rt_copy_bytes");
         let ctx = define_copy_bytes(ctx)?;
+        // rt_copy_to_arena depends on rt_allocate_raw and rt_copy_bytes;
+        // declared after both.  Used by compile_spawn to copy buf args
+        // across async-spawn boundaries (#138 phase 2d).
+        debug!("rt: rt_copy_to_arena");
+        let ctx = define_copy_to_arena(ctx)?;
         debug!("rt: rt_{{argc,argv,envp}}_raw + rt_cstr_len (asm imports)");
         let ctx = declare_asm_env_helpers(ctx)?;
         debug!("rt: rt_load_ptr_raw");

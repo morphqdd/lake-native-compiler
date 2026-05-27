@@ -284,6 +284,7 @@ pub fn compile(
         }
 
         let call_hash = hash_call_args(args, state.lake_types());
+        let arg_types = crate::compiler::expr_type_strs(args, state.lake_types());
         if let Some(name) = ctx.get_current_machine()
             && *callee_name == "self"
         {
@@ -296,6 +297,7 @@ pub fn compile(
                 &name,
                 call_hash,
                 call_base,
+                &arg_types,
             )
         } else {
             spawn_expr::compile_spawn(
@@ -307,6 +309,7 @@ pub fn compile(
                 callee_name,
                 call_hash,
                 call_base,
+                &arg_types,
             )
         }
     }
