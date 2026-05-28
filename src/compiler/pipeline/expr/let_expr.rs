@@ -108,7 +108,7 @@ pub fn compile(
     // name) falls into the same i64 slot since Lake's ABI is uniformly
     // pointer-sized for reference types.  #058 followup.
     let lookup_key = match ty {
-        Type::Struct(_) => "i64".to_string(),
+        Type::Struct(_) | Type::Unit | Type::Unknown => "i64".to_string(),
         Type::Named(ident) if ident.inner.0 == "atom" => "i64".to_string(),
         Type::Named(ident) => {
             let n = ident.inner.0;
@@ -244,7 +244,7 @@ fn compile_pure_let(
     // Composite types (Struct/Tuple, atom) live as fat-ptr i64s at
     // runtime — collapse for the type-map lookup, same as the slow path.
     let lookup_key = match ty {
-        Type::Struct(_) => "i64".to_string(),
+        Type::Struct(_) | Type::Unit | Type::Unknown => "i64".to_string(),
         Type::Named(ident) if ident.inner.0 == "atom" => "i64".to_string(),
         Type::Named(ident) => {
             let n = ident.inner.0;
