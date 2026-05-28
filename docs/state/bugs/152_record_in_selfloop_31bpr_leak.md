@@ -299,6 +299,65 @@ fires for these, so they sit in the arena and die with it.
 Outcome: leak source remains unidentified.  Lake-server stays at
 80 B/req default, 64 B/req slab.  Tracked as task #76.
 
+## Deeper analysis — class-2 breakdown by sub-source
+
+Class-2 allocs = 350,008; class-2 frees = 345,005.  Spawn / death
+counters match exactly: 265,004 spawns / 265,003 deaths.  So per
+death every spawn's resources are freed — leak is not from
+orphaned actors.
+
+Splitting class-2 by sub-source:
+
+| Sub-source           | Allocs    | Frees     | Active |
+|----------------------|-----------|-----------|--------|
+| proc_ctx (40 B)      | 265,004   | 265,003   | 1      |
+| Other (vars 24-48 B) | 85,004    | 80,002    | 5,002  |
+
+The proc_ctx column matches spawn/death exactly (1 live = the
+listener).  The 5,002 vars-class-2 leak is the per-request 1
+chunk per req we see.
+
+Vars allocation uses `max_branch_var_count(machine) * 8`.
+Machines whose max_vars lands in 3-6 i64 slots (= 24-48 B
+user_size) route through class 2.  Per-request lake-server hits
+roughly 17 such spawns (= 85,004 / 5,000).
+
+The leak: 5,002 of those allocs never get a matching free.  Per
+request, exactly 1 such chunk goes unfreed.  Since the death
+free unconditionally calls `rt_free(vars_fat_ptr)`
+(`sheduler_ctx.rs:783`), the leak must come from a vars
+allocation whose corresponding death doesn't run — or from a
+different `rt_allocate_raw` site that returns chunks in this
+size range outside the spawn lifecycle.
+
+Remaining suspects (none yet verified):
+- Some specific machine with max_vars in 3-6 whose death path
+  hits an early exit (STOP_PARK that never unparks, rt_die_actor
+  that skips free, …).
+- A scheduler bookkeeping alloc with size 17-48 we haven't
+  enumerated (init_ctx ProcessCtxLayout::init?  No — that IS the
+  proc_ctx counted above).
+- Compile-time fused/sync-ret-machine path that allocates an
+  intermediate fat-ptr but stashes it past its actor's lifetime.
+
+Tracked as task #76 with the verified-zero fallback paths and the
+85k/80k vars-class-2 split.
+
+## Conclusion
+
+Bug #152 (own-arena self-loop ptr-arg leak + latent UB) — fixed
+in 3c516ff + 9e37a72.
+
+Bug #76 — residual ~64 B/req from one class-2 chunk per request.
+Source ruled out: arena_alloc fallback, copy_to_arena fallback,
+proc_ctx-from-spawn lifecycle.  Source narrowed to: a vars
+allocation (or unidentified rt_allocate_raw site) in size 17-48
+B range, ~1/request, not freed.
+
+Acceptable lake-server steady state for now: 80 B/req default
+bucket, 64 B/req slab.  Down from 3946 B/req at start of session
+— a 98% reduction.
+
 ## Workaround
 
 Until root cause is fixed: use default bucket allocator (omit
