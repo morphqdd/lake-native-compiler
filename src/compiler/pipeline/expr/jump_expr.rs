@@ -52,6 +52,7 @@ pub fn compile(
     if *callee_name == "self" && args.iter().all(|a| pure_expr::is_pure(a)) {
         if let Some(machine_name) = ctx.get_current_machine() {
             let call_hash = hash_call_args(args, state.lake_types());
+            let arg_types = crate::compiler::expr_type_strs(args, state.lake_types());
             return compile_fused_self_call(
                 ctx,
                 builder,
@@ -62,6 +63,7 @@ pub fn compile(
                 &machine_name,
                 call_hash,
                 args,
+                &arg_types,
             );
         }
     }
@@ -453,6 +455,7 @@ fn compile_fused_self_call(
     machine_name: &str,
     call_hash: u64,
     args: &[Expr<'_>],
+    arg_types: &[String],
 ) -> Result<StmtOutcome> {
     let ptr_ty = ctx.module().target_config().pointer_type();
 
@@ -486,21 +489,214 @@ fn compile_fused_self_call(
         .map(|arg| pure_expr::fold(arg, builder, ptr_ty, Some(vars_start), state))
         .collect();
 
-    // 3. Write all values directly to VARIABLES
-    for (i, val) in values.iter().enumerate() {
-        builder
-            .ins()
-            .store(MemFlags::trusted(), *val, vars_start, i as i32 * 8);
-    }
+    // 2.5 (bug #152 latent): for own-arena actors (non-ret machines)
+    // with pointer-typed args, the arena reset in step 3.5 would
+    // invalidate the pointer payloads on the next iteration's first
+    // allocation.  Snapshot ptr args to a scratch buf, reset arena,
+    // re-alloc + recopy into the fresh arena.  Mirrors the slow
+    // path (`change_state_expr.rs:179-295`).
+    //
+    // Skipped for sync-ret-machines (inherited arena) because the
+    // arena reset in step 3.5 is a no-op (gated on
+    // `OWNED_ARENA_BASE != 0`), so the original ptr args stay
+    // valid through the self() iteration.  Doing snapshot+recopy
+    // there would bump the inherited caller's arena every iter,
+    // amplifying allocations for stdlib helpers like
+    // `next_newline`, `slice_buf`, etc.
+    let mut final_values = values.clone();
+    let is_own_arena = !ctx.is_ret_machine(machine_name);
+    let ptr_arg_idxs: Vec<usize> = if is_own_arena {
+        arg_types
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| {
+                if crate::compiler::is_pointer_like_type(t) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
-    // 3.5 Reset arena (bug #152).  The slow path through
-    // change_state_expr does this in its #138-phase-2e arena-reset
-    // step; the fused fast path was bypassing it, leaving the
-    // self-looping actor's arena to bump forever and eventually
-    // exhaust → rt_arena_alloc fallback → class-1 slab chunks
-    // pinned forever.  Reset only when the actor owns its arena
-    // (OWNED_ARENA_BASE != 0).
-    if let Some(FuncOrDataId::Data(sid)) = ctx.module().get_name("sheduler_ctx_fat_ptr") {
+    if !ptr_arg_idxs.is_empty() {
+        // Compute per-arg sizes (end - start) and total.
+        let mut ptr_arg_sizes: Vec<(usize, cranelift::prelude::Value)> = Vec::new();
+        let mut total_size_opt: Option<cranelift::prelude::Value> = None;
+        for &i in &ptr_arg_idxs {
+            let fp = values[i];
+            let start = builder.ins().load(ptr_ty, MemFlags::trusted(), fp, 0);
+            let end = builder.ins().load(ptr_ty, MemFlags::trusted(), fp, 8);
+            let sz = builder.ins().isub(end, start);
+            total_size_opt = Some(match total_size_opt {
+                None => sz,
+                Some(prev) => builder.ins().iadd(prev, sz),
+            });
+            ptr_arg_sizes.push((i, sz));
+        }
+
+        let alloc_raw_id = match ctx.module().get_name("rt_allocate_raw") {
+            Some(FuncOrDataId::Func(id)) => id,
+            _ => bail!("rt_allocate_raw not declared"),
+        };
+        let alloc_raw_ref = ctx
+            .module_mut()
+            .declare_func_in_func(alloc_raw_id, &mut builder.func);
+        let copy_bytes_id = match ctx.module().get_name("rt_copy_bytes") {
+            Some(FuncOrDataId::Func(id)) => id,
+            _ => bail!("rt_copy_bytes not declared"),
+        };
+        let copy_bytes_ref = ctx
+            .module_mut()
+            .declare_func_in_func(copy_bytes_id, &mut builder.func);
+        let free_id = match ctx.module().get_name("rt_free") {
+            Some(FuncOrDataId::Func(id)) => id,
+            _ => bail!("rt_free not declared"),
+        };
+        let free_ref = ctx
+            .module_mut()
+            .declare_func_in_func(free_id, &mut builder.func);
+        let arena_alloc_id = match ctx.module().get_name("rt_arena_alloc") {
+            Some(FuncOrDataId::Func(id)) => id,
+            _ => bail!("rt_arena_alloc not declared"),
+        };
+        let arena_alloc_ref = ctx
+            .module_mut()
+            .declare_func_in_func(arena_alloc_id, &mut builder.func);
+
+        let total_size = total_size_opt.unwrap();
+        let call_scratch = builder.ins().call(alloc_raw_ref, &[total_size]);
+        let scratch_fat = builder.inst_results(call_scratch)[0];
+        let zero_off = builder.ins().iconst(ptr_ty, 0);
+
+        // Snapshot each ptr-arg's payload bytes into the scratch buf.
+        let mut offsets: Vec<(usize, cranelift::prelude::Value, cranelift::prelude::Value)> =
+            Vec::new();
+        let mut cursor = builder.ins().iconst(ptr_ty, 0);
+        for &(i, sz) in &ptr_arg_sizes {
+            let src_fat = values[i];
+            builder.ins().call(
+                copy_bytes_ref,
+                &[scratch_fat, cursor, src_fat, zero_off, sz],
+            );
+            offsets.push((i, cursor, sz));
+            cursor = builder.ins().iadd(cursor, sz);
+        }
+
+        // Reset will fire in step 3.5 below; re-alloc each ptr arg
+        // afterwards.  We rely on step 3.5 to actually reset the
+        // arena before our re-allocs; since both run in the same
+        // straight-line block, ordering is preserved.
+
+        // (Tail of dance is emitted AFTER step 3.5 reset block.)
+        // Stash refs and indices for the post-reset loop via a
+        // closure-like pattern: just remember and re-iterate.
+
+        // Emit step 3.5 reset inline here so we control ordering:
+        // 1. snapshot (above)
+        // 2. arena reset
+        // 3. re-alloc + recopy (below)
+        // 4. free scratch
+        if let Some(FuncOrDataId::Data(sid)) = ctx.module().get_name("sheduler_ctx_fat_ptr") {
+            let sched_gv = ctx
+                .module_mut()
+                .declare_data_in_func(sid, &mut builder.func);
+            let sched_fat = builder.ins().global_value(ptr_ty, sched_gv);
+            let sched_start = builder
+                .ins()
+                .load(ptr_ty, MemFlags::trusted(), sched_fat, 0);
+            let cur_idx = builder.ins().load(
+                ptr_ty,
+                MemFlags::trusted(),
+                sched_start,
+                ShedulerCtxLayout::CURRENT_PROCESS,
+            );
+            let proc_arr_fat = builder.ins().load(
+                ptr_ty,
+                MemFlags::trusted(),
+                sched_start,
+                ShedulerCtxLayout::PROCESS_ARR_FAT,
+            );
+            let proc_arr = builder
+                .ins()
+                .load(ptr_ty, MemFlags::trusted(), proc_arr_fat, 0);
+            let cur_off = builder.ins().imul_imm(cur_idx, 8);
+            let cur_entry_addr = builder.ins().iadd(proc_arr, cur_off);
+            let proc_ctx_fat_ptr = builder
+                .ins()
+                .load(ptr_ty, MemFlags::trusted(), cur_entry_addr, 0);
+            let proc_ctx_start = builder
+                .ins()
+                .load(ptr_ty, MemFlags::trusted(), proc_ctx_fat_ptr, 0);
+            let arena_fat = builder.ins().load(
+                ptr_ty,
+                MemFlags::trusted(),
+                proc_ctx_start,
+                ProcessCtxLayout::OWNED_ARENA_FAT,
+            );
+            let arena_base = builder.ins().load(
+                ptr_ty,
+                MemFlags::trusted(),
+                proc_ctx_start,
+                ProcessCtxLayout::OWNED_ARENA_BASE,
+            );
+            // Reset only if we own (guard preserved even though
+            // is_own_arena is true at compile time — runtime check
+            // mirrors slow path's exact semantics).
+            let owns = builder.ins().icmp_imm(
+                cranelift::prelude::IntCC::NotEqual,
+                arena_base,
+                0,
+            );
+            let reset_blk = builder.create_block();
+            let skip_blk = builder.create_block();
+            builder.ins().brif(owns, reset_blk, &[], skip_blk, &[]);
+            builder.switch_to_block(reset_blk);
+            builder.seal_block(reset_blk);
+            builder
+                .ins()
+                .store(MemFlags::trusted(), arena_base, arena_fat, 0);
+            builder.ins().jump(skip_blk, &[]);
+            builder.switch_to_block(skip_blk);
+            builder.seal_block(skip_blk);
+        }
+
+        // Re-alloc each ptr arg in the (just-reset) arena, copy
+        // payload bytes back from the scratch snapshot.
+        for (i, off, sz) in &offsets {
+            let call_dst = builder.ins().call(arena_alloc_ref, &[*sz]);
+            let dst_fat = builder.inst_results(call_dst)[0];
+            builder.ins().call(
+                copy_bytes_ref,
+                &[dst_fat, zero_off, scratch_fat, *off, *sz],
+            );
+            final_values[*i] = dst_fat;
+        }
+
+        // Free scratch.
+        builder.ins().call(free_ref, &[scratch_fat]);
+
+        // 3. Write final values directly to VARIABLES (post-recopy).
+        for (i, val) in final_values.iter().enumerate() {
+            builder
+                .ins()
+                .store(MemFlags::trusted(), *val, vars_start, i as i32 * 8);
+        }
+    } else {
+        // No ptr args (or sync-ret machine — inherited arena).
+        // Original simple flow: write vals to vars + reset arena
+        // (which is a no-op when arena_base == 0).
+        for (i, val) in values.iter().enumerate() {
+            builder
+                .ins()
+                .store(MemFlags::trusted(), *val, vars_start, i as i32 * 8);
+        }
+
+        // Reset arena only when owned (#152 fix preserved for the
+        // no-ptr-arg case — handles e.g. server_min's `self(fd)`).
+        if let Some(FuncOrDataId::Data(sid)) = ctx.module().get_name("sheduler_ctx_fat_ptr") {
         let sched_gv = ctx.module_mut().declare_data_in_func(sid, &mut builder.func);
         let sched_fat = builder.ins().global_value(ptr_ty, sched_gv);
         let sched_start = builder
@@ -557,6 +753,7 @@ fn compile_fused_self_call(
         builder.ins().jump(skip_blk, &[]);
         builder.switch_to_block(skip_blk);
         builder.seal_block(skip_blk);
+        }
     }
 
     // 4. Set BRANCH_ID — with guard dispatch if multiple branches share this hash.
