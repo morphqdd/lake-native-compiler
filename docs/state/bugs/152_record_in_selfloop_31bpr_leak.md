@@ -95,17 +95,110 @@ mmap'd regions that should have been reclaimed via
 `rt_free_slab → munmap` but **stay mapped**.  Pattern fits "one
 chunk per slab is perpetually allocated and pins the slab".
 
-## Hypothesis (unverified)
+## Diagnostic — per-class slab counters
 
-Some per-request allocation lands in a small slab class (0..6), is
-counted as "in use" but never reaches the `free_count == chunks_per_slab`
-condition in `rt_free_slab` because at least one chunk in the same
-slab is held by a long-lived actor (handle or main).  The held chunk
-prevents the rest of the slab from munmap'ing on death.
+Diagnostic patch (since reverted) added two global counter arrays:
+`slab_class_active[21]` (incremented in `rt_allocate_slab`,
+decremented in `rt_free_slab`) and
+`slab_class_lifetime_allocs[21]` (alloc-only).  Counter dump via
+`kill -ABRT` → `coredumpctl dump` → ELF reader against the binary
++ core symbol table.
 
-To prove: instrument `rt_allocate_raw` / `rt_free` with a per-class
-counter; after 10 k req compare totals.  The class with non-zero net
-== leak source.
+For `server_min` (record + Connection arg, 5000 req, RSS 660 →
+800 KB):
+
+```
+class  size       allocs   frees   active   pinned_bytes
+[ 1]  32         7352     5041    2311     73952
+[ 2]  64         30254    30250   4        256
+[ 3]  128        5041     5041    0        0       <- balanced
+[ 4]  256        20169    20167   2        512
+[ 8]  4096       40336    40332   4        16384
+[12]  65536      3        0       3        196608  <- live actor arenas
+[13]  131072     5045     5042    3        393216
+```
+
+Class 1 alone leaks 2311 chunks (74 KB), which fills two full
+class-1 slabs (~2030 chunks/slab × 32 B = 64 KB each).  The
+remaining 4 + 2 + 4 = 10 active chunks across classes 2/4/8 are
+the running actors' (handle, serve, etc.) bookkeeping — those
+stay until process exit.
+
+For `server_spawnonly` (no record, 5000 req): every alloc is
+balanced — class 1 = 0 leak.
+
+For `server_recok` (record + i64 spawn, no Connection arg-copy):
+class 1 = 2271 leaked.  Same magnitude as `server_min` — confirms
+the leak source is the record **creation** path, not the
+async-spawn arg copy.
+
+## Root cause confirmed: `rt_arena_alloc` fallback path leaks
+
+Added `arena_alloc_fallback_count` counter to the fallback branch
+of `rt_arena_alloc` (`alloc.rs:1538-1546`, since reverted).
+After 5000 req on `server_min`:
+
+```
+class[1]   2298 active chunks
+fallback_count = 2298
+```
+
+**1:1 match** — every `rt_arena_alloc` → fallback call leaks a
+class-1 chunk.  The fallback calls `rt_allocate_raw(user_size)`
+and returns the result, but the caller (`tuple_expr.rs:96`,
+`change_state_expr.rs:271`) treats the result as arena-lifetime
+memory and never issues `rt_free`.
+
+`rt_arena_alloc` body (`alloc.rs:1481-1545`):
+
+* `has_arena_block` (bump from arena cursor): used when
+  `target_proc_ctx.OWNED_ARENA_FAT != 0` and `new_bump <= arena_end`.
+* `fallback_block`: when either check fails — calls
+  `rt_allocate_raw(user_size)`.
+
+The fallback branch was originally a guard against arena
+exhaustion / missing arena.  In the slab-allocator era, every
+spawn (including `main` via `init_main_process`) gives the actor
+an arena, so the "missing arena" case should never fire for
+user code.  Yet we see ~0.46 fallback calls per request.
+
+## Open question
+
+Why does the `arena_fat == 0` check fire ~0.46×/req for record
+creation but never for non-record-bearing flows
+(`server_spawnonly` = 0 fallback)?
+
+Trace seemed to rule out:
+
+* handle's OWNED_ARENA_FAT cleared mid-iteration (`self()`
+  doesn't touch it).
+* CURRENT_PROCESS pointing at a freed actor (would crash
+  elsewhere).
+* arena exhaustion (`self()` resets bump each iteration).
+
+Likeliest remaining explanation: a specific code path inside the
+spawn machinery (e.g. `accept`'s sync ret return, the `let conn =
+accept(fd)` wait, or the let-binding for `c` itself) executes
+under a transient scheduler state where `CURRENT_PROCESS` points
+at an actor whose `OWNED_ARENA_FAT` slot is uninitialised or
+stale.
+
+## Suggested next step
+
+Plant a side-channel write inside the fallback path that captures
+the calling `CURRENT_PROCESS` index, the loaded `proc_ctx`
+address, and the actor's machine name table offset.  Cross-
+reference with a process-id-to-machine table dumped at the same
+time to identify which actor is hitting the fallback.
+
+## Mitigation
+
+If root-causing the scheduler quirk proves hard, the cheapest
+workaround is to make the fallback path **not leak**: route the
+fallback through arena-of-main instead of `rt_allocate_raw`, or
+attach the fallback'd chunks to the caller's exec_ctx so death
+cleanup frees them.  Either eliminates the per-request leak
+without identifying the underlying scheduler bug.
 
 ## Workaround
 
