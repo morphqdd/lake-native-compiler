@@ -348,15 +348,58 @@ Tracked as task #76 with the verified-zero fallback paths and the
 Bug #152 (own-arena self-loop ptr-arg leak + latent UB) — fixed
 in 3c516ff + 9e37a72.
 
-Bug #76 — residual ~64 B/req from one class-2 chunk per request.
-Source ruled out: arena_alloc fallback, copy_to_arena fallback,
-proc_ctx-from-spawn lifecycle.  Source narrowed to: a vars
-allocation (or unidentified rt_allocate_raw site) in size 17-48
-B range, ~1/request, not freed.
+Bug #76 — **FIXED** in lake-stdlib commit 9211833.
 
-Acceptable lake-server steady state for now: 80 B/req default
-bucket, 64 B/req slab.  Down from 3946 B/req at start of session
-— a 98% reduction.
+Root cause: `alloc_or_die(n)` (std/process.lake) wrapped
+`rt_allocate(n)` which returns a raw slab chunk via the tuple
+ABI ({atom buf}).  Callers like `cstr_of`
+(`std/experimental/fs.lake:62`) discard the returned buf
+without `rt_free` — every call leaked one slab chunk per
+allocation.
+
+lake-server hit this through the `open(path)` → `cstr_of(path)`
+→ `alloc_or_die(strlen+1)` chain once per request.  Path string
+`/home/morphe/compiler/lake-server/ww/index.html` is ~46 chars,
+allocation of 47 B → class 2 (64 B chunk) — exactly the leak
+signature we saw.
+
+Diagnostic trail to root cause:
+- Class-2 active counter showed +1 chunk/req leaked.
+- Vars-class-2 sub-buckets balanced for sizes 32/40/48; size 24
+  had +1 over 5000 req.
+- Size 48 had +1/req in lake-server but balanced in server_close
+  → not vars-48 of any single machine.
+- Per-machine vars-48 spawn diagnostic surfaced four candidates:
+  close_file, alloc_or_die, last_index_of_byte_from,
+  next_newline_loop.
+- server_aod test (just calls `alloc_or_die(16)` per request,
+  nothing else) reproduced 32 B/req leak — isolated to
+  alloc_or_die itself.
+- Source: alloc_or_die's body returns `rt_allocate(n).1` — a
+  raw slab chunk — to its caller, who discards without
+  `rt_free`.
+
+Fix: `alloc_or_die` now calls `rt_arena_alloc(n)` directly,
+yielding a buf in the caller's arena (reclaimed at actor death).
+OOM-die semantics preserved (rt_arena_alloc's fallback path
+already invokes rt_die_actor on slab OOM).
+
+## Final measurements
+
+| Workload                       | Default bucket | LAKE_SLAB_ALLOC=1 |
+|--------------------------------|----------------|-------------------|
+| Session start                  | 3946 B/req     | 3946 B/req        |
+| After arena (#138)             | 140            | 140               |
+| After tuple wrapper fix        | 110            | 95                |
+| After slab Phase 5             | 110            | 95                |
+| After fused-self arena reset   | 80             | 64                |
+| After alloc_or_die → arena     | **0**          | **0**             |
+
+**Session total: 3946 → 0 B/req (100% reduction).**
+
+Integration tests: 65/67 passing in both default and slab modes
+(the two pre-existing failures are enum frontend AST issues
+unrelated to allocator work, tracked separately).
 
 ## Workaround
 
