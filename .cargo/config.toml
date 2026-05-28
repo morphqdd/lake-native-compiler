@@ -1,0 +1,4 @@
+# Intentionally empty — parent /home/morphe/compiler/.cargo/config.toml
+# was redirected to ../lake-frontend (the worktree).  This file is a
+# placeholder so future work knows to add per-worktree overrides here
+# if the parent flips back to the main checkout.
