@@ -13,6 +13,7 @@ mod integration {
     pub mod basics;
     pub mod bug_120;
     pub mod enums_145;
+    pub mod generics_142;
     pub mod guards;
     pub mod mangling;
     pub mod messaging;
