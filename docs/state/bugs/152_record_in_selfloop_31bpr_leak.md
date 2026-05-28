@@ -1,6 +1,7 @@
 # Bug 152 — 31 B/req leak: record creation in a self-looping async actor
 
-**Status:** open  **Severity:** medium  **First seen:** 2026-05-28
+**Status:** fixed (3c516ff)  **Severity:** medium  **First seen:** 2026-05-28
+**Fixed:** 2026-05-28 — see `## Fix` section.
 **Reproduces under:** `LAKE_SLAB_ALLOC=1`.  Default bucket mode: 0 leak.
 
 ## Symptom
@@ -191,14 +192,76 @@ address, and the actor's machine name table offset.  Cross-
 reference with a process-id-to-machine table dumped at the same
 time to identify which actor is hitting the fallback.
 
-## Mitigation
+## Fix (commit 3c516ff)
 
-If root-causing the scheduler quirk proves hard, the cheapest
-workaround is to make the fallback path **not leak**: route the
-fallback through arena-of-main instead of `rt_allocate_raw`, or
-attach the fallback'd chunks to the caller's exec_ctx so death
-cleanup frees them.  Either eliminates the per-request leak
-without identifying the underlying scheduler bug.
+Root cause: `compile_fused_self_call` in
+`src/compiler/pipeline/expr/jump_expr.rs:51-66` is the fast path
+for `self(...)` calls whose args are all pure (Var, Num, atom, …).
+It bypasses `change_state_expr::compile` — the only place that
+runs the #138-phase-2e arena-reset sequence.  Self-looping non-ret
+actors with any in-body arena allocation (record / tuple literal)
+therefore bumped their arena every iteration until the 64 KiB
+exhausted, then every subsequent `rt_arena_alloc` fell back to
+`rt_allocate_raw`, pinning class-1 slab chunks forever.
+
+The diagnostic counters (instrumentation since reverted) on
+`/tmp/server_min`:
+
+```
+[0] arena_fat == 0:    0
+[1] arena exhausted:   2288   ← every fallback was exhaustion
+[2] bump success:      2730
+[3] reset fires:       0      ← never! slow path skipped
+[4] no-ptr-args path:  0
+[6] change_state hit:  0      ← entire fn never called
+```
+
+Fix: emit the same reset sequence inline inside
+`compile_fused_self_call` between the vars-write step and the
+BRANCH_ID set.  Guarded by `OWNED_ARENA_BASE != 0` so
+sync-ret-machine inheritance is unaffected.
+
+## Measured impact
+
+| Workload                     | Before    | After     |
+|------------------------------|-----------|-----------|
+| `server_min` (record + spawn)| 31 B/req  | 0.8 B/req |
+| `server_recok` (rec + i64)   | 31 B/req  | 0 B/req   |
+| `server_spawnonly` (no rec)  | 0         | 0         |
+| lake-server default bucket   | 110 B/req | 80 B/req  |
+| lake-server LAKE_SLAB_ALLOC=1| 95 B/req  | 64 B/req  |
+
+`server_spawnonly` was already 0 because no record creation
+means no arena bump means no exhaustion regardless of reset.
+
+## Followup — lake-server still leaks 64 B/req
+
+Diagnostic on lake-server (5000 req, slab mode):
+
+```
+class[ 1]:  5001 allocs,  5001 frees, 0    active
+class[ 2]: 350008 allocs, 345005 frees, 5003 active  ← ~1/req leak
+class[ 4]: 295006 allocs, 295004 frees, 2 active
+class[ 8]: 530010 allocs, 530006 frees, 4 active
+class[12]:      3 allocs,      0 frees, 3 active (live arenas)
+class[13]:  15004 allocs,  15001 frees, 3 active (live arenas)
+
+spawns: 265004 / deaths: 265003 — balanced (1 = listener never dies)
+```
+
+So spawn/death are balanced; the leak is NOT a missed
+`free_process_resources`.  ~1 class-2 (40-48 B user_size) chunk
+per request leaks somewhere outside the spawn lifecycle.
+
+Candidates:
+- `rt_copy_to_arena` fallback path (still leaks `rt_allocate_raw`).
+- `change_state_expr`'s scratch alloc for pointer-arg snapshot
+  (line 211: `rt_allocate_raw(total_size)` — should be freed at
+  line 295, but maybe not every iteration?).
+- An arena-allocation that falls back when serve_file's arena
+  exhausts on big-file streaming.
+
+Tracked as task #76.
 
 ## Workaround
 
