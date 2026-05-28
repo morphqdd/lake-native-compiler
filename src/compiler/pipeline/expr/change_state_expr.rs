@@ -174,7 +174,16 @@ pub fn compile(
             ProcessCtxLayout::OWNED_ARENA_BASE,
         );
 
-        let has_any_ptr_arg = args.iter().any(|a| a.is_ptr);
+        // Same is_own_arena gate as compile_fused_self_call (#152
+        // followup): snapshot+recopy is only needed when the actor
+        // owns its arena (non-ret machine) — for sync ret-machines
+        // arena is inherited and reset is a no-op; doing snapshot+
+        // recopy still bumps the inherited arena per iter, which on
+        // SHA-256's `compress` self-loop (3 buf args × 64 iter per
+        // block) exhausted the caller's arena after ~14 compress
+        // calls.  Measured 944× slowdown vs Rust pre-fix.
+        let is_own_arena = !ctx.is_ret_machine(machine_name);
+        let has_any_ptr_arg = is_own_arena && args.iter().any(|a| a.is_ptr);
 
         if has_any_ptr_arg {
             // Snapshot pointer args' bytes into a fresh scratch buf.
