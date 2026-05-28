@@ -263,6 +263,42 @@ Candidates:
 
 Tracked as task #76.
 
+## #76 update — fallback hypotheses ruled out
+
+After the `3c516ff` fix shipped, the `compile_fused_self_call`
+followup fix (`9e37a72`) ported the slow path's snapshot+recopy
+dance into the fused fast path for own-arena actors with
+pointer-typed self() args.  That closed the latent correctness
+bug.
+
+The class-2 leak persisted unchanged: 350,008 allocs vs 345,005
+frees on a 5,000-request `/` load.  Diagnostic counters added
+(again, since reverted) on both `rt_arena_alloc` fallback
+(`alloc.rs:1543`) and `rt_copy_to_arena` fallback
+(`alloc.rs:1693`) recorded **0 invocations** for the whole run.
+
+So the residual ~5,003-chunk class-2 leak is NOT from any arena
+fallback path.  Suspect now lives elsewhere — most likely:
+
+- A specific machine whose vars allocation lands in class 2 (e.g.
+  ~5 vars × 8 = 40 B → +16 header = 56 → class 2) but whose
+  death path doesn't always reach `free_process_resources`.
+- An `io_uring`-park / sync-ret machine that gets stuck in
+  `io_parked` and never resumes (proc_ctx stays alive).
+- Some other untracked rt_allocate_raw site in stdlib helpers
+  (e.g. `strings.rs:147` `to_string_with_ln`, `strings.rs:266`
+  `to_string`) called per-request that allocates class-2 size
+  and never frees.
+
+Lake-server's `build_resp_buf` calls `int_to_buf(resp.code)` and
+`int_to_buf(body_len)` per request — those route through
+`rt_arena_alloc(20)` (class 2) but live in the arena and should
+be reclaimed at the actor's death.  Confirmed: fallback never
+fires for these, so they sit in the arena and die with it.
+
+Outcome: leak source remains unidentified.  Lake-server stays at
+80 B/req default, 64 B/req slab.  Tracked as task #76.
+
 ## Workaround
 
 Until root cause is fixed: use default bucket allocator (omit
