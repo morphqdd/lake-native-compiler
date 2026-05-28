@@ -192,8 +192,10 @@ fn define_allocate_impl(
         let slab_class_idx = builder.ins().iadd_imm(slab_log2_ceil, -4);
 
         // Phase 5: slab handles every supported class (0..20 = ≤ 16 MiB).
-        // Larger requests still fall through to the direct-mmap huge_block
-        // path.  max_slab_class = NUM_CLASSES - 1 = 20.
+        // Larger requests fall through to direct-mmap huge_block.
+        // Combined with rt_free_slab's no-munmap-on-empty trade-off
+        // (kept slabs reused indefinitely), this gives bucket-allocator-
+        // like reuse without per-alloc syscalls.
         let max_slab_class = builder.ins().iconst(ty, (SlabLayout::NUM_CLASSES - 1) as i64);
         let slab_supported = builder.ins().icmp(
             IntCC::UnsignedLessThanOrEqual,
@@ -2548,13 +2550,19 @@ pub fn define_free_slab(mut ctx: CompilerCtx) -> Result<CompilerCtx> {
         SlabLayout::HDR_FREE_COUNT,
     );
 
-    // ── 6. If fully empty → reclaim ────────────────────────────────────
+    // ── 6. Skip munmap-on-empty: keep slabs in the class list for reuse.
+    // Returning empty slabs to the OS sounds frugal but in a hot path
+    // (lake-server scheduler allocates ~250 slab chunks per request)
+    // it adds an mmap + 2 trim-munmap on the next alloc of the same
+    // class — measured 4-5× slowdown vs reuse.  RSS is bounded by
+    // peak working set (chunks_per_slab × num_classes_used), so we
+    // pay memory once.  Direct-mmap huge_block path (class > 20)
+    // still munmaps on free since each huge alloc is its own region.
     let chunks_addr = builder.ins().iadd(chunks_base, idx_x8);
     let chunks_per_slab_val =
         builder.ins().load(ty, MemFlags::trusted(), chunks_addr, 0);
-    let is_empty = builder
-        .ins()
-        .icmp(IntCC::Equal, new_free, chunks_per_slab_val);
+    let _ = (new_free, chunks_per_slab_val);
+    let is_empty = builder.ins().iconst(ty, 0);
 
     let reclaim_block = builder.create_block();
     let done_block = builder.create_block();
