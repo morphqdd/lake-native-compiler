@@ -17,8 +17,9 @@ use crate::compiler::{
         },
         machine::STOP_PARK,
     },
-    rt::layout::ExecCtxLayout,
+    rt::layout::{ExecCtxLayout, process_ctx::ProcessCtxLayout, sheduler_ctx::ShedulerCtxLayout},
 };
+use cranelift::module::FuncOrDataId;
 
 /// Compile a jump / function call: `callee(arg0, arg1, ...)`.
 ///
@@ -490,6 +491,72 @@ fn compile_fused_self_call(
         builder
             .ins()
             .store(MemFlags::trusted(), *val, vars_start, i as i32 * 8);
+    }
+
+    // 3.5 Reset arena (bug #152).  The slow path through
+    // change_state_expr does this in its #138-phase-2e arena-reset
+    // step; the fused fast path was bypassing it, leaving the
+    // self-looping actor's arena to bump forever and eventually
+    // exhaust → rt_arena_alloc fallback → class-1 slab chunks
+    // pinned forever.  Reset only when the actor owns its arena
+    // (OWNED_ARENA_BASE != 0).
+    if let Some(FuncOrDataId::Data(sid)) = ctx.module().get_name("sheduler_ctx_fat_ptr") {
+        let sched_gv = ctx.module_mut().declare_data_in_func(sid, &mut builder.func);
+        let sched_fat = builder.ins().global_value(ptr_ty, sched_gv);
+        let sched_start = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), sched_fat, 0);
+        let cur_idx = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            sched_start,
+            ShedulerCtxLayout::CURRENT_PROCESS,
+        );
+        let proc_arr_fat = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            sched_start,
+            ShedulerCtxLayout::PROCESS_ARR_FAT,
+        );
+        let proc_arr = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), proc_arr_fat, 0);
+        let cur_off = builder.ins().imul_imm(cur_idx, 8);
+        let cur_entry_addr = builder.ins().iadd(proc_arr, cur_off);
+        let proc_ctx_fat_ptr = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), cur_entry_addr, 0);
+        let proc_ctx_start = builder
+            .ins()
+            .load(ptr_ty, MemFlags::trusted(), proc_ctx_fat_ptr, 0);
+        let arena_fat = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            proc_ctx_start,
+            ProcessCtxLayout::OWNED_ARENA_FAT,
+        );
+        let arena_base = builder.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            proc_ctx_start,
+            ProcessCtxLayout::OWNED_ARENA_BASE,
+        );
+        let owns = builder.ins().icmp_imm(
+            cranelift::prelude::IntCC::NotEqual,
+            arena_base,
+            0,
+        );
+        let reset_blk = builder.create_block();
+        let skip_blk = builder.create_block();
+        builder.ins().brif(owns, reset_blk, &[], skip_blk, &[]);
+        builder.switch_to_block(reset_blk);
+        builder.seal_block(reset_blk);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), arena_base, arena_fat, 0);
+        builder.ins().jump(skip_blk, &[]);
+        builder.switch_to_block(skip_blk);
+        builder.seal_block(skip_blk);
     }
 
     // 4. Set BRANCH_ID — with guard dispatch if multiple branches share this hash.
