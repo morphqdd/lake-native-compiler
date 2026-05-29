@@ -191,42 +191,6 @@ STD_PATH=/path/to/lake-stdlib/std lakec -O speed main.lake -o out
 
 ---
 
-## Performance
-
-Benchmarks run on x86-64 with full CPU frequency (single-threaded, `GOMAXPROCS=1` for Go).
-
-### I/O benchmark (10 workers × 10k writes)
-
-| Runtime         | Time      | Relative |
-|-----------------|-----------|----------|
-| C++ coroutines  | 21.3 ms   | 1.0×     |
-| **Lake**        | **22.7 ms** | **1.07×** |
-| Rust (Tokio)    | 35.1 ms   | 1.65×    |
-| Go              | 43.7 ms   | 2.05×    |
-
-### Message passing (ping-pong 100k round-trips)
-
-| Runtime         | Time      | Relative |
-|-----------------|-----------|----------|
-| C++ coroutines  | 2.4 ms    | 1.0×     |
-| **Lake** (mailbox) | **21.7 ms** | **9.2×** |
-| Rust (tokio mpsc) | 24.9 ms  | 10.5×    |
-| Go (channels)   | 35.5 ms   | 15.0×    |
-
-### CPU benchmark (8 workers, fib(100k))
-
-| Runtime                    | Time      | vs C   |
-|----------------------------|-----------|--------|
-| C sequential (baseline)    | 772 µs    | 1.0×   |
-| Go (GOMAXPROCS=1)          | 1.8 ms    | 2.4×   |
-| C++ coroutines             | 2.1 ms    | 2.7×   |
-| Rust (Tokio current_thread)| 3.3 ms    | 4.3×   |
-| **Lake** (fused self-call) | **7.0 ms** | **9.1×** |
-
-Lake's I/O performance is competitive because the scheduler operates on atomic blocks — it can preempt a process without explicit `await` points. Message passing beats both Rust and Go thanks to inline mailbox operations and direct process wake-up. The CPU gap is architectural: CPS dispatch + reduction counting (like BEAM) trades raw throughput for fairness and cooperative scheduling guarantees.
-
----
-
 ## Ecosystem
 
 | Crate | Role |
