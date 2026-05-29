@@ -230,3 +230,51 @@ main is {
     assert_eq!(out.exit_code, 0, "stderr: {:?}", out.stderr);
     assert_eq!(out.stdout, b"impl ok\n");
 }
+
+/// Phase 2 — overloaded `index` must not collide in mono (#101).  A user
+/// type `Struct[T]` defines its own `index`, and its body subscripts the
+/// inner `Vec[T]` (`v[i]` → stdlib `Vec.index`).  Both instantiate at
+/// `i64`; before the fix they shared the mangled symbol `index_i64`, so
+/// `v[i]` dispatched to `Struct`'s index → E003.  Now owner-qualified.
+#[test]
+fn overloaded_index_no_mono_collision() {
+    ensure_lake_path();
+    let src = r#"
++std.io.{ println }
++std.vec.{ Vec vec_new vec_push }
++std.strings.{ int_to_buf }
+
+Struct[T] is { data Vec[T] }
+Struct is Index
+
+pub index[T] is {
+  st Struct[T] i i64 -> ret T {
+    let v Vec[T] = st.data
+    let d T = v[i]
+    ret d
+  }
+}
+
+push_into[T] is {
+  st Struct[T] val T -> ret Struct[T] {
+    let old Vec[T] = st.data
+    let v = vec_push(old val)
+    ret Struct(v)
+  }
+}
+
+main is {
+  _ -> {
+    let v0 Vec[i64] = vec_new()
+    let s0 Struct[i64] = Struct(v0)
+    let s1 = push_into(s0 10)
+    let s2 = push_into(s1 20)
+    println(int_to_buf(s2[0]))
+    println(int_to_buf(s2[1]))
+  }
+}
+"#;
+    let out = run(src).expect("compile/run failed");
+    assert_eq!(out.exit_code, 0, "stderr: {:?}", out.stderr);
+    assert_eq!(out.stdout, b"10\n20\n");
+}
