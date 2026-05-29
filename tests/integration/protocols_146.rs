@@ -148,3 +148,85 @@ main is {
     assert_eq!(out.exit_code, 0, "stderr: {:?}", out.stderr);
     assert_eq!(out.stdout, b"ok index\n");
 }
+
+/// Phase 2 — nominal `[]`.  A composite receiver whose type does NOT
+/// carry an `is Index` assertion cannot be subscripted: `p[0]` on a
+/// plain record must fail to compile (E042).  `index` is a proto
+/// method now, not a bare naming convention.
+#[test]
+fn index_on_non_index_type_errors() {
+    let src = r#"
++std.io.{ println }
+
+Pair is { a i64  b i64 }
+
+main is {
+  _ -> {
+    let p Pair = Pair(1 2)
+    let x = p[0]
+    println("unreachable")
+  }
+}
+"#;
+    let err = try_compile(src).expect_err("expected `[]`-without-Index compile error");
+    let msg = format!("{err:#}").to_lowercase();
+    assert!(
+        msg.contains("ast") || msg.contains("fail"),
+        "unexpected error: {msg}"
+    );
+}
+
+/// Phase 2 — enforced explicit impl.  An `X is Eq` assertion whose
+/// required `eq` machine is absent must fail with E042, even though the
+/// impl is verified up front (X never appears in a bounded generic).
+/// Also exercises the impl-parser boundary fix: `Color is Eq` followed
+/// by `main is { … }` must not swallow `main` as a proto name.
+#[test]
+fn explicit_impl_missing_method_errors() {
+    let src = r#"
++std.io.{ println }
+
+Color is enum { Red Green }
+
+Eq is proto { eq is { Self Self -> i64 } }
+
+Color is Eq
+
+main is {
+  _ -> { println("hi") }
+}
+"#;
+    let err = try_compile(src).expect_err("expected missing-impl compile error");
+    let msg = format!("{err:#}").to_lowercase();
+    assert!(
+        msg.contains("ast") || msg.contains("fail"),
+        "unexpected error: {msg}"
+    );
+}
+
+/// Phase 2 — explicit impl satisfied.  `Color is Eq` with the `eq`
+/// machine present compiles and runs.  Guards the impl-parser boundary
+/// fix and the relaxed (base-name) method-signature match.
+#[test]
+fn explicit_impl_satisfied_runs() {
+    let src = r#"
++std.io.{ println }
+
+Color is enum { Red Green }
+
+Eq is proto { eq is { Self Self -> i64 } }
+
+eq is {
+  a Color b Color -> ret i64 { ret 1 }
+}
+
+Color is Eq
+
+main is {
+  _ -> { println("impl ok") }
+}
+"#;
+    let out = run(src).expect("compile/run failed");
+    assert_eq!(out.exit_code, 0, "stderr: {:?}", out.stderr);
+    assert_eq!(out.stdout, b"impl ok\n");
+}
