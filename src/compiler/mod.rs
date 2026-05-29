@@ -519,7 +519,11 @@ pub(crate) fn hash_call_args(
                     continue;
                 }
             }
-            // Arithmetic, negation, and comparison ops produce i64.
+            // Arithmetic, negation, comparison, and bitwise/shift ops
+            // all produce i64.  Bitwise/shift were missing here while
+            // hash_pattern (param side) treats them as i64 — so a call
+            // like `f(x >> 4 & 0xf)` skipped the arg entirely and the
+            // call hash omitted it, never matching the branch.
             Expr::Add(_, _)
             | Expr::Sub(_, _)
             | Expr::Mul(_, _)
@@ -529,7 +533,12 @@ pub(crate) fn hash_call_args(
             | Expr::Ge(_, _)
             | Expr::Eq(_, _)
             | Expr::Lt(_, _)
-            | Expr::Gt(_, _) => "i64".to_string(),
+            | Expr::Gt(_, _)
+            | Expr::BAnd(_, _)
+            | Expr::BOr(_, _)
+            | Expr::BXor(_, _)
+            | Expr::Shl(_, _)
+            | Expr::Shr(_, _) => "i64".to_string(),
             Expr::Bool(_) => "i64".to_string(),
             _ => continue,
         };
