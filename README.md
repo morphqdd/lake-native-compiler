@@ -97,6 +97,98 @@ main is {
 }
 ```
 
+### Records
+
+A *record* groups named fields into a nominal type. Construct positionally, read with dot-access, and destructure with a `let` pattern:
+
+```lake
+Greeting is {
+  who   buf
+  count i64
+}
+
+main is {
+  _ -> {
+    let g = Greeting("world" 3)
+    let { who count } = g
+  }
+}
+```
+
+### Enums
+
+An *enum* is a tagged union of named variants, matched with `when`. Matches must be exhaustive:
+
+```lake
+Result is enum {
+  Ok(i64)
+  Err(buf)
+}
+
+unwrap is {
+  r Result -> ret i64 {
+    when r {
+      Ok(n)  -> { ret n }
+      Err(_) -> { ret 0 - 1 }
+    }
+  }
+}
+```
+
+### Generics
+
+Records, enums, and machines can take type parameters in square brackets. Instantiations are monomorphized — specialized at compile time, no runtime cost:
+
+```lake
+Option[T] is enum {
+  Some(T)
+  None
+}
+
+unwrap_or[T] is {
+  o Option[T] d T -> ret T {
+    when o {
+      Some(v) -> { ret v }
+      None    -> { ret d }
+    }
+  }
+}
+```
+
+---
+
+## Standard Library
+
+The standard library (`lake-stdlib`) is written in Lake itself and imported with `+module.{ names }`:
+
+```lake
++std.io.{ println }
++std.vec.{ vec_new vec_push vec_get vec_len }
+```
+
+| Module | Provides |
+|--------|----------|
+| `std.io` | `print` / `println` / `eprintln` (+ `_buf` variants) |
+| `std.option` | `Option[T]` + `is_some` / `is_none` / `unwrap_or` |
+| `std.result` | `Result[T E]` + `is_ok` / `is_err` / `unwrap_or` |
+| `std.vec` | `Vec[T]` growable vector |
+| `std.string` / `std.strings` | owned `String` + string/`buf` algorithms |
+| `std.hashmap` | `IntMap[V]` integer-keyed hash map |
+| `std.bytes` | bounded byte access over a `buf` |
+| `std.math` | `abs` / `mod` / `min` / `max` |
+| `std.process` / `std.sys` / `std.env` | allocation, `exit`, argv/envp |
+| `std.tcp` | `listen` / `accept` / `send` / `recv` / `close` |
+| `std.crypto.*` | `sha256`, `hmac_sha256`, `pbkdf2_sha256` |
+| `std.encoding.base64` | `encode` / `decode` |
+| `std.postgres` | PostgreSQL client (see below) |
+
+Collections (`Vec`, `String`, `IntMap`) are value-threaded: a mutating call returns a possibly-new value that you bind and reuse.
+
+```sh
+# Point the compiler at the stdlib's std/ directory
+STD_PATH=/path/to/lake-stdlib/std lakec -O speed main.lake -o out
+```
+
 ---
 
 ## Performance
@@ -141,8 +233,31 @@ Lake's I/O performance is competitive because the scheduler operates on atomic b
 |-------|------|
 | [`lake-native-compiler`](.) | Compiler: Cranelift codegen, scheduler, linker integration |
 | [`lake-frontend`](https://github.com/morphqdd/lake_frontend) | Parser and AST — reusable for linters, formatters, LSP servers |
+| `lake-stdlib` | Standard library, written in Lake (collections, crypto, networking) |
 
 The frontend is intentionally decoupled from the compiler. Building a linter, formatter, or language server only requires `lake-frontend`.
+
+### PostgreSQL client
+
+`std.postgres` is a from-scratch PostgreSQL client written in Lake: it speaks the wire protocol over a raw socket, authenticates with SCRAM-SHA-256, and uses binary codecs for typed columns. The surface is `connect` / `query` / `prepare` / `execute` / `close`:
+
+```lake
++std.postgres.{ connect close query ip_v4 row_field }
++std.postgres.types.{ dec_int4 }
+
+main is {
+  _ -> {
+    let c = connect(ip_v4(127 0 0 1) 5432 user db password)
+    when c.ok {
+      1 -> {
+        let rows = query(c "SELECT 1::int4")
+        close(c)
+      }
+      _ -> { }
+    }
+  }
+}
+```
 
 ---
 
@@ -216,12 +331,23 @@ Each block is a Cranelift function that returns the next `block_id`. The schedul
 - [x] Process IDs (`pid` type) and message passing
 - [x] `wait` expression — blocking receive with mailbox
 - [x] Fused self-call optimization (pure args bypass staging)
-- [ ] User-defined structs
-- [ ] Arena allocator per process
-- [ ] `io_uring` integration for async I/O
+- [x] Bitwise / shift operators (`&`, `|`, `^`, `<<`, `>>`)
+- [x] Byte-string (`b"..."`) and char (`'x'`) literals
+- [x] Records (named fields, dot-access, destructure)
+- [x] Enums (tagged unions, exhaustive `when` matching)
+- [x] Generics (monomorphized records / enums / machines)
+- [x] `@cfg(arch=...)` per-target item filtering
+- [x] Per-process arena allocator
+- [x] Multi-file compilation and imports
+- [x] Standard library (collections, strings, crypto, networking)
+- [x] `io_uring`-backed async I/O (TCP)
+- [x] PostgreSQL client (wire protocol, SCRAM-SHA-256, binary codecs)
+- [ ] Protocols / bounded type parameters (`X is Eq Show`, `[T: Proto]`)
+- [ ] `panic` / structured error propagation
+- [ ] `io_uring` fallback path for non-supporting kernels
 - [ ] Thread pool for blocking `@rt` calls
-- [ ] Multi-file compilation and imports
-- [ ] Standard library (file I/O, networking, timers)
+- [ ] Fully generic-key hash map (string / `buf` keys)
+- [ ] Modulo (`%`) and `!=` operators
 
 ---
 
