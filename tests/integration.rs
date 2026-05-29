@@ -19,6 +19,7 @@ mod integration {
     pub mod guards;
     pub mod mangling;
     pub mod messaging;
+    pub mod protocols_146;
     pub mod regression;
     pub mod self_call;
     pub mod slab_route_150;
