@@ -12,6 +12,7 @@ mod integration {
     pub mod anf_eq_bitwise;
     pub mod basics;
     pub mod bug_120;
+    pub mod cfg_054;
     pub mod enums_145;
     pub mod generic_enums_142;
     pub mod generics_142;

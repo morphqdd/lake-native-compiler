@@ -12,7 +12,7 @@ use lake_frontend::{
         ast::{Branch, Clean, Item, MachineItem, Pattern, Type},
         expr::Expr,
     },
-    prelude::{build_program, load_and_build},
+    prelude::{build_program_for_target, load_and_build},
 };
 use log::{debug, error, info, warn};
 
@@ -56,8 +56,10 @@ pub fn compile_for_target<SP: AsRef<Path>>(
         anyhow!("Failed to load Lake program")
     })?;
 
-    // ── Phase 2: parse → populate registry → resolve → typecheck ───────────
-    let lake_program = build_program(&sources).map_err(|errs| {
+    // ── Phase 2: parse → cfg-filter → populate registry → resolve → typecheck
+    // Thread the chosen target arch into the frontend so `@cfg(arch=...)`
+    // stdlib items (e.g. per-arch syscall numbers, #055) resolve correctly.
+    let lake_program = build_program_for_target(&sources, target_arch.as_str()).map_err(|errs| {
         pb.finish_and_clear();
         // Route each diagnostic to the file its span belongs to.  Old
         // code looped every loaded file and re-rendered all errors
